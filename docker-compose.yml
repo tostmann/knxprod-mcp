@@ -2,8 +2,9 @@
 # Create both folders before the first start (see README).
 services:
   knxprod-mcp:
-    build: .
-    image: knxprod-mcp:local
+    # The published image (linux/amd64 and linux/arm64). To build from this
+    # checkout instead, replace the next line with "build: .".
+    image: tostmann/knxprod-mcp:latest
     # Host networking (Linux) lets the server announce itself on the LAN via
     # mDNS/DNS-SD (_knxprod-mcp._tcp), so clients find it without a URL.
     network_mode: host

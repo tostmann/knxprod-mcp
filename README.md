@@ -21,8 +21,9 @@ on the LAN via mDNS/DNS-SD, so clients can find it without a URL.
    cp ~/Downloads/*.knxprod knxprod/
    ```
 
-2. **Start the container.** Run this from a checkout of this repository; the
-   image is built locally.
+2. **Start the container.** With the `docker-compose.yml` from this repository
+   next to the two folders (it uses the published image
+   `tostmann/knxprod-mcp`, for linux/amd64 and linux/arm64):
 
    ```sh
    docker compose up -d
@@ -67,12 +68,13 @@ on the LAN via mDNS/DNS-SD, so clients can find it without a URL.
 The same without Compose:
 
 ```sh
-docker build -t knxprod-mcp .
 docker run -d --name knxprod-mcp --network host -e KNXPROD_BIND=auto \
   --user "$(id -u):$(id -g)" \
   -v "$PWD/knxprod:/knxprod" -v "$PWD/knxprod-index:/data" \
-  --restart unless-stopped knxprod-mcp
+  --restart unless-stopped tostmann/knxprod-mcp
 ```
+
+To build the image yourself: `docker build -t knxprod-mcp .` in a checkout.
 
 With port mapping instead of host networking, discovery is not available:
 replace `--network host -e KNXPROD_BIND=auto` with `-p 8095:8095`.
@@ -134,7 +136,9 @@ Some things to keep in mind:
   the function in an installation. What a channel really does depends on its
   configured mode.
 - One com-object number can have several variants. Pick the variant whose
-  `size_bits` matches what the device reports.
+  `size_bits` matches what the device reports. When several variants have the
+  same size, the channel's configured mode decides: read that parameter from
+  the device and decode it with `prod-decode`.
 - Multi-byte parameter values follow the byte order the program declares. The
   indexer compares that declaration with the defaults in the manufacturer's
   memory template and adds a `byte_order_warning` when they disagree.
