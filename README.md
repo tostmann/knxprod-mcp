@@ -8,7 +8,8 @@ addresses, bit positions, value types and defaults.
 
 This project ships no manufacturer data. You supply the product files and the
 server indexes them. It is a single Python file that uses the standard library
-only and is meant to run as a container in a private network.
+only and is meant to run as a container in a private network. It announces itself
+on the LAN via mDNS/DNS-SD, so clients can find it without a URL.
 
 ## Quick start
 
@@ -27,6 +28,10 @@ only and is meant to run as a container in a private network.
    docker compose up -d
    ```
 
+   The Compose file uses host networking (Linux), which the discovery needs. The
+   server then listens on the host's LAN address only (`KNXPROD_BIND=auto`). On
+   Docker Desktop, switch to port mapping as described in `docker-compose.yml`.
+
    The container runs as UID/GID 1000 by default. If your folders belong to
    another user, start it with `KNXPROD_UID=$(id -u) KNXPROD_GID=$(id -g)
    docker compose up -d`.
@@ -41,7 +46,8 @@ only and is meant to run as a container in a private network.
    ```
 
 4. **Connect your MCP client** to `http://<host>:8095/mcp` (Streamable HTTP).
-   For example with Claude Code:
+   Clients that browse for the service find it by themselves, for example a
+   busware KNX stick (see [Discovery](#discovery)). With Claude Code:
 
    ```sh
    claude mcp add --transport http knxprod http://<host>:8095/mcp
@@ -62,10 +68,34 @@ The same without Compose:
 
 ```sh
 docker build -t knxprod-mcp .
-docker run -d --name knxprod-mcp -p 8095:8095 --user "$(id -u):$(id -g)" \
+docker run -d --name knxprod-mcp --network host -e KNXPROD_BIND=auto \
+  --user "$(id -u):$(id -g)" \
   -v "$PWD/knxprod:/knxprod" -v "$PWD/knxprod-index:/data" \
   --restart unless-stopped knxprod-mcp
 ```
+
+With port mapping instead of host networking, discovery is not available:
+replace `--network host -e KNXPROD_BIND=auto` with `-p 8095:8095`.
+
+## Discovery
+
+The server announces itself with mDNS/DNS-SD as service type `_knxprod-mcp._tcp`.
+The instance name is `knxprod-mcp on <hostname>` and the TXT record says
+`path=/mcp`. A client that browses for this type gets host, port and path and
+needs no URL. Any DNS-SD browser shows it, for example
+`avahi-browse -rt _knxprod-mcp._tcp`.
+
+- In Docker it needs host networking (`network_mode: host`, Linux only). That
+  is the default in `docker-compose.yml`.
+- With port mapping or on Docker Desktop the container only sees internal
+  addresses. The server then logs a warning and skips the announcement; enter
+  `http://<host>:8095/mcp` in your client instead.
+- The server shares UDP port 5353 with other mDNS responders such as Avahi. If
+  the instance name is already taken on the network it adds ` (2)`, ` (3)`, …
+  When it stops cleanly it withdraws the announcement.
+- Switch it off with `--no-mdns` or `KNXPROD_MDNS=0`. `KNXPROD_MDNS_NAME`,
+  `KNXPROD_MDNS_HOSTNAME` and `KNXPROD_MDNS_ADDRESS` set the announced instance
+  name, host name and IPv4 address.
 
 ## How the product folder is used
 
@@ -122,18 +152,23 @@ wins over the environment.
 |---|---|---|---|
 | `--products` | `KNXPROD_DIR` | `/knxprod` | product folder |
 | `--data` | `KNXPROD_DATA` | `/data` | index folder |
-| `--bind` | `KNXPROD_BIND` | `127.0.0.1` | listen address (the container uses `0.0.0.0`) |
+| `--bind` | `KNXPROD_BIND` | `127.0.0.1` | listen address; `auto` = this host's LAN address (the image default is `0.0.0.0`) |
 | `--port` | `KNXPROD_PORT` | `8095` | listen port |
 | `--allowed-host` | `KNXPROD_ALLOWED_HOSTS` | – | extra host names clients may use (comma separated) |
 | `--upload-origin` | `KNXPROD_UPLOAD_ORIGINS` | private-network rule | browser origins allowed to upload; `none` turns browser uploads off |
 | `--scan-interval` | `KNXPROD_SCAN_INTERVAL` | `10` | seconds between folder scans; `0` scans only at start |
 | `--allow-any-bind` | `KNXPROD_ALLOW_ANY_BIND=1` | off | allow listening on `0.0.0.0` / `::` |
+| `--no-mdns` | `KNXPROD_MDNS=0` | on | do not announce the service via mDNS/DNS-SD |
+| `--mdns-name` | `KNXPROD_MDNS_NAME` | `knxprod-mcp on <hostname>` | DNS-SD instance name |
+| `--mdns-hostname` | `KNXPROD_MDNS_HOSTNAME` | this host's name | announced as `<name>.local` |
+| `--mdns-address` | `KNXPROD_MDNS_ADDRESS` | listen or LAN address | IPv4 address(es) to announce (comma separated) |
 
 Without Docker:
 
 ```sh
-python3 knxprod_mcp.py serve --products ./knxprod --data ./knxprod-index --bind 192.168.1.10
+python3 knxprod_mcp.py serve --products ./knxprod --data ./knxprod-index --bind auto
 python3 knxprod_mcp.py sync  --products ./knxprod --data ./knxprod-index   # index once, then exit
+python3 knxprod_mcp.py health --data ./knxprod-index                       # 0 if the server is healthy
 ```
 
 ## Endpoints
@@ -144,8 +179,8 @@ python3 knxprod_mcp.py sync  --products ./knxprod --data ./knxprod-index   # ind
 - `POST /upload?name=<file>`: the raw file as request body, at most 64 MB. Zip
   archives are checked for path traversal, member count, nesting depth and
   uncompressed size.
-- `GET /healthz`: liveness and index counts. The container's health check uses
-  it.
+- `GET /healthz`: liveness, index counts and the mDNS state. The container's
+  health check (`knxprod_mcp.py health`) uses it.
 
 ## Security
 
@@ -159,6 +194,8 @@ python3 knxprod_mcp.py sync  --products ./knxprod --data ./knxprod-index   # ind
   private IPv4 addresses (RFC 1918), IPv6 ULA and link-local addresses,
   `localhost` and `*.local`. Use `KNXPROD_UPLOAD_ORIGINS` to narrow this.
   Command-line clients such as curl send no Origin header and are not affected.
+- The mDNS announcement tells every device on the LAN that the service exists.
+  Switch it off (`KNXPROD_MDNS=0`) where that is not wanted.
 - The container runs as a non-root user. The product folder only needs to be
   writable if you want uploads.
 
@@ -168,9 +205,11 @@ python3 knxprod_mcp.py sync  --products ./knxprod --data ./knxprod-index   # ind
 python3 tests/test_knxprod_mcp.py
 ```
 
-The tests use a synthetic fixture with a fictitious manufacturer. To also check
-a real product file you own, set `KNXPROD_TEST_REAL_DATA=/path/to/file.knxprod`.
-Optionally set `KNXPROD_TEST_APP_ID` and `KNXPROD_TEST_OBJECTS` as well.
+The tests use a synthetic fixture with a fictitious manufacturer and send no
+network traffic. To also check a real product file you own, set
+`KNXPROD_TEST_REAL_DATA=/path/to/file.knxprod`. Optionally set
+`KNXPROD_TEST_APP_ID` and `KNXPROD_TEST_OBJECTS` as well. A live mDNS check on
+the LAN runs with `KNXPROD_TEST_MDNS_ADDRESS=<a LAN address of this host>`.
 
 ## License
 

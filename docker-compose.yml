@@ -4,17 +4,28 @@ services:
   knxprod-mcp:
     build: .
     image: knxprod-mcp:local
-    ports:
-      - "8095:8095"
+    # Host networking (Linux) lets the server announce itself on the LAN via
+    # mDNS/DNS-SD (_knxprod-mcp._tcp), so clients find it without a URL.
+    network_mode: host
+    # Without host networking (Docker Desktop, or if you prefer port mapping):
+    # remove network_mode and KNXPROD_BIND and publish the port instead.
+    # Discovery is then skipped; enter http://<host>:8095/mcp in the client.
+    # ports:
+    #   - "8095:8095"
     volumes:
       - ./knxprod:/knxprod
       - ./knxprod-index:/data
     # Run as the owner of the two folders.
     user: "${KNXPROD_UID:-1000}:${KNXPROD_GID:-1000}"
     environment:
+      # Listen on this host's LAN address only ("auto"), or give one address,
+      # e.g. "192.168.1.10".
+      KNXPROD_BIND: auto
       # Extra host names clients use to reach this server (comma separated).
       # IP addresses, localhost and *.local names always work.
       KNXPROD_ALLOWED_HOSTS: ""
       # Seconds between scans of ./knxprod for new, changed or removed files.
       KNXPROD_SCAN_INTERVAL: "10"
+      # "0" switches the mDNS/DNS-SD announcement off.
+      KNXPROD_MDNS: "1"
     restart: unless-stopped

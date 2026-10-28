@@ -6,12 +6,17 @@ them).  It distills every application program into a small index and serves
 read-only MCP tools about com objects, parameters and memory layout over
 Streamable HTTP.  Python standard library only.
 
-    knxprod_mcp.py serve [--products DIR] [--data DIR] [--bind ADDR] [--port N] ...
-    knxprod_mcp.py sync  [--products DIR] [--data DIR]
+    knxprod_mcp.py serve  [--products DIR] [--data DIR] [--bind ADDR|auto] [--port N] ...
+    knxprod_mcp.py sync   [--products DIR] [--data DIR]
+    knxprod_mcp.py health [--data DIR]          (exit 0 if the running server is healthy)
 
 Every option has an environment fallback: KNXPROD_DIR, KNXPROD_DATA,
 KNXPROD_BIND, KNXPROD_PORT, KNXPROD_ALLOWED_HOSTS, KNXPROD_UPLOAD_ORIGINS,
-KNXPROD_SCAN_INTERVAL, KNXPROD_ALLOW_ANY_BIND.
+KNXPROD_SCAN_INTERVAL, KNXPROD_ALLOW_ANY_BIND, KNXPROD_MDNS,
+KNXPROD_MDNS_NAME, KNXPROD_MDNS_HOSTNAME, KNXPROD_MDNS_ADDRESS.
+
+The server announces itself on the LAN via mDNS/DNS-SD as _knxprod-mcp._tcp
+(TXT path=/mcp) so that clients can find it without a URL.
 
 The product directory is the source of truth.  On start the server syncs
 the index with it (new or changed files are ingested, the application
@@ -40,6 +45,7 @@ Parser traps this code is built around:
 """
 
 import argparse
+import array
 import base64
 import collections
 import datetime
@@ -48,22 +54,25 @@ import hashlib
 import ipaddress
 import json
 import os
+import random
 import re
 import shutil
 import signal
 import socket
 import socketserver
 import stat
+import struct
 import sys
 import threading
 import time
 import traceback
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SCHEMA_VERSION = 2
 SERVER_NAME = "knxprod-mcp"
 
@@ -2661,6 +2670,567 @@ def handle_rpc(msg, store, notes=None):
 
 
 # ---------------------------------------------------------------------------
+# mDNS / DNS-SD responder (RFC 6762, RFC 6763), deliberately small
+#
+# Announces _knxprod-mcp._tcp.local so that clients on the LAN find the server
+# without a URL.  It answers PTR (service and service enumeration), SRV, TXT
+# and A queries for its own names, honours the QU bit and legacy unicast
+# queries, probes its instance name once at start (" (2)" etc. on conflict),
+# announces three times and says goodbye (TTL 0) on a clean shutdown.  It
+# shares UDP port 5353 with other responders on the host.
+# ---------------------------------------------------------------------------
+
+MDNS_GROUP = "224.0.0.251"
+MDNS_PORT = 5353
+SERVICE_LABELS = ("_knxprod-mcp", "_tcp", "local")
+ENUM_LABELS = ("_services", "_dns-sd", "_udp", "local")
+T_A, T_PTR, T_TXT, T_AAAA, T_SRV, T_ANY = 1, 12, 16, 28, 33, 255
+C_IN = 1
+CACHE_FLUSH = 0x8000
+QU_BIT = 0x8000
+TTL_HOST = 120                     # SRV, A
+TTL_OTHER = 4500                   # PTR, TXT
+LEGACY_TTL = 10                    # RFC 6762 6.7: at most 10 s for legacy unicast
+FLAGS_RESPONSE = 0x8400            # QR + AA
+IFF_UP, IFF_LOOPBACK, IFF_POINTOPOINT, IFF_MULTICAST = 0x1, 0x8, 0x10, 0x1000
+_BRIDGE_IF_RE = re.compile(r"^(docker\d*|br-|veth|virbr|lxcbr|lxdbr|cni|podman|flannel|cali|vxlan|kube)")
+# default address pools of Docker (bridge networks) and Podman
+_CONTAINER_NETS = ([ipaddress.ip_network("172.%d.0.0/16" % i) for i in range(17, 32)]
+                   + [ipaddress.ip_network("10.88.0.0/16")])
+
+
+def _key(labels):
+    return tuple(lb.lower() for lb in labels)
+
+
+def encode_name(labels):
+    out = bytearray()
+    for lb in labels:
+        b = lb.encode("utf-8")
+        if not 0 < len(b) <= 63:
+            raise ValueError("DNS label must have 1..63 bytes: %r" % lb)
+        out.append(len(b))
+        out += b
+    out.append(0)
+    if len(out) > 255:
+        raise ValueError("DNS name longer than 255 bytes")
+    return bytes(out)
+
+
+def read_name(data, pos):
+    """Decode a (possibly compressed) name at `pos` -> (labels, next position).
+    Pointers must point backwards, which rules out loops."""
+    labels, end, jumps, total = [], None, 0, 0
+    while True:
+        if pos >= len(data):
+            raise ValueError("name runs past the packet")
+        n = data[pos]
+        if n & 0xC0 == 0xC0:
+            if pos + 1 >= len(data):
+                raise ValueError("truncated compression pointer")
+            ptr = ((n & 0x3F) << 8) | data[pos + 1]
+            if ptr >= pos:
+                raise ValueError("compression pointer does not point backwards")
+            if end is None:
+                end = pos + 2
+            jumps += 1
+            if jumps > 64:
+                raise ValueError("too many compression pointers")
+            pos = ptr
+            continue
+        if n & 0xC0:
+            raise ValueError("unsupported label type")
+        pos += 1
+        if n == 0:
+            break
+        if pos + n > len(data):
+            raise ValueError("label runs past the packet")
+        total += n + 1
+        if total > 255:
+            raise ValueError("name longer than 255 bytes")
+        labels.append(bytes(data[pos:pos + n]).decode("utf-8", "replace"))
+        pos += n
+    return tuple(labels), end if end is not None else pos
+
+
+def parse_message(data):
+    if len(data) < 12:
+        raise ValueError("short DNS message")
+    mid, flags, qd, an, ns, ar = struct.unpack_from("!6H", data, 0)
+    pos, questions, records = 12, [], []
+    for _ in range(qd):
+        name, pos = read_name(data, pos)
+        if pos + 4 > len(data):
+            raise ValueError("truncated question")
+        qtype, qclass = struct.unpack_from("!2H", data, pos)
+        pos += 4
+        questions.append((name, qtype, qclass))
+    for section, count in (("an", an), ("ns", ns), ("ar", ar)):
+        for _ in range(count):
+            name, pos = read_name(data, pos)
+            if pos + 10 > len(data):
+                raise ValueError("truncated record")
+            rtype, rclass, ttl, rdlen = struct.unpack_from("!2HIH", data, pos)
+            pos += 10
+            if pos + rdlen > len(data):
+                raise ValueError("truncated record data")
+            records.append({"section": section, "name": name, "type": rtype, "class": rclass,
+                            "ttl": ttl, "rdata_pos": pos, "rdlen": rdlen})
+            pos += rdlen
+    return {"id": mid, "flags": flags, "questions": questions, "records": records,
+            "data": bytes(data)}
+
+
+def record_value(msg, r):
+    """Comparable form of a record's data (names decompressed)."""
+    d, p = msg["data"], r["rdata_pos"]
+    if r["type"] == T_PTR:
+        return _key(read_name(d, p)[0])
+    if r["type"] == T_SRV:
+        if r["rdlen"] < 7:
+            raise ValueError("short SRV record")
+        return struct.unpack_from("!3H", d, p) + (_key(read_name(d, p + 6)[0]),)
+    return d[p:p + r["rdlen"]]
+
+
+def build_message(mid, flags, questions=(), answers=(), authority=(), additionals=()):
+    out = bytearray(struct.pack("!6H", mid, flags, len(questions), len(answers),
+                                len(authority), len(additionals)))
+    for labels, qtype, qclass in questions:
+        out += encode_name(labels) + struct.pack("!2H", qtype, qclass)
+    for blob in list(answers) + list(authority) + list(additionals):
+        out += blob
+    return bytes(out)
+
+
+class _Rec:
+    __slots__ = ("labels", "rtype", "ttl", "unique", "rdata", "value")
+
+    def __init__(self, labels, rtype, ttl, unique, rdata, value):
+        self.labels, self.rtype, self.ttl = labels, rtype, ttl
+        self.unique, self.rdata, self.value = unique, rdata, value
+
+    def wire(self, ttl=None, flush=True):
+        rclass = C_IN | (CACHE_FLUSH if self.unique and flush else 0)
+        return (encode_name(self.labels) + struct.pack(
+            "!2HIH", self.rtype, rclass, self.ttl if ttl is None else ttl, len(self.rdata))
+            + self.rdata)
+
+
+def next_instance_name(name):
+    """'x' -> 'x (2)', 'x (2)' -> 'x (3)'; stays within one 63-byte label."""
+    m = re.match(r"^(.*) \((\d+)\)$", name)
+    base, n = (m.group(1), int(m.group(2)) + 1) if m else (name, 2)
+    suffix = " (%d)" % n
+    return base.encode("utf-8")[:63 - len(suffix)].decode("utf-8", "ignore") + suffix
+
+
+def clip_label(text):
+    return text.encode("utf-8")[:63].decode("utf-8", "ignore")
+
+
+class MdnsCore:
+    """The records and the answering logic, without any socket."""
+
+    def __init__(self, instance, host, port, addresses, txt):
+        self.host, self.port = host, port
+        self.addresses = list(addresses)
+        self.txt = list(txt)
+        self.set_instance(instance)
+
+    def set_instance(self, instance):
+        self.instance = clip_label(instance)
+        self.instance_labels = (self.instance,) + SERVICE_LABELS
+        self.host_labels = (self.host, "local")
+        srv = struct.pack("!3H", 0, 0, self.port) + encode_name(self.host_labels)
+        txt = b"".join(bytes([len(s.encode("utf-8"))]) + s.encode("utf-8") for s in self.txt)
+        self.ptr = _Rec(SERVICE_LABELS, T_PTR, TTL_OTHER, False,
+                        encode_name(self.instance_labels), _key(self.instance_labels))
+        self.enum = _Rec(ENUM_LABELS, T_PTR, TTL_OTHER, False, encode_name(SERVICE_LABELS),
+                         _key(SERVICE_LABELS))
+        self.srv = _Rec(self.instance_labels, T_SRV, TTL_HOST, True, srv,
+                        (0, 0, self.port, _key(self.host_labels)))
+        self.txt_rec = _Rec(self.instance_labels, T_TXT, TTL_OTHER, True, txt, txt)
+        self.a = [_Rec(self.host_labels, T_A, TTL_HOST, True, socket.inet_aton(a),
+                       socket.inet_aton(a)) for a in self.addresses]
+
+    def records(self):
+        return [self.ptr, self.enum, self.srv, self.txt_rec] + self.a
+
+    def announcement(self, ttl=None):
+        return build_message(0, FLAGS_RESPONSE, answers=[r.wire(ttl) for r in self.records()])
+
+    def probe(self):
+        return build_message(0, 0, questions=[(self.instance_labels, T_ANY, C_IN)],
+                             authority=[self.srv.wire(flush=False),
+                                        self.txt_rec.wire(flush=False)])
+
+    def _lookup(self, labels, qtype):
+        k = _key(labels)
+        answers, extra = [], []
+        if k == _key(SERVICE_LABELS) and qtype in (T_PTR, T_ANY):
+            answers.append(self.ptr)
+            extra += [self.srv, self.txt_rec] + self.a
+        elif k == _key(ENUM_LABELS) and qtype in (T_PTR, T_ANY):
+            answers.append(self.enum)
+        elif k == _key(self.instance_labels):
+            if qtype in (T_SRV, T_ANY):
+                answers.append(self.srv)
+                extra += self.a
+            if qtype in (T_TXT, T_ANY):
+                answers.append(self.txt_rec)
+        elif k == _key(self.host_labels) and qtype in (T_A, T_ANY):
+            answers += self.a
+        return answers, extra
+
+    def respond(self, msg, src):
+        """[(packet, destination)] for a parsed query from `src`."""
+        if msg["flags"] & 0x8000 or (msg["flags"] >> 11) & 0xF:
+            return []                        # responses and non-QUERY opcodes
+        known = {}
+        for r in msg["records"]:
+            if r["section"] == "an":
+                try:
+                    key = (_key(r["name"]), r["type"], record_value(msg, r))
+                except (ValueError, struct.error):
+                    continue
+                known[key] = max(known.get(key, 0), r["ttl"])
+        answers, extra, all_qu = [], [], True
+        for labels, qtype, qclass in msg["questions"]:
+            if qclass & 0x7FFF not in (C_IN, T_ANY):
+                continue
+            found, more = self._lookup(labels, qtype)
+            found = [rec for rec in found if known.get(
+                (_key(rec.labels), rec.rtype, rec.value), -1) < rec.ttl / 2]
+            if found:
+                all_qu = all_qu and bool(qclass & QU_BIT)
+                answers += [rec for rec in found if rec not in answers]
+                extra += [rec for rec in more if rec not in extra]
+        if not answers:
+            return []
+        extra = [rec for rec in extra if rec not in answers]
+        if src[1] != MDNS_PORT:              # legacy unicast: plain DNS rules
+            pkt = build_message(
+                msg["id"], FLAGS_RESPONSE, questions=msg["questions"],
+                answers=[r.wire(min(r.ttl, LEGACY_TTL), flush=False) for r in answers],
+                additionals=[r.wire(min(r.ttl, LEGACY_TTL), flush=False) for r in extra])
+            return [(pkt, src)]
+        pkt = build_message(0, FLAGS_RESPONSE, answers=[r.wire() for r in answers],
+                            additionals=[r.wire() for r in extra])
+        return [(pkt, src if all_qu else (MDNS_GROUP, MDNS_PORT))]
+
+    def conflicts(self, msg):
+        """True if another responder claims our instance name with other data."""
+        if not msg["flags"] & 0x8000:
+            return False
+        mine = {T_SRV: self.srv.value, T_TXT: self.txt_rec.value}
+        key = _key(self.instance_labels)
+        for r in msg["records"]:
+            if _key(r["name"]) != key or r["ttl"] == 0:
+                continue
+            try:
+                value = record_value(msg, r)
+            except (ValueError, struct.error):
+                continue
+            if mine.get(r["type"]) != value:
+                return True
+        return False
+
+
+# -- which address to announce
+
+def ipv4_interfaces():
+    """[{name, address, netmask, flags}] of this network namespace via ioctl
+    (Linux); an empty list where that is not available."""
+    out = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return out
+    try:
+        size = 40 if struct.calcsize("P") == 8 else 32          # sizeof(struct ifreq)
+        buf = array.array("B", bytes(size * 256))
+        res = fcntl.ioctl(s.fileno(), 0x8912,                    # SIOCGIFCONF
+                          struct.pack("iL", size * 256, buf.buffer_info()[0]))
+        length = struct.unpack("iL", res)[0]
+        data = buf.tobytes()[:length]
+        for off in range(0, length, size):
+            name = data[off:off + 16].split(b"\0", 1)[0].decode("ascii", "replace")
+            ifreq = struct.pack("256s", name.encode("ascii", "replace")[:15])
+            flags = struct.unpack_from("H", fcntl.ioctl(s.fileno(), 0x8913, ifreq), 16)[0]
+            try:
+                netmask = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x891B, ifreq)[20:24])
+            except OSError:
+                netmask = None
+            out.append({"name": name, "address": socket.inet_ntoa(data[off + 20:off + 24]),
+                        "netmask": netmask, "flags": flags})
+    except (OSError, ValueError, struct.error):
+        return out
+    finally:
+        s.close()
+    return out
+
+
+def default_route_ipv4():
+    """Source address the kernel would use for the default route (no packet is sent)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return None
+    try:
+        s.connect(("192.0.2.1", 9))
+        a = s.getsockname()[0]
+        return None if a.startswith("0.") else a
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def in_container():
+    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup", encoding="utf-8", errors="replace") as f:
+            c = f.read()
+    except OSError:
+        return False
+    return any(k in c for k in ("docker", "containerd", "kubepods", "libpod"))
+
+
+BRIDGE_HINT = ("mDNS discovery skipped: only container-internal addresses are visible (%s). "
+               "Discovery needs host networking (Docker: network_mode: host or --network host). "
+               "Clients then need the URL, or set KNXPROD_MDNS_ADDRESS.")
+
+
+def mdns_plan(bind, override=None, interfaces=None, default_route=None, container=None):
+    """Decide which IPv4 address(es) to announce and on which interface.
+    Returns {addresses, interface, netmask, reason, warning}; no addresses
+    means skip mDNS (reason says why)."""
+    if interfaces is None:
+        interfaces = ipv4_interfaces()
+    if container is None:
+        container = in_container()
+    # a container that sees no bridge or veth interfaces runs in a bridge network itself
+    bridged_ns = container and not any(_BRIDGE_IF_RE.match(i["name"]) for i in interfaces)
+
+    def internal(addr, ifname=None):
+        if ifname and _BRIDGE_IF_RE.match(ifname):
+            return True
+        ip = ipaddress.ip_address(addr)
+        return bridged_ns and any(ip in n for n in _CONTAINER_NETS)
+
+    def iface(addr):
+        return next((i for i in interfaces if i["address"] == addr), None)
+
+    def skip(reason, warning=True):
+        return {"addresses": [], "interface": None, "netmask": None, "reason": reason,
+                "warning": warning}
+
+    def use(addrs):
+        i = iface(addrs[0])
+        return {"addresses": addrs, "interface": addrs[0], "netmask": i and i["netmask"],
+                "reason": None, "warning": False}
+
+    if override:
+        addrs = [a for a in override if not ipaddress.ip_address(a).is_loopback]
+        return use(addrs) if addrs else skip("KNXPROD_MDNS_ADDRESS holds only loopback addresses")
+    b = (bind or "").strip()
+    if b.startswith("[") and b.endswith("]"):
+        b = b[1:-1]
+    ip = _ip(b) if b else None
+    if ip is not None and ip.version == 6 and not ip.is_unspecified:
+        return skip("listening on an IPv6 address; mDNS here announces IPv4 only")
+    if ip is not None and not ip.is_unspecified:
+        if ip.is_loopback:
+            return skip("listening on loopback only; nothing to announce", warning=False)
+        i = iface(str(ip))
+        if internal(str(ip), i and i["name"]):
+            if container:
+                return skip(BRIDGE_HINT % ip)
+            return skip("%s belongs to a container or VM bridge (%s); mDNS announces LAN "
+                        "addresses only" % (ip, i and i["name"]))
+        return use([str(ip)])
+    usable = []
+    for i in interfaces:
+        a = ipaddress.ip_address(i["address"])
+        if (i["flags"] & IFF_UP and i["flags"] & IFF_MULTICAST
+                and not i["flags"] & (IFF_LOOPBACK | IFF_POINTOPOINT)
+                and not a.is_loopback and not a.is_link_local
+                and not internal(i["address"], i["name"])):
+            usable.append(i)
+    if not usable:
+        seen = sorted({i["address"] for i in interfaces
+                       if not ipaddress.ip_address(i["address"]).is_loopback})
+        if container:
+            return skip(BRIDGE_HINT % (", ".join(seen) or "none"))
+        return skip("no multicast-capable LAN interface with an IPv4 address")
+    dr = default_route_ipv4() if default_route is None else default_route
+    chosen = next((i for i in usable if i["address"] == dr), usable[0])
+    base = chosen["name"].split(":", 1)[0]
+    addrs = [i["address"] for i in usable if i["name"].split(":", 1)[0] == base]
+    addrs.sort(key=lambda a: a != chosen["address"])
+    return {"addresses": addrs, "interface": chosen["address"], "netmask": chosen["netmask"],
+            "reason": None, "warning": False}
+
+
+def default_mdns_hostname():
+    h = re.sub(r"[^A-Za-z0-9-]", "-", socket.gethostname().split(".")[0]).strip("-")
+    return h[:63] or "knxprod-mcp"
+
+
+class MdnsResponder(threading.Thread):
+    """Owns the UDP socket: probe, announce, answer, goodbye."""
+
+    def __init__(self, core, plan, log, sock=None):
+        super().__init__(name="knxprod-mdns", daemon=True)
+        self.core, self.plan, self.log, self.sock = core, plan, log, sock
+        self.stop_event = threading.Event()
+        self.status = "starting"
+        self.announced = False
+        self._lock = threading.Lock()
+        self._conflict_logged = False
+        self._net = None
+        if plan.get("netmask"):
+            self._net = ipaddress.ip_network("%s/%s" % (plan["interface"], plan["netmask"]),
+                                             strict=False)
+
+    def info(self):
+        return {"enabled": self.status in ("starting", "probing", "announced"),
+                "name": self.core.instance, "address": self.core.addresses[0],
+                "status": self.status}
+
+    def _open(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            s.bind(("", MDNS_PORT))
+            iface = socket.inet_aton(self.plan["interface"])
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                         socket.inet_aton(MDNS_GROUP) + iface)
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, iface)
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 255)
+        except OSError:
+            s.close()
+            raise
+        return s
+
+    def _send(self, pkt, dest):
+        with self._lock:
+            if self.sock is not None:
+                self.sock.sendto(pkt, dest)
+
+    def _recv(self, timeout):
+        self.sock.settimeout(max(0.01, timeout))
+        try:
+            data, src = self.sock.recvfrom(9000)
+        except (socket.timeout, BlockingIOError, InterruptedError):
+            return None
+        if self._net is not None:
+            try:
+                if ipaddress.ip_address(src[0]) not in self._net:
+                    return None              # only on-link senders are answered
+            except ValueError:
+                return None
+        try:
+            return parse_message(data), src
+        except (ValueError, struct.error):
+            return None
+
+    def probe(self):
+        """Claim the instance name: three probes 250 ms apart; on a conflict
+        take the next name (' (2)', ' (3)', ...)."""
+        self.status = "probing"
+        time.sleep(random.uniform(0, 0.25))
+        for _ in range(16):
+            conflict = False
+            for _ in range(3):
+                self._send(self.core.probe(), (MDNS_GROUP, MDNS_PORT))
+                end = time.monotonic() + 0.25
+                while not conflict and not self.stop_event.is_set():
+                    left = end - time.monotonic()
+                    if left <= 0:
+                        break
+                    got = self._recv(left)
+                    if got and self.core.conflicts(got[0]):
+                        conflict = True
+                if conflict or self.stop_event.is_set():
+                    break
+            if not conflict:
+                return self.core.instance
+            old = self.core.instance
+            self.core.set_instance(next_instance_name(old))
+            self.log("%s mDNS: %r is taken on the network, trying %r"
+                     % (_utc_now(), old, self.core.instance))
+        return self.core.instance
+
+    def run(self):
+        try:
+            if self.sock is None:
+                self.sock = self._open()
+        except OSError as e:
+            self.status = "error"
+            self.log("%s mDNS: cannot use UDP port %d (%s); discovery is off"
+                     % (_utc_now(), MDNS_PORT, e.strerror or e))
+            return
+        try:
+            self.probe()
+            if self.stop_event.is_set():
+                return
+            due = [time.monotonic() + d for d in (0.0, 1.0, 2.0)]
+            while not self.stop_event.is_set():
+                now = time.monotonic()
+                if due and due[0] <= now:
+                    due.pop(0)
+                    self._send(self.core.announcement(), (MDNS_GROUP, MDNS_PORT))
+                    if not self.announced:
+                        self.announced = True
+                        self.status = "announced"
+                        self.log("%s mDNS: announcing %r (%s.local -> %s, port %d)" % (
+                            _utc_now(), self.core.instance, self.core.host,
+                            ", ".join(self.core.addresses), self.core.port))
+                    continue
+                got = self._recv(min(1.0, due[0] - now) if due else 1.0)
+                if not got:
+                    continue
+                msg, src = got
+                if msg["flags"] & 0x8000:
+                    if not self._conflict_logged and self.core.conflicts(msg):
+                        self._conflict_logged = True
+                        self.log("%s mDNS: another responder (%s) claims %r with other data"
+                                 % (_utc_now(), src[0], self.core.instance))
+                    continue
+                for pkt, dest in self.core.respond(msg, src):
+                    self._send(pkt, dest)
+        except OSError as e:
+            if not self.stop_event.is_set():
+                self.status = "error"
+                self.log("%s mDNS: stopped after a socket error (%s)"
+                         % (_utc_now(), e.strerror or e))
+
+    def stop(self):
+        """Stop answering; send a goodbye (TTL 0) if we announced anything."""
+        self.stop_event.set()
+        if self.is_alive():
+            self.join(3)
+        try:
+            if self.announced:
+                self._send(self.core.announcement(ttl=0), (MDNS_GROUP, MDNS_PORT))
+        except OSError:
+            pass
+        with self._lock:
+            if self.sock is not None:
+                self.sock.close()
+                self.sock = None
+        if self.status != "error":
+            self.status = "stopped"
+
+
+# ---------------------------------------------------------------------------
 # HTTP: Host and Origin guards
 #
 # Host header (DNS rebinding guard): IP literals, localhost and *.local names
@@ -2931,7 +3501,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "version": VERSION, "apps": len(apps),
                                  "files": len(files),
                                  "file_errors": sum(1 for r in files.values()
-                                                    if r.get("status") == "error")})
+                                                    if r.get("status") == "error"),
+                                 "mdns": self.server.mdns_info()})
             else:
                 self._json(404, {"error": "not_found"})
         except _HttpError as e:
@@ -3111,6 +3682,9 @@ def is_any_address(bind):
     return ip is not None and ip.is_unspecified
 
 
+MDNS_OFF = {"enabled": False, "name": None, "address": None, "status": "off"}
+
+
 def make_server(bind, port, data_dir, products_dir, allowed_hosts=(), upload_origins=None,
                 allow_any_bind=False, activate=True):
     """Create the HTTP server and bind its socket.  With activate=False it does
@@ -3118,6 +3692,11 @@ def make_server(bind, port, data_dir, products_dir, allowed_hosts=(), upload_ori
     b = (bind or "").strip()
     if b.startswith("[") and b.endswith("]"):
         b = b[1:-1]
+    if b.lower() == "auto":                 # the LAN address mDNS would announce
+        plan = mdns_plan("0.0.0.0")
+        if not plan["addresses"]:
+            raise ConfigError("--bind auto found no LAN address: %s" % plan["reason"])
+        b = plan["interface"]
     if is_any_address(b) and not allow_any_bind:
         raise ConfigError("refusing to listen on all interfaces (%r) without --allow-any-bind "
                           "(KNXPROD_ALLOW_ANY_BIND=1); give an address of this host instead"
@@ -3138,6 +3717,7 @@ def make_server(bind, port, data_dir, products_dir, allowed_hosts=(), upload_ori
     httpd.upload_origins = (upload_origins if isinstance(upload_origins, frozenset)
                             else parse_upload_origins(upload_origins))
     httpd.log_line = _print_line
+    httpd.mdns_info = lambda: dict(MDNS_OFF)
     return httpd
 
 
@@ -3180,6 +3760,7 @@ class Service:
         self.httpd.log_line = self.log
         self.port = self.httpd.server_address[1]
         self.scanner = None
+        self.mdns = None
 
     def initial_sync(self):
         interval = self.cfg.get("scan_interval", DEFAULT_SCAN_INTERVAL)
@@ -3200,7 +3781,28 @@ class Service:
             self.scanner = ProductScanner(self.products, self.data, interval, self.log)
             self.scanner.start()
 
+    def start_mdns(self):
+        """Announce the service via mDNS unless switched off or pointless."""
+        m = self.cfg.get("mdns") or {}
+        if not m.get("enabled"):
+            return None
+        plan = mdns_plan(self.httpd.server_address[0], m.get("address") or None)
+        if not plan["addresses"]:
+            self.log("%s %s" % (_utc_now(), plan["reason"]))
+            info = dict(MDNS_OFF, status="skipped", reason=plan["reason"])
+            self.httpd.mdns_info = lambda: dict(info)
+            return None
+        hostname = m.get("hostname") or default_mdns_hostname()
+        core = MdnsCore(m.get("name") or "knxprod-mcp on %s" % hostname, hostname, self.port,
+                        plan["addresses"], ["txtvers=1", "path=/mcp", "v=%s" % VERSION])
+        self.mdns = MdnsResponder(core, plan, self.log)
+        self.httpd.mdns_info = self.mdns.info
+        self.mdns.start()
+        return self.mdns
+
     def close(self):
+        if self.mdns:
+            self.mdns.stop()                  # goodbye (TTL 0) first
         if self.scanner:
             self.scanner.stop_event.set()
         self.httpd.server_close()
@@ -3210,7 +3812,11 @@ def serve(cfg):
     svc = Service(cfg)
     svc.initial_sync()
     svc.activate()
+    info_path = os.path.join(svc.data, "server.json")
+    atomic_write_json(info_path, {"host": svc.httpd.server_address[0], "port": svc.port,
+                                  "pid": os.getpid(), "version": VERSION, "started": _utc_now()})
     svc.start_scanner()
+    svc.start_mdns()
 
     def _stop(signum, frame):
         raise KeyboardInterrupt
@@ -3226,8 +3832,35 @@ def serve(cfg):
         pass
     finally:
         svc.close()
+        try:
+            os.remove(info_path)
+        except OSError:
+            pass
         svc.log("%s knxprod-mcp stopped" % _utc_now())
     return 0
+
+
+def health_check(data_dir, timeout=4.0):
+    """Exit status for container health checks: 0 if the server that wrote
+    DATA/server.json answers /healthz with ok."""
+    info = _load_json(os.path.join(os.path.abspath(data_dir), "server.json"))
+    if not info:
+        print("knxprod-mcp: no running server found (server.json missing)", file=sys.stderr)
+        return 1
+    host, port = info.get("host") or "", int(info.get("port") or 0)
+    ip = _ip(host) if host else None
+    if not host or (ip is not None and ip.is_unspecified):
+        host = "::1" if ip is not None and ip.version == 6 else "127.0.0.1"
+    url = "http://%s:%d/healthz" % ("[%s]" % host if ":" in host else host, port)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as r:
+            ok = r.status == 200 and json.loads(r.read()).get("ok") is True
+    except (OSError, ValueError):
+        ok = False
+    if not ok:
+        print("knxprod-mcp: %s is not healthy" % url, file=sys.stderr)
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------------------
@@ -3252,12 +3885,15 @@ def build_parser():
     sub = ap.add_subparsers(dest="cmd", required=True)
     ps = sub.add_parser("serve", help="sync the product directory, then serve MCP over HTTP")
     py = sub.add_parser("sync", help="sync the product directory with the index once and exit")
+    ph = sub.add_parser("health", help="exit 0 if the running server answers /healthz")
+    ph.add_argument("--data", help="index directory (KNXPROD_DATA, default %s)" % DEFAULT_DATA)
     for p in (ps, py):
         p.add_argument("--products", help="product directory, scanned recursively for "
                                           ".knxprod/.zip (KNXPROD_DIR, default %s)"
                                           % DEFAULT_PRODUCTS)
         p.add_argument("--data", help="index directory (KNXPROD_DATA, default %s)" % DEFAULT_DATA)
-    ps.add_argument("--bind", help="listen address (KNXPROD_BIND, default %s)" % DEFAULT_BIND)
+    ps.add_argument("--bind", help="listen address, or 'auto' for this host's LAN address "
+                                   "(KNXPROD_BIND, default %s)" % DEFAULT_BIND)
     ps.add_argument("--port", type=int, help="port (KNXPROD_PORT, default %d)" % DEFAULT_PORT)
     ps.add_argument("--allowed-host", action="append",
                     help="extra host name clients may use, repeatable "
@@ -3271,13 +3907,22 @@ def build_parser():
                          "(KNXPROD_SCAN_INTERVAL, default %g)" % DEFAULT_SCAN_INTERVAL)
     ps.add_argument("--allow-any-bind", action="store_true",
                     help="allow listening on 0.0.0.0 / :: (KNXPROD_ALLOW_ANY_BIND=1)")
+    ps.add_argument("--no-mdns", action="store_true",
+                    help="do not announce the service via mDNS/DNS-SD (KNXPROD_MDNS=0)")
+    ps.add_argument("--mdns-name", help="DNS-SD instance name (KNXPROD_MDNS_NAME, "
+                                        "default 'knxprod-mcp on <hostname>')")
+    ps.add_argument("--mdns-hostname", help="host name announced as <name>.local "
+                                            "(KNXPROD_MDNS_HOSTNAME, default this host's name)")
+    ps.add_argument("--mdns-address", action="append",
+                    help="IPv4 address to announce, repeatable (KNXPROD_MDNS_ADDRESS, comma "
+                         "separated; default: the listen address or the LAN address)")
     return ap
 
 
 def resolve_config(args):
     """Command-line values win over environment variables, which win over defaults."""
     cfg = {"cmd": args.cmd,
-           "products": args.products or _env("KNXPROD_DIR") or DEFAULT_PRODUCTS,
+           "products": getattr(args, "products", None) or _env("KNXPROD_DIR") or DEFAULT_PRODUCTS,
            "data": args.data or _env("KNXPROD_DATA") or DEFAULT_DATA}
     if args.cmd != "serve":
         return cfg
@@ -3304,6 +3949,30 @@ def resolve_config(args):
     cfg["scan_interval"] = interval
     cfg["allow_any_bind"] = bool(args.allow_any_bind) or (
         (_env("KNXPROD_ALLOW_ANY_BIND") or "").lower() in ("1", "true", "yes", "on"))
+    name = args.mdns_name or _env("KNXPROD_MDNS_NAME")
+    if name is not None and not 0 < len(name.strip().encode("utf-8")) <= 63:
+        raise ConfigError("mDNS instance name must have 1..63 bytes: %r" % name)
+    hostname = args.mdns_hostname or _env("KNXPROD_MDNS_HOSTNAME")
+    if hostname is not None:
+        h = hostname.strip().rstrip(".")
+        if h.lower().endswith(".local"):
+            h = h[:-6]
+        if not re.match(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$", h):
+            raise ConfigError("mDNS host name must be one DNS label: %r" % hostname)
+        hostname = h
+    raw = args.mdns_address if args.mdns_address else _env_list("KNXPROD_MDNS_ADDRESS")
+    addresses = []
+    for a in (x.strip() for v in raw for x in v.split(",")):
+        if not a:
+            continue
+        try:
+            addresses.append(str(ipaddress.IPv4Address(a)))
+        except ValueError:
+            raise ConfigError("mDNS address must be an IPv4 address: %r" % a)
+    cfg["mdns"] = {"enabled": not args.no_mdns and (_env("KNXPROD_MDNS") or "1").lower()
+                   not in ("0", "false", "no", "off"),
+                   "name": name.strip() if name else None, "hostname": hostname,
+                   "address": addresses or None}
     return cfg
 
 
@@ -3313,6 +3982,8 @@ def main(argv=None):
         cfg = resolve_config(args)
         if cfg["cmd"] == "serve":
             return serve(cfg)
+        if cfg["cmd"] == "health":
+            return health_check(cfg["data"])
         _prepare_dirs(os.path.abspath(cfg["products"]), os.path.abspath(cfg["data"]))
         s = sync_products(cfg["products"], cfg["data"], settle=0, log=_print_line)
     except ConfigError as e:

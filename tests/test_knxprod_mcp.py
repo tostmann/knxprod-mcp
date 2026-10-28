@@ -6,6 +6,10 @@
 The fixture under tests/fixture/ is synthetic (fictitious manufacturer M-FFF0)
 and written for these tests.  HTTP tests listen on 127.0.0.1 with a free port.
 
+Optional live mDNS check on a LAN address of this host (sends multicast):
+
+    KNXPROD_TEST_MDNS_ADDRESS=192.168.1.10 python3 tests/test_knxprod_mcp.py TestMdnsLive
+
 Optional test against a real product file you own (never committed):
 
     KNXPROD_TEST_REAL_DATA=/path/to/file.knxprod python3 tests/test_knxprod_mcp.py
@@ -22,12 +26,14 @@ import re
 import shutil
 import socket
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -47,7 +53,8 @@ APP1 = "FFF0123456"
 APP2 = "FFF000AB01"
 ENV_KEYS = ("KNXPROD_DIR", "KNXPROD_DATA", "KNXPROD_BIND", "KNXPROD_PORT",
             "KNXPROD_ALLOWED_HOSTS", "KNXPROD_UPLOAD_ORIGINS", "KNXPROD_SCAN_INTERVAL",
-            "KNXPROD_ALLOW_ANY_BIND")
+            "KNXPROD_ALLOW_ANY_BIND", "KNXPROD_MDNS", "KNXPROD_MDNS_NAME", "KNXPROD_MDNS_HOSTNAME",
+            "KNXPROD_MDNS_ADDRESS")
 
 
 def _tmpdir():
@@ -57,6 +64,11 @@ def _tmpdir():
 def _read(path):
     with open(path, "rb") as f:
         return f.read()
+
+
+def load_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def members(*parts, app2_name=None):
@@ -136,7 +148,8 @@ def env(**values):
 
 
 class Server:
-    """The real service in a thread on 127.0.0.1 and a free port."""
+    """The real service in a thread; by default on 127.0.0.1, a free port and
+    without mDNS."""
 
     def __init__(self, products, data, **cfg):
         self.lines = []
@@ -147,20 +160,27 @@ class Server:
         self.svc.initial_sync()
         self.svc.activate()
         self.svc.start_scanner()
+        self.svc.start_mdns()
         self.port = self.svc.port
+        host = self.svc.httpd.server_address[0]
+        self.host = "127.0.0.1" if K.is_any_address(host) else host
+        self.stopped = False
         self.thread = threading.Thread(target=self.svc.httpd.serve_forever, daemon=True)
         self.thread.start()
 
     def stop(self):
+        if self.stopped:
+            return
+        self.stopped = True
         self.svc.httpd.shutdown()
         self.svc.close()
         self.thread.join(5)
 
     def request(self, method, path, body=b"", headers=None, host=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=120)
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=120)
         try:
             conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
-            conn.putheader("Host", host if host is not None else "127.0.0.1:%d" % self.port)
+            conn.putheader("Host", host if host is not None else "%s:%d" % (self.host, self.port))
             for k, v in (headers or {}).items():
                 conn.putheader(k, v)
             if method in ("POST", "PUT") or body:
@@ -659,6 +679,8 @@ class TestConfig(unittest.TestCase):
                          ("/knxprod", "/data", "127.0.0.1", 8095))
         self.assertEqual((c["scan_interval"], c["allow_any_bind"], c["upload_origins"],
                           c["allowed_hosts"]), (10.0, False, None, []))
+        self.assertEqual(c["mdns"], {"enabled": True, "name": None, "hostname": None,
+                                     "address": None})
 
     def test_environment(self):
         with env(KNXPROD_DIR="/p", KNXPROD_DATA="/d", KNXPROD_BIND="192.0.2.10",
@@ -704,7 +726,7 @@ class TestConfig(unittest.TestCase):
 
     def test_main_reports_config_errors(self):
         with env(KNXPROD_PORT="nope"):
-            with contextlib.redirect_stderr(open(os.devnull, "w")):
+            with open(os.devnull, "w") as dn, contextlib.redirect_stderr(dn):
                 self.assertEqual(K.main(["serve"]), 2)
 
 
@@ -802,14 +824,14 @@ class TestProductDirectory(unittest.TestCase):
         self.assertEqual(self.index()[APP1]["sources"], ["a.knxprod"])
         self.assertEqual(self.files_state()["a.knxprod"]["sha256"],
                          K._sha256_file(os.path.join(self.products, "a.knxprod")))
-        generated = json.load(open(os.path.join(self.data, "index.json")))["generated"]
+        generated = load_json(os.path.join(self.data, "index.json"))["generated"]
         s = self.sync()
         self.assertEqual((s["added"], s["changed"], s["unchanged"]), ([], [], 1))
         t = time.time() - 30
         os.utime(os.path.join(self.products, "a.knxprod"), (t, t))       # touched, same bytes
         s = self.sync()
         self.assertEqual((s["changed"], s["unchanged"]), ([], 1))
-        self.assertEqual(json.load(open(os.path.join(self.data, "index.json")))["generated"],
+        self.assertEqual(load_json(os.path.join(self.data, "index.json"))["generated"],
                          generated)
 
     def test_files_are_never_modified(self):
@@ -865,7 +887,7 @@ class TestProductDirectory(unittest.TestCase):
         self.put("b.knxprod", zip_bytes(members("master", "hardware", "app2",
                                                 app2_name="Test actuator 00AB (b)")))
         self.sync()
-        name = lambda: json.load(open(os.path.join(self.data, "apps", APP2 + ".json")))["name"]
+        name = lambda: load_json(os.path.join(self.data, "apps", APP2 + ".json"))["name"]
         self.assertEqual(name(), "Test actuator 00AB (b)")             # b was read last
         os.remove(os.path.join(self.products, "b.knxprod"))
         s = self.sync()
@@ -960,6 +982,8 @@ class TestHttp(unittest.TestCase):
     def test_a_initial_sync_before_serving(self):
         h = self.srv.health()
         self.assertEqual((h["ok"], h["apps"], h["files"], h["file_errors"]), (True, 1, 1, 0))
+        self.assertEqual(h["mdns"], {"enabled": False, "name": None, "address": None,
+                                     "status": "off"})
         self.assertTrue(any("indexed start.knxprod" in ln for ln in self.srv.lines))
 
     def test_b_host_guard(self):
@@ -1119,7 +1143,453 @@ class TestHttp(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 9. optional: a real product file (KNXPROD_TEST_REAL_DATA)
+# 9. mDNS / DNS-SD without network
+# ---------------------------------------------------------------------------
+
+SVC = ("_knxprod-mcp", "_tcp", "local")
+INST = ("knxprod-mcp on testhost",) + SVC
+HOST = ("testhost", "local")
+
+
+def core():
+    return K.MdnsCore("knxprod-mcp on testhost", "testhost", 8095, ["192.168.1.10"],
+                      ["txtvers=1", "path=/mcp", "v=" + K.VERSION])
+
+
+def records(msg, section):
+    return [(r["name"], r["type"], r["class"], r["ttl"], K.record_value(msg, r))
+            for r in msg["records"] if r["section"] == section]
+
+
+def txt_strings(blob):
+    out, i = [], 0
+    while i < len(blob):
+        n = blob[i]
+        out.append(blob[i + 1:i + 1 + n].decode())
+        i += 1 + n
+    return out
+
+
+class FakeSock:
+    """Stands in for the UDP socket: records what is sent, plays back replies."""
+
+    def __init__(self, replies=()):
+        self.sent, self.replies, self.timeout = [], list(replies), 0.01
+
+    def sendto(self, data, dest):
+        self.sent.append((data, dest))
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def recvfrom(self, n):
+        if self.replies:
+            return self.replies.pop(0)
+        time.sleep(min(self.timeout, 0.25))
+        raise socket.timeout()
+
+    def close(self):
+        pass
+
+
+class TestMdnsWire(unittest.TestCase):
+
+    def test_names(self):
+        data = K.encode_name(INST)
+        self.assertEqual(K.read_name(data, 0), (INST, len(data)))
+        with self.assertRaises(ValueError):
+            K.encode_name(("x" * 64, "local"))
+        with self.assertRaises(ValueError):
+            K.encode_name(("", "local"))
+        self.assertEqual(len(K.clip_label("ä" * 40).encode()), 62)
+
+    def test_compression_pointers_in_queries(self):
+        head = struct.pack("!6H", 0x1234, 0, 3, 0, 0, 0)
+        q1 = K.encode_name(SVC) + struct.pack("!2H", K.T_PTR, K.C_IN)
+        # "x" + pointer to the service name; "y" + pointer into the middle ("_tcp.local")
+        q2 = b"\x01x" + bytes([0xC0, 12]) + struct.pack("!2H", K.T_SRV, K.C_IN)
+        q3 = b"\x01y" + bytes([0xC0, 12 + 1 + len("_knxprod-mcp")]) + struct.pack(
+            "!2H", K.T_A, K.C_IN)
+        msg = K.parse_message(head + q1 + q2 + q3)
+        self.assertEqual(msg["id"], 0x1234)
+        self.assertEqual([q[0] for q in msg["questions"]],
+                         [SVC, ("x",) + SVC, ("y", "_tcp", "local")])
+
+    def test_bad_pointers_are_rejected(self):
+        head = struct.pack("!6H", 0, 0, 1, 0, 0, 0)
+        for name in (bytes([0xC0, 12]),                  # points at itself
+                     bytes([0xC0, 40]),                  # points forward
+                     bytes([0xC0]),                      # truncated
+                     b"\x05abc"):                        # label runs past the end
+            with self.assertRaises(ValueError, msg=name):
+                K.parse_message(head + name + struct.pack("!2H", 1, 1))
+
+    def test_next_instance_name(self):
+        self.assertEqual(K.next_instance_name("knxprod-mcp on a"), "knxprod-mcp on a (2)")
+        self.assertEqual(K.next_instance_name("knxprod-mcp on a (2)"), "knxprod-mcp on a (3)")
+        long = K.next_instance_name("x" * 63)
+        self.assertTrue(long.endswith(" (2)"))
+        self.assertLessEqual(len(long.encode()), 63)
+
+
+class TestMdnsAnswers(unittest.TestCase):
+
+    def ask(self, questions, src=("192.168.1.20", 5353), mid=0, known=()):
+        q = K.parse_message(K.build_message(mid, 0, questions=questions, answers=known))
+        return [(K.parse_message(pkt), dest) for pkt, dest in core().respond(q, src)]
+
+    def test_ptr_query_answers_with_additionals(self):
+        [(msg, dest)] = self.ask([(SVC, K.T_PTR, K.C_IN)])
+        self.assertEqual(dest, ("224.0.0.251", 5353))
+        self.assertEqual((msg["id"], msg["flags"]), (0, 0x8400))
+        self.assertEqual(records(msg, "an"), [(SVC, K.T_PTR, 1, 4500, K._key(INST))])
+        add = {r[1]: r for r in records(msg, "ar")}
+        self.assertEqual(sorted(add), [K.T_A, K.T_TXT, K.T_SRV])
+        self.assertEqual(add[K.T_SRV], (INST, K.T_SRV, 0x8001, 120, (0, 0, 8095, K._key(HOST))))
+        self.assertEqual(add[K.T_A][2:], (0x8001, 120, socket.inet_aton("192.168.1.10")))
+        self.assertEqual(add[K.T_TXT][:4], (INST, K.T_TXT, 0x8001, 4500))
+        self.assertEqual(txt_strings(add[K.T_TXT][4]), ["txtvers=1", "path=/mcp",
+                                                        "v=" + K.VERSION])
+
+    def test_service_enumeration(self):
+        [(msg, _)] = self.ask([(("_services", "_dns-sd", "_udp", "local"), K.T_PTR, K.C_IN)])
+        self.assertEqual(records(msg, "an")[0][4], K._key(SVC))
+        self.assertEqual(records(msg, "ar"), [])
+
+    def test_srv_txt_a_any(self):
+        [(msg, _)] = self.ask([(INST, K.T_SRV, K.C_IN)])
+        self.assertEqual([r[1] for r in records(msg, "an")], [K.T_SRV])
+        self.assertEqual([r[1] for r in records(msg, "ar")], [K.T_A])
+        [(msg, _)] = self.ask([(INST, K.T_TXT, K.C_IN)])
+        self.assertEqual([r[1] for r in records(msg, "an")], [K.T_TXT])
+        [(msg, _)] = self.ask([(HOST, K.T_A, K.C_IN)])
+        self.assertEqual(records(msg, "an")[0][4], socket.inet_aton("192.168.1.10"))
+        [(msg, _)] = self.ask([(INST, K.T_ANY, K.C_IN)])
+        self.assertEqual(sorted(r[1] for r in records(msg, "an")), [K.T_TXT, K.T_SRV])
+        upper = tuple(lb.upper() for lb in INST)                  # names are case-insensitive
+        self.assertEqual(len(self.ask([(upper, K.T_SRV, K.C_IN)])), 1)
+        self.assertEqual(self.ask([(("other",) + SVC, K.T_SRV, K.C_IN)]), [])
+        self.assertEqual(self.ask([(HOST, K.T_AAAA, K.C_IN)]), [])
+
+    def test_qu_bit_and_legacy_unicast(self):
+        [(msg, dest)] = self.ask([(SVC, K.T_PTR, K.C_IN | K.QU_BIT)])
+        self.assertEqual(dest, ("192.168.1.20", 5353))            # unicast to the querier
+        [(msg, dest)] = self.ask([(SVC, K.T_PTR, K.C_IN)], src=("192.168.1.20", 40000),
+                                 mid=0x4242)
+        self.assertEqual(dest, ("192.168.1.20", 40000))
+        self.assertEqual(msg["id"], 0x4242)
+        self.assertEqual(msg["questions"], [(SVC, K.T_PTR, K.C_IN)])
+        for r in msg["records"]:
+            self.assertLessEqual(r["ttl"], 10)
+            self.assertEqual(r["class"], 1)                       # no cache-flush bit
+
+    def test_known_answer_suppression_and_responses(self):
+        ptr = core().ptr
+        self.assertEqual(self.ask([(SVC, K.T_PTR, K.C_IN)], known=[ptr.wire()]), [])
+        self.assertEqual(len(self.ask([(SVC, K.T_PTR, K.C_IN)], known=[ptr.wire(ttl=100)])), 1)
+        reply = K.parse_message(core().announcement())
+        self.assertEqual(core().respond(reply, ("192.168.1.20", 5353)), [])
+
+    def test_announcement_goodbye_probe(self):
+        msg = K.parse_message(core().announcement())
+        self.assertEqual(sorted(r[1] for r in records(msg, "an")),
+                         [K.T_A, K.T_PTR, K.T_PTR, K.T_TXT, K.T_SRV])
+        bye = K.parse_message(core().announcement(ttl=0))
+        self.assertEqual({r["ttl"] for r in bye["records"]}, {0})
+        probe = K.parse_message(core().probe())
+        self.assertEqual((probe["flags"], probe["questions"]), (0, [(INST, K.T_ANY, K.C_IN)]))
+        self.assertEqual(sorted(r[1] for r in records(probe, "ns")), [K.T_TXT, K.T_SRV])
+
+    def test_conflicts(self):
+        mine = core()
+        other = K.MdnsCore(mine.instance, "otherhost", 8095, ["192.168.1.11"], mine.txt)
+        self.assertTrue(mine.conflicts(K.parse_message(other.announcement())))
+        self.assertFalse(mine.conflicts(K.parse_message(mine.announcement())))
+        self.assertFalse(mine.conflicts(K.parse_message(other.announcement(ttl=0))))
+        self.assertFalse(mine.conflicts(K.parse_message(other.probe())))
+
+
+class TestMdnsResponder(unittest.TestCase):
+    PLAN = {"addresses": ["192.168.1.10"], "interface": "192.168.1.10",
+            "netmask": "255.255.255.0"}
+
+    def test_probe_conflict_gets_a_suffix(self):
+        mine = core()
+        other = K.MdnsCore(mine.instance, "otherhost", 8095, ["192.168.1.11"], mine.txt)
+        sock = FakeSock([(other.announcement(), ("192.168.1.11", 5353))])
+        lines = []
+        r = K.MdnsResponder(mine, self.PLAN, lines.append, sock=sock)
+        self.assertEqual(r.probe(), "knxprod-mcp on testhost (2)")
+        asked = [K.parse_message(pkt)["questions"][0][0][0] for pkt, _ in sock.sent]
+        self.assertEqual(asked[0], "knxprod-mcp on testhost")
+        self.assertEqual(asked[-3:], ["knxprod-mcp on testhost (2)"] * 3)
+        self.assertTrue(any("is taken" in ln for ln in lines))
+
+    def test_announce_answer_goodbye(self):
+        mine = core()
+        query = K.build_message(0x7777, 0, questions=[(SVC, K.T_PTR, K.C_IN)])
+        sock = FakeSock()
+        r = K.MdnsResponder(mine, self.PLAN, lambda line: None, sock=sock)
+        r.start()
+        self.assertTrue(wait_for(lambda: r.status == "announced", 5))
+        sock.replies.append((query, ("192.168.1.20", 41000)))       # legacy unicast query
+        sock.replies.append((query, ("10.9.9.9", 41000)))           # off-link: ignored
+        self.assertTrue(wait_for(lambda: any(d == ("192.168.1.20", 41000)
+                                             for _, d in sock.sent), 5))
+        time.sleep(0.6)                                             # give it time to (not) answer
+        self.assertFalse(any(d[0] == "10.9.9.9" for _, d in sock.sent))
+        info = r.info()
+        self.assertEqual((info["enabled"], info["name"], info["address"]),
+                         (True, "knxprod-mcp on testhost", "192.168.1.10"))
+        r.stop()
+        last = K.parse_message(sock.sent[-1][0])
+        self.assertEqual((sock.sent[-1][1], {x["ttl"] for x in last["records"]}),
+                         (("224.0.0.251", 5353), {0}))
+        self.assertEqual(r.info()["enabled"], False)
+
+
+def iface(name, addr, flags=0x1043, mask="255.255.255.0"):
+    return {"name": name, "address": addr, "netmask": mask, "flags": flags}
+
+
+LO = iface("lo", "127.0.0.1", 0x49, "255.0.0.0")
+
+
+class TestMdnsAddress(unittest.TestCase):
+
+    def plan(self, bind, interfaces, container=False, default_route="", override=None):
+        return K.mdns_plan(bind, override, interfaces, default_route, container)
+
+    def test_specific_and_any_bind(self):
+        host = [LO, iface("eth0", "192.168.1.10"), iface("wg0", "10.0.0.2", 0xd1),
+                iface("docker0", "172.17.0.1", mask="255.255.0.0"), iface("tap0", "192.168.45.1"),
+                iface("eth0:1", "192.168.1.11")]
+        p = self.plan("192.168.1.10", host)
+        self.assertEqual((p["addresses"], p["netmask"]), (["192.168.1.10"], "255.255.255.0"))
+        p = self.plan("0.0.0.0", host, default_route="192.168.1.10")
+        self.assertEqual(p["addresses"], ["192.168.1.10", "192.168.1.11"])
+        p = self.plan("0.0.0.0", host, default_route="192.168.45.1")
+        self.assertEqual(p["addresses"], ["192.168.45.1"])
+        p = self.plan("::", host, default_route="192.168.1.10")
+        self.assertEqual(p["addresses"], ["192.168.1.10", "192.168.1.11"])
+
+    def test_nothing_to_announce(self):
+        p = self.plan("127.0.0.1", [LO])
+        self.assertEqual((p["addresses"], p["warning"]), ([], False))
+        p = self.plan("0.0.0.0", [LO, iface("wg0", "10.0.0.2", 0xd1)])
+        self.assertEqual(p["addresses"], [])
+        self.assertIn("no multicast-capable", p["reason"])
+        p = self.plan("fd00::5", [LO])
+        self.assertIn("IPv6", p["reason"])
+        p = self.plan("172.17.0.1", [LO, iface("docker0", "172.17.0.1", mask="255.255.0.0")])
+        self.assertIn("bridge", p["reason"])
+
+    def test_container_bridge_only_is_skipped_with_warning(self):
+        bridged = [LO, iface("eth0", "172.18.0.2", mask="255.255.0.0")]
+        for bind in ("0.0.0.0", "172.18.0.2"):
+            p = self.plan(bind, bridged, container=True)
+            self.assertEqual((p["addresses"], p["warning"]), ([], True))
+            self.assertIn("host networking", p["reason"])
+
+    def test_container_with_host_networking_or_lan_address(self):
+        hostnet = [LO, iface("eth0", "192.168.1.10"), iface("docker0", "172.17.0.1"),
+                   iface("vethab12", "169.254.3.3")]
+        p = self.plan("0.0.0.0", hostnet, container=True, default_route="192.168.1.10")
+        self.assertEqual(p["addresses"], ["192.168.1.10"])
+        macvlan = [LO, iface("eth0", "192.168.1.50")]
+        self.assertEqual(self.plan("0.0.0.0", macvlan, container=True)["addresses"],
+                         ["192.168.1.50"])
+
+    def test_override(self):
+        p = self.plan("0.0.0.0", [LO], override=["192.168.5.5"])
+        self.assertEqual(p["addresses"], ["192.168.5.5"])
+        p = self.plan("0.0.0.0", [LO], override=["127.0.0.1"])
+        self.assertEqual(p["addresses"], [])
+
+
+class TestMdnsService(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = _tmpdir()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.saved = (K.ipv4_interfaces, K.in_container, K.default_route_ipv4)
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        K.ipv4_interfaces, K.in_container, K.default_route_ipv4 = self.saved
+
+    def test_bridge_only_container_skips_with_warning(self):
+        K.ipv4_interfaces = lambda: [LO, iface("eth0", "172.18.0.2", mask="255.255.0.0")]
+        K.in_container = lambda: True
+        K.default_route_ipv4 = lambda: "172.18.0.2"
+        srv = Server(os.path.join(self.tmp, "p"), os.path.join(self.tmp, "d"),
+                     bind="127.0.0.1", mdns={"enabled": True})
+        self.addCleanup(srv.stop)
+        self.assertIsNone(srv.svc.mdns)
+        # the server itself listens on 127.0.0.1 here: nothing to announce, quietly
+        self.assertEqual(srv.health()["mdns"]["status"], "skipped")
+        plan = K.mdns_plan("0.0.0.0")
+        self.assertIn("host networking", plan["reason"])
+        svc_lines = []
+        svc = K.Service({"products": os.path.join(self.tmp, "p"),
+                         "data": os.path.join(self.tmp, "d2"), "bind": "127.0.0.1", "port": 0,
+                         "mdns": {"enabled": True}}, log=svc_lines.append)
+        self.addCleanup(svc.close)
+        svc.httpd.server_address = ("0.0.0.0", svc.port)          # as if bound to all
+        self.assertIsNone(svc.start_mdns())
+        self.assertTrue(any("host networking" in ln for ln in svc_lines))
+        self.assertEqual(svc.httpd.mdns_info()["status"], "skipped")
+
+    def test_bind_auto(self):
+        K.ipv4_interfaces = lambda: [LO]
+        with self.assertRaises(K.ConfigError):
+            K.make_server("auto", 0, self.tmp, self.tmp)
+        orig = K.mdns_plan
+        K.mdns_plan = lambda bind, *a, **k: {"addresses": ["127.0.0.1"], "interface": "127.0.0.1"}
+        try:
+            httpd = K.make_server("auto", 0, self.tmp, self.tmp)
+            self.assertEqual(httpd.server_address[0], "127.0.0.1")
+            httpd.server_close()
+        finally:
+            K.mdns_plan = orig
+
+    def test_config_and_health_command(self):
+        with env(KNXPROD_MDNS="0"):
+            self.assertFalse(K.resolve_config(K.build_parser().parse_args(["serve"]))["mdns"]
+                             ["enabled"])
+        with env(KNXPROD_MDNS_NAME="KNX office", KNXPROD_MDNS_HOSTNAME="Box.local.",
+                 KNXPROD_MDNS_ADDRESS="192.168.1.10, 192.168.1.11"):
+            c = K.resolve_config(K.build_parser().parse_args(["serve"]))
+            self.assertEqual(c["mdns"], {"enabled": True, "name": "KNX office", "hostname": "Box",
+                                         "address": ["192.168.1.10", "192.168.1.11"]})
+            c = K.resolve_config(K.build_parser().parse_args(["serve", "--no-mdns"]))
+            self.assertFalse(c["mdns"]["enabled"])
+        for bad in ({"KNXPROD_MDNS_ADDRESS": "fe80::1"}, {"KNXPROD_MDNS_HOSTNAME": "a.b"},
+                    {"KNXPROD_MDNS_NAME": "x" * 64}):
+            with env(**bad):
+                with self.assertRaises(K.ConfigError, msg=str(bad)):
+                    K.resolve_config(K.build_parser().parse_args(["serve"]))
+        data = os.path.join(self.tmp, "d")
+        with open(os.devnull, "w") as dn, contextlib.redirect_stderr(dn):
+            self.assertEqual(K.health_check(data), 1)            # nothing running
+        srv = Server(os.path.join(self.tmp, "p"), data)
+        self.addCleanup(srv.stop)
+        K.atomic_write_json(os.path.join(data, "server.json"), {"host": "0.0.0.0",
+                                                               "port": srv.port})
+        self.assertEqual(K.health_check(data), 0)
+        srv.stop()
+        with open(os.devnull, "w") as dn, contextlib.redirect_stderr(dn):
+            self.assertEqual(K.health_check(data, timeout=1), 1)
+
+
+# ---------------------------------------------------------------------------
+# 10. optional: live mDNS on a LAN address (KNXPROD_TEST_MDNS_ADDRESS)
+# ---------------------------------------------------------------------------
+
+LIVE = os.environ.get("KNXPROD_TEST_MDNS_ADDRESS")
+LIVE_PORT = int(os.environ.get("KNXPROD_TEST_MDNS_PORT") or 0)
+
+
+def mdns_socket(addr, port=0):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if port:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    s.bind(("", port))
+    if port:
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                     socket.inet_aton("224.0.0.251") + socket.inet_aton(addr))
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(addr))
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+    return s
+
+
+def collect(sock, seconds, want):
+    """Messages received within `seconds` for which want(msg) is true."""
+    out, end = [], time.monotonic() + seconds
+    while time.monotonic() < end:
+        sock.settimeout(max(0.05, end - time.monotonic()))
+        try:
+            data, src = sock.recvfrom(9000)
+        except socket.timeout:
+            break
+        try:
+            msg = K.parse_message(data)
+        except ValueError:
+            continue
+        if want(msg):
+            out.append((msg, src))
+    return out
+
+
+@unittest.skipUnless(LIVE, "set KNXPROD_TEST_MDNS_ADDRESS to a LAN address of this host")
+class TestMdnsLive(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = _tmpdir()
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+        write_file(os.path.join(cls.tmp, "p", "a.knxprod"), full_knxprod())
+        cls.name = "knxprod-mcp live test %d" % os.getpid()
+        cls.srv = Server(os.path.join(cls.tmp, "p"), os.path.join(cls.tmp, "d"), bind=LIVE,
+                         port=LIVE_PORT, mdns={"enabled": True, "name": cls.name})
+        cls.addClassCleanup(cls.srv.stop)
+        assert wait_for(lambda: cls.srv.health()["mdns"]["status"] == "announced", 10)
+        cls.inst = K._key((cls.name,) + SVC)
+
+    def mine(self, msg):
+        return any(r["type"] == K.T_PTR and K.record_value(msg, r) == self.inst
+                   for r in msg["records"])
+
+    def check_additionals(self, msg):
+        add = {r["type"]: K.record_value(msg, r) for r in msg["records"]}
+        self.assertEqual(add[K.T_SRV][2], self.srv.port)
+        self.assertEqual(add[K.T_A], socket.inet_aton(LIVE))
+        self.assertIn(b"path=/mcp", add[K.T_TXT])
+        return add
+
+    def test_a_legacy_unicast_browse(self):
+        s = mdns_socket(LIVE)
+        try:
+            s.sendto(K.build_message(0x5151, 0, questions=[(SVC, K.T_PTR, K.C_IN)]),
+                     ("224.0.0.251", 5353))
+            got = collect(s, 2, self.mine)
+        finally:
+            s.close()
+        self.assertTrue(got, "no unicast answer")
+        msg, src = got[0]
+        self.assertEqual((msg["id"], msg["questions"]), (0x5151, [(SVC, K.T_PTR, K.C_IN)]))
+        self.check_additionals(msg)
+
+    def test_b_multicast_browse_and_connect(self):
+        s = mdns_socket(LIVE, 5353)
+        try:
+            s.sendto(K.build_message(0, 0, questions=[(SVC, K.T_PTR, K.C_IN)]),
+                     ("224.0.0.251", 5353))
+            got = collect(s, 2, lambda m: m["flags"] & 0x8000 and self.mine(m))
+        finally:
+            s.close()
+        self.assertTrue(got, "no multicast answer")
+        add = self.check_additionals(got[0][0])
+        url = "http://%s:%d/healthz" % (socket.inet_ntoa(add[K.T_A]), add[K.T_SRV][2])
+        with urllib.request.urlopen(url, timeout=5) as r:
+            h = json.loads(r.read())
+        self.assertEqual((h["ok"], h["mdns"]["name"], h["mdns"]["address"]),
+                         (True, self.name, LIVE))
+
+    def test_c_goodbye_on_stop(self):
+        s = mdns_socket(LIVE, 5353)
+        try:
+            self.srv.stop()
+            got = collect(s, 3, lambda m: m["flags"] & 0x8000 and self.mine(m))
+        finally:
+            s.close()
+        self.assertTrue(got, "no goodbye")
+        self.assertEqual({r["ttl"] for r in got[0][0]["records"]}, {0})
+
+
+# ---------------------------------------------------------------------------
+# 11. optional: a real product file (KNXPROD_TEST_REAL_DATA)
 # ---------------------------------------------------------------------------
 
 @unittest.skipUnless(REAL and os.path.isfile(REAL), "set KNXPROD_TEST_REAL_DATA to a product file")
