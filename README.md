@@ -112,7 +112,8 @@ needs no URL. Any DNS-SD browser shows it, for example
   stored a second time.
 - The index (distilled JSON, one sha256 per product file) lives in the data
   folder (`/data` in the container). You can delete it at any time; it is
-  rebuilt from the product folder on the next start.
+  rebuilt from the product folder on the next start. An index written by a
+  version with another record format is rebuilt on start as well.
 - A product folder mounted read-only works. Uploads are then refused.
 - Unpacked product folders are not read. Keep the `.knxprod` (or zip) file.
 
@@ -123,7 +124,7 @@ needs no URL. Any DNS-SD browser shows it, for example
 | `prod-applications` | which application programs are indexed (filter by manufacturer, words, order number) |
 | `prod-application` | one program by ApplicationId: products, mask, memory segments, table locations, byte order, load procedure |
 | `prod-comobjects` | com objects with all ComObjectRef variants: size, flags (C R W T U I), the ETS condition that shows each variant |
-| `prod-parameters` | parameters with absolute address, bit offset (from the MSB), size, value type, default; filter by words or address |
+| `prod-parameters` | parameters with absolute address, bit offset (from the MSB), size, value type, default; filter by words, address or module instance |
 | `prod-decode` | turns raw bytes read from device memory into parameter values |
 
 A device identifies its application program with a 5-byte ApplicationId
@@ -142,6 +143,14 @@ Some things to keep in mind:
 - Multi-byte parameter values follow the byte order the program declares. The
   indexer compares that declaration with the defaults in the manufacturer's
   memory template and adds a `byte_order_warning` when they disagree.
+- Many programs define a channel once as an ETS module and instantiate it per
+  channel. Each instance is listed on its own: its parameters get their own
+  addresses, its com objects their own numbers, and `module` names the instance
+  (for example `Channel B`). Repetitions (`Repeat`, allocators) are expanded the
+  same way. What cannot be resolved is counted in `counts.module_unsupported`.
+- Programs that keep their parameters in a relative segment have offsets but no
+  absolute addresses. Pass `segment` to `prod-parameters` and `prod-decode` and
+  give the offset within that segment as `address`.
 
 Every `tools/call` response stays at or below 12 000 bytes, so small clients
 that forward replies can handle it. Long lists are paginated (`offset`/`limit`
@@ -212,8 +221,11 @@ python3 tests/test_knxprod_mcp.py
 The tests use a synthetic fixture with a fictitious manufacturer and send no
 network traffic. To also check a real product file you own, set
 `KNXPROD_TEST_REAL_DATA=/path/to/file.knxprod`. Optionally set
-`KNXPROD_TEST_APP_ID` and `KNXPROD_TEST_OBJECTS` as well. A live mDNS check on
-the LAN runs with `KNXPROD_TEST_MDNS_ADDRESS=<a LAN address of this host>`.
+`KNXPROD_TEST_APP_ID` and `KNXPROD_TEST_OBJECTS` as well. To check the module
+instances of programs in such a file, set `KNXPROD_TEST_MODULE_DATA` to the file
+and `KNXPROD_TEST_MODULE_APPS` to their ApplicationIds (comma separated). A
+live mDNS check on the LAN runs with
+`KNXPROD_TEST_MDNS_ADDRESS=<a LAN address of this host>`.
 
 ## License
 

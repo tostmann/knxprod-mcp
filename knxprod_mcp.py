@@ -42,6 +42,11 @@ Parser traps this code is built around:
 4. ElementTree iterparse + el.clear() on every end event deletes children (and
    their attributes) before the enclosing record has been processed.  Only
    complete records are cleared.
+5. Parameters and com objects inside a <ModuleDef> are templates: a <Memory>
+   with BaseOffset and a <ComObject> with BaseNumber are placed by the value
+   each <Module> instance passes for that argument (NumericArg Value, or the
+   next value of an Allocator for each repetition of a <Repeat>).  Every
+   instance is distilled into records of its own.
 """
 
 import argparse
@@ -72,8 +77,8 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.3.0"
-SCHEMA_VERSION = 2
+VERSION = "0.4.0"
+SCHEMA_VERSION = 3                 # distilled record format; another value rebuilds the index
 SERVER_NAME = "knxprod-mcp"
 
 DEFAULT_DATA = "/data"
@@ -99,6 +104,7 @@ ZIP_MAX_MEMBERS = 5000             # members, all nesting levels
 ZIP_MAX_DEPTH = 3
 CACHE_BYTES = 24 << 20             # app JSON kept in memory, counted by file size
 MAX_CONDS = 3                      # innermost ETS conditions kept per object/parameter
+MAX_REPEAT = 256                   # module instances expanded per <Repeat>
 
 SLOT_NOTE = ("Names label slots of the application program, not what an "
              "installation uses them for; the channel mode decides.")
@@ -123,7 +129,14 @@ INSTRUCTIONS = (
     "in size, flags or text. Pick the variant whose size_bits matches the object "
     "size the device itself reports; 'when' shows the ETS condition (channel "
     "mode) under which a variant is shown.\n"
-    "Parameters: address = segment base + offset; bit_offset counts from the MSB "
+    "Channels that a program defines once as an ETS module and instantiates "
+    "several times are listed per instance: such a parameter or com object has "
+    "its own address or number and 'module' (the instance, e.g. 'Channel B'). "
+    "Alternative modules for one channel share memory and object numbers; "
+    "'when' says which one the channel mode selects.\n"
+    "Parameters: address = segment base + offset; in a relative segment (no "
+    "address) pass segment to prod-parameters / prod-decode and use the offset "
+    "within it. bit_offset counts from the MSB "
     "of the first byte; multi-byte values follow the byte order the program "
     "declares (byte_order) -- heed a byte_order_warning. Union members share "
     "memory: only the member whose 'when' matches the configured mode is valid. "
@@ -383,7 +396,8 @@ def _collect_translation(langs, lang, el):
 # ---------------------------------------------------------------------------
 
 class _RawApp:
-    """Everything of one <ApplicationProgram>, still with full XML ids."""
+    """Everything of one <ApplicationProgram>, still with full XML ids.  Each
+    <ModuleDef> gets an instance of its own for the records it defines."""
 
     def __init__(self, attrs):
         self.attrs = attrs
@@ -398,15 +412,16 @@ class _RawApp:
         self.tables = {}
         self.options = {}
         self.ldprocs = []
-        self.dynamic = {"co": {}, "pr": {}}
-        self.skipped_module_records = 0
+        self.dynamic = {"co": {}, "pr": {}, "modules": [], "first_block": None}
+        self.module_defs = {}           # ModuleDef Id -> _RawApp with its records
+        self.args = {}                  # in a ModuleDef: Argument Id -> declaration
+        self.allocators = {}            # Allocator Id -> {name, start, max}
+        self.unsupported = collections.Counter()
 
     # -- Static/Code
-    def add_abs_segment(self, el):
-        sid = el.get("Id")
-        size = _int(el.get("Size"))
-        self.segments[sid] = {"kind": "absolute", "address": _int(el.get("Address")),
-                              "size": size}
+    def _template(self, sid, el, size):
+        """<Data> of a segment: the manufacturer's memory image, usually
+        holding the parameter defaults."""
         for c in el:
             if _local(c.tag) == "Data" and c.text:
                 try:
@@ -416,10 +431,19 @@ class _RawApp:
                 if data is not None:
                     self.seg_data[sid] = data[:size] if size else data
 
+    def add_abs_segment(self, el):
+        sid = el.get("Id")
+        size = _int(el.get("Size"))
+        self.segments[sid] = {"kind": "absolute", "address": _int(el.get("Address")),
+                              "size": size}
+        self._template(sid, el, size)
+
     def add_rel_segment(self, el):
-        self.segments[el.get("Id")] = {"kind": "relative", "offset": _int(el.get("Offset")),
-                                       "size": _int(el.get("Size")),
-                                       "lsm": _int(el.get("LoadStateMachine"))}
+        sid = el.get("Id")
+        size = _int(el.get("Size"))
+        self.segments[sid] = {"kind": "relative", "offset": _int(el.get("Offset")),
+                              "size": size, "lsm": _int(el.get("LoadStateMachine"))}
+        self._template(sid, el, size)
 
     # -- Static/ParameterTypes
     def add_type(self, el):
@@ -460,25 +484,31 @@ class _RawApp:
     @staticmethod
     def _location(m, add_offset, add_bits):
         """Byte offset and MSB-first bit offset of a <Memory>/<Property>,
-        shifted by a union member's own Offset/BitOffset."""
+        shifted by a union member's own Offset/BitOffset.  In a module
+        definition, BaseOffset names the argument whose value is added to
+        the byte offset of each instance."""
         total = ((_int(m.get("Offset"), 0) + add_offset) * 8
                  + _int(m.get("BitOffset"), 0) + add_bits)
         if _local(m.tag) == "Memory":
-            return {"kind": "memory", "segment": m.get("CodeSegment"),
-                    "offset": total // 8, "bit_offset": total % 8}
-        loc = {"kind": "property", "offset": total // 8, "bit_offset": total % 8}
-        for key, attr in (("object_index", "ObjectIndex"), ("object_type", "ObjectType"),
-                          ("pid", "PropertyId"), ("occurrence", "Occurrence")):
-            v = _int(m.get(attr))
-            if v is not None:
-                loc[key] = v
+            loc = {"kind": "memory", "segment": m.get("CodeSegment"),
+                   "offset": total // 8, "bit_offset": total % 8}
+        else:
+            loc = {"kind": "property", "offset": total // 8, "bit_offset": total % 8}
+            for key, attr in (("object_index", "ObjectIndex"), ("object_type", "ObjectType"),
+                              ("pid", "PropertyId"), ("occurrence", "Occurrence")):
+                v = _int(m.get(attr))
+                if v is not None:
+                    loc[key] = v
+        if m.get("BaseOffset"):
+            loc["base"] = m.get("BaseOffset")
         return loc
 
     @staticmethod
     def _param_base(el):
         return {"id": el.get("Id"), "name": el.get("Name"), "text": el.get("Text"),
                 "type": el.get("ParameterType"), "access": el.get("Access"),
-                "default": el.get("Value"), "loc": None}
+                "default": el.get("Value"), "loc": None,
+                "text_param": el.get("TextParameterRefId")}
 
     def add_parameter(self, el):
         p = self._param_base(el)
@@ -507,27 +537,39 @@ class _RawApp:
     def add_parameter_ref(self, el):
         self.param_refs.append({"id": el.get("Id"), "ref": el.get("RefId"),
                                 "text": el.get("Text"), "default": el.get("Value"),
-                                "access": el.get("Access")})
+                                "access": el.get("Access"),
+                                "text_param": el.get("TextParameterRefId")})
 
-    # -- Static/ComObjectTable, ComObjectRefs
+    # -- Static/ComObjectTable (ComObjects in a module definition), ComObjectRefs
     def add_comobject(self, el):
         self.comobjects.append({
             "id": el.get("Id"), "number": _int(el.get("Number")), "name": el.get("Name"),
             "text": el.get("Text"), "function_text": el.get("FunctionText"),
             "size": el.get("ObjectSize"), "priority": el.get("Priority"),
-            "flags": {k: el.get(a) for k, a in _FLAG_ATTRS}, "dpt": el.get("DatapointType")})
+            "flags": {k: el.get(a) for k, a in _FLAG_ATTRS}, "dpt": el.get("DatapointType"),
+            "base_number": el.get("BaseNumber"), "text_param": el.get("TextParameterRefId")})
 
     def add_comobject_ref(self, el):
         self.comobject_refs.append({
             "id": el.get("Id"), "ref": el.get("RefId"), "text": el.get("Text"),
             "function_text": el.get("FunctionText"), "size": el.get("ObjectSize"),
             "priority": el.get("Priority"), "flags": {k: el.get(a) for k, a in _FLAG_ATTRS},
-            "dpt": el.get("DatapointType")})
+            "dpt": el.get("DatapointType"), "text_param": el.get("TextParameterRefId")})
 
     # -- Static/LoadProcedures
     def add_load_procedure(self, el):
         steps = [(_local(c.tag), dict(c.attrib)) for c in el if _local(c.tag).startswith("LdCtrl")]
         self.ldprocs.append((el.get("MergeId"), steps))
+
+    # -- ModuleDef/Arguments, Static/Allocators
+    def add_argument(self, el):
+        self.args[el.get("Id")] = {"name": el.get("Name") or "",
+                                   "text": (el.get("Type") or "").lower() == "text",
+                                   "allocates": _int(el.get("Allocates"))}
+
+    def add_allocator(self, el):
+        self.allocators[el.get("Id")] = {"name": el.get("Name"), "start": _int(el.get("Start")),
+                                         "max": _int(el.get("maxInclusive"))}
 
 
 def _note_ref(table, refid, conds, block):
@@ -540,19 +582,24 @@ def _note_ref(table, refid, conds, block):
         r[0] += 1
 
 
-def walk_dynamic(dyn):
+def walk_dynamic(dyn, in_module=False):
     """Record, per ComObjectRef/ParameterRef id, how often the ETS UI shows it
     and the innermost conditions (choose/when) plus block of its first
-    occurrence.  Iterative: the nesting can be deep."""
-    co, pr = {}, {}
-    stack = [[iter(list(dyn)), (), None, None]]
+    occurrence; and every <Module> instance with its arguments, conditions
+    and enclosing <Repeat>.  Iterative: the nesting can be deep.  Modules
+    inside a module definition and repeats inside repeats are only counted."""
+    co, pr, modules = {}, {}, []
+    unsupported = collections.Counter()
+    first_block = None
+    # frame: [children, conditions, block, (choose param, tests) or None, repeat]
+    stack = [[iter(list(dyn)), (), None, None, None]]
     while stack:
         frame = stack[-1]
         c = next(frame[0], None)
         if c is None:
             stack.pop()
             continue
-        conds, block, choose = frame[1], frame[2], frame[3]
+        conds, block, choose, repeat = frame[1], frame[2], frame[3], frame[4]
         k = _local(c.tag)
         if choose is not None:              # iterating the <when>s of a <choose>
             if k != "when":
@@ -566,28 +613,52 @@ def walk_dynamic(dyn):
                 cond = (pref, None, tests)  # default branch: none of the other tests
             else:
                 cond = None
-            stack.append([iter(list(c)), conds + ((cond,) if cond else ()), block, None])
+            stack.append([iter(list(c)), conds + ((cond,) if cond else ()), block, None, repeat])
         elif k == "choose":
             whens = [w for w in c if _local(w.tag) == "when"]
             tests = tuple(w.get("test") for w in whens
                           if w.get("test") is not None
                           and (w.get("default") or "").lower() not in ("true", "1"))
-            stack.append([iter(whens), conds, block, (c.get("ParamRefId"), tests)])
+            stack.append([iter(whens), conds, block, (c.get("ParamRefId"), tests), repeat])
         elif k == "ComObjectRefRef":
             _note_ref(co, c.get("RefId"), conds, block)
         elif k == "ParameterRefRef":
             _note_ref(pr, c.get("RefId"), conds, block)
+        elif k in ("Module", "Repeat") and in_module:
+            unsupported["%s_in_module_def" % k.lower()] += 1
+        elif k == "Repeat" and repeat is not None:
+            unsupported["repeat_in_repeat"] += 1
+        elif k == "Module":
+            args = {}
+            for a in c:
+                ak = _local(a.tag)
+                if ak == "NumericArg":
+                    args[a.get("RefId")] = {"value": a.get("Value"),
+                                            "allocator": a.get("AllocatorRefId")}
+                elif ak == "TextArg":
+                    args[a.get("RefId")] = {"value": a.get("Value"), "text_id": a.get("Id")}
+            modules.append({"id": c.get("Id"), "ref": c.get("RefId"), "name": c.get("Name"),
+                            "args": args, "conds": conds, "repeat": repeat})
+        elif k == "Repeat":
+            rep = {"id": c.get("Id"), "count": _int(c.get("Count")),
+                   "pref": c.get("ParameterRefId")}
+            stack.append([iter(list(c)), conds, block, None, rep])
         elif k in ("ParameterBlock", "Channel", "ChannelIndependentBlock"):
-            nb = (k, c.get("Id"), c.get("Text"), c.get("ParamRefId"), c.get("Name"))
-            stack.append([iter(list(c)), conds, nb, None])
+            nb = (k, c.get("Id"), c.get("Text"), c.get("ParamRefId"), c.get("Name"),
+                  c.get("TextParameterRefId"))
+            if first_block is None and block is None and c.get("Text"):
+                first_block = nb
+            stack.append([iter(list(c)), conds, nb, None, repeat])
         else:
-            stack.append([iter(list(c)), conds, block, None])
-    return {"co": co, "pr": pr}
+            stack.append([iter(list(c)), conds, block, None, repeat])
+    return {"co": co, "pr": pr, "modules": modules, "first_block": first_block,
+            "unsupported": unsupported}
 
 
 # elements whose children are complete records that were already processed
 _APP_CONTAINERS = {"Code", "ParameterTypes", "Parameters", "ParameterRefs", "ComObjectTable",
-                   "ComObjectRefs", "LoadProcedures", "Static", "ModuleDefs"}
+                   "ComObjects", "ComObjectRefs", "LoadProcedures", "Static", "ModuleDefs",
+                   "SubModuleDefs", "Arguments", "Allocators"}
 
 
 def parse_application_xml(stream):
@@ -597,25 +668,33 @@ def parse_application_xml(stream):
     when all of its children are complete, and cleared only afterwards.  The
     <Parameter> children of a <Union> are deliberately NOT handled at their
     own end events: clearing them there would wipe Offset/BitOffset before
-    the union is processed (trap 4)."""
+    the union is processed (trap 4).  Records inside a <ModuleDef> go to that
+    definition; a definition nested inside another one is only counted."""
     apps = []
     langs = {}
     cur = None
     lang = None
     tags = []
-    in_modules = 0
+    defs = []                       # open <ModuleDef>s: _RawApp, None when nested
     for event, el in ET.iterparse(stream, events=("start", "end")):
         tag = _local(el.tag)
         if event == "start":
             tags.append(tag)
             if tag == "ApplicationProgram":
                 cur = _RawApp(dict(el.attrib))
-            elif tag == "ModuleDefs":
-                in_modules += 1
-            elif cur is not None and not in_modules and tag in (
+                defs = []
+            elif cur is not None and tag == "ModuleDef":
+                if defs:
+                    defs.append(None)
+                    cur.unsupported["module_def_nested"] += 1
+                else:
+                    md = _RawApp(dict(el.attrib))
+                    cur.module_defs[md.full_id] = md
+                    defs.append(md)
+            elif cur is not None and not defs and tag in (
                     "ComObjectTable", "AddressTable", "AssociationTable"):
                 cur.tables[tag] = dict(el.attrib)
-            elif cur is not None and not in_modules and tag == "Options":
+            elif cur is not None and not defs and tag == "Options":
                 cur.options = dict(el.attrib)
             elif tag == "Language":
                 lang = el.get("Identifier") or ""
@@ -625,54 +704,61 @@ def parse_application_xml(stream):
         if tag == "TranslationElement":
             _collect_translation(langs, lang, el)
             el.clear()
-        elif cur is not None:
-            if in_modules:
-                # Parameters inside module definitions are placed through
-                # arguments; not resolved here (only counted).
-                if tag == "ModuleDefs":
-                    in_modules -= 1
-                    el.clear()
-                elif tag in ("Parameter", "Union", "ComObject") and parent in (
-                        "Parameters", "ComObjectTable"):
-                    cur.skipped_module_records += 1
-                continue
-            if tag == "AbsoluteSegment" and parent == "Code":
-                cur.add_abs_segment(el)
+            continue
+        if cur is None:
+            if tag in ("TranslationUnit", "Language", "Languages", "ApplicationPrograms"):
                 el.clear()
-            elif tag == "RelativeSegment" and parent == "Code":
-                cur.add_rel_segment(el)
-                el.clear()
-            elif tag == "ParameterType" and parent == "ParameterTypes":
-                cur.add_type(el)
-                el.clear()
-            elif tag == "Parameter" and parent == "Parameters":
-                cur.add_parameter(el)
-                el.clear()
-            elif tag == "Union" and parent == "Parameters":
-                cur.add_union(el)
-                el.clear()
-            elif tag == "ParameterRef" and parent == "ParameterRefs":
-                cur.add_parameter_ref(el)
-                el.clear()
-            elif tag == "ComObject" and parent == "ComObjectTable":
-                cur.add_comobject(el)
-                el.clear()
-            elif tag == "ComObjectRef" and parent == "ComObjectRefs":
-                cur.add_comobject_ref(el)
-                el.clear()
-            elif tag == "LoadProcedure" and parent == "LoadProcedures":
-                cur.add_load_procedure(el)
-                el.clear()
-            elif tag == "Dynamic" and parent == "ApplicationProgram":
-                cur.dynamic = walk_dynamic(el)
-                el.clear()
-            elif tag in _APP_CONTAINERS:
-                el.clear()
-            elif tag == "ApplicationProgram":
-                apps.append(cur)
-                cur = None
-                el.clear()
-        elif tag in ("TranslationUnit", "Language", "Languages", "ApplicationPrograms"):
+            continue
+        if tag == "ModuleDef":
+            defs.pop()
+            el.clear()
+            continue
+        target = defs[-1] if defs else cur
+        if target is None:                  # inside a nested definition
+            continue
+        if tag == "AbsoluteSegment" and parent == "Code":
+            cur.add_abs_segment(el)
+            el.clear()
+        elif tag == "RelativeSegment" and parent == "Code":
+            cur.add_rel_segment(el)
+            el.clear()
+        elif tag == "ParameterType" and parent == "ParameterTypes":
+            cur.add_type(el)
+            el.clear()
+        elif tag == "Parameter" and parent == "Parameters":
+            target.add_parameter(el)
+            el.clear()
+        elif tag == "Union" and parent == "Parameters":
+            target.add_union(el)
+            el.clear()
+        elif tag == "ParameterRef" and parent == "ParameterRefs":
+            target.add_parameter_ref(el)
+            el.clear()
+        elif tag == "ComObject" and parent in ("ComObjectTable", "ComObjects"):
+            target.add_comobject(el)
+            el.clear()
+        elif tag == "ComObjectRef" and parent == "ComObjectRefs":
+            target.add_comobject_ref(el)
+            el.clear()
+        elif tag == "Argument" and parent == "Arguments":
+            target.add_argument(el)
+            el.clear()
+        elif tag == "Allocator" and parent == "Allocators":
+            cur.add_allocator(el)
+            el.clear()
+        elif tag == "LoadProcedure" and parent == "LoadProcedures":
+            cur.add_load_procedure(el)
+            el.clear()
+        elif tag == "Dynamic" and parent in ("ApplicationProgram", "ModuleDef"):
+            dyn = walk_dynamic(el, in_module=target is not cur)
+            cur.unsupported.update(dyn.pop("unsupported"))
+            target.dynamic = dyn
+            el.clear()
+        elif tag in _APP_CONTAINERS:
+            el.clear()
+        elif tag == "ApplicationProgram":
+            apps.append(cur)
+            cur = None
             el.clear()
     return apps, langs
 
@@ -784,6 +870,66 @@ def _pick_load_procedure(mask):
 
 def _is_intlike(s):
     return bool(re.match(r"^-?\d+$", s or ""))
+
+
+_PH_HEAD = re.compile(r"^[\s:,;|/–-]+")
+_PH_TAIL = re.compile(r"[\s:,;|/–-]+$")
+_PH_GAP = re.compile(r"\s+([:,;])")
+
+
+def _fill(text, lookup, depth):
+    out, unresolved, emptied = [], 0, False
+    i, n = 0, len(text)
+    while i < n:
+        j = text.find("{{", i)
+        if j < 0:
+            out.append(text[i:])
+            break
+        out.append(text[i:j])
+        k, level = j + 2, 1
+        while k < n and level:
+            if text.startswith("{{", k):
+                level += 1
+                k += 2
+            elif text.startswith("}}", k):
+                level -= 1
+                k += 2
+            else:
+                k += 1
+        if level:                           # unbalanced: leave the rest alone
+            out.append(text[j:])
+            break
+        name, sep, default = text[j + 2:k - 2].partition(":")
+        value = lookup(name.strip())
+        if value:
+            out.append(value)
+        elif sep and depth < 4:             # ETS shows the default for an empty value
+            d, u, e = _fill(default, lookup, depth + 1)
+            out.append(d)
+            unresolved += u
+            emptied = emptied or e or not d
+        elif value is not None:
+            emptied = True
+        else:
+            out.append(text[j:k])
+            unresolved += 1
+        i = k
+    return "".join(out), unresolved, emptied
+
+
+def fill_placeholders(text, lookup):
+    """Resolve ETS text placeholders {{name}} and {{name:default}}; a default
+    may contain placeholders itself.  lookup(name) returns the value (empty
+    allowed) or None when the name is unknown: such a placeholder stays in
+    the text unless it has a default.  Separators left dangling by an empty
+    value are removed ('Channel B: ' -> 'Channel B').  Returns (text,
+    number of placeholders left)."""
+    if not text or "{{" not in text:
+        return text, 0
+    out, unresolved, emptied = _fill(text, lookup, 0)
+    if emptied:
+        out = _PH_GAP.sub(r"\1", _PH_TAIL.sub("", _PH_HEAD.sub("", out)))
+    return _norm(out), unresolved
 
 
 def build_record(raw, langs, master, hw, source):
@@ -913,20 +1059,87 @@ def build_record(raw, langs, master, hw, source):
             o["max_entries"] = _int(t.get("MaxEntries"))
         tables[key] = o
 
-    # -- ETS conditions (Dynamic) rendered as text
-    params_by_id = {p["id"]: p for p in raw.params}
-    pref_by_id = {r["id"]: r for r in raw.param_refs}
+    # -- lookups over the program and its module definitions
+    defs = raw.module_defs
+    all_params = list(raw.params)
+    all_prefs = list(raw.param_refs)
+    all_corefs = list(raw.comobject_refs)
+    for md in defs.values():
+        all_params += md.params
+        all_prefs += md.param_refs
+        all_corefs += md.comobject_refs
+    params_by_id = {p["id"]: p for p in all_params}
+    pref_by_id = {r["id"]: r for r in all_prefs}
+    refs_by_param = collections.defaultdict(list)
+    for r in all_prefs:
+        refs_by_param[r["ref"]].append(r)
+    corefs = collections.defaultdict(list)
+    for r in all_corefs:
+        corefs[r["ref"]].append(r)
+    refs_by_number = collections.defaultdict(list)       # "226" -> [..._P-1854_R-226]
+    for r in all_prefs:
+        mm = re.search(r"_R-(\d+)$", r["id"] or "")
+        if mm:
+            refs_by_number[mm.group(1)].append(r["id"])
 
-    def pref_text(pref_id):
+    # -- texts with ETS placeholders: {{argument}} = module instance argument,
+    # {{0}} = value of the element's text parameter (TextParameterRefId),
+    # {{226}} (older schemas) = value of the parameter behind ParameterRef R-226
+    zero_cache = {}
+
+    def zero_value(ref_id):
+        """(en, de) default of a text parameter, None if unknown."""
+        if not ref_id:
+            return None
+        if ref_id not in zero_cache:
+            r = pref_by_id.get(ref_id)
+            p = params_by_id.get(r["ref"] if r else ref_id)
+            v = None
+            if r is not None and r.get("default") is not None:
+                v = T.get(r["id"], "Value", r["default"])
+            elif p is not None and p.get("default") is not None:
+                v = T.get(p["id"], "Value", p["default"])
+            zero_cache[ref_id] = v
+        return zero_cache[ref_id]
+
+    def text2(elem_id, attr, raw_text, names=None, zero=None):
+        t_en, t_de = T.get(elem_id, attr, raw_text)
+        if "{{" not in (t_en or "") and "{{" not in (t_de or ""):
+            return t_en, t_de
+        z = zero_value(zero)
+
+        def lookup(idx):
+            def f(key):
+                if key.isdigit():
+                    v = z if key == "0" else None
+                    if v is None and len(refs_by_number.get(key, ())) == 1:
+                        v = zero_value(refs_by_number[key][0])
+                else:
+                    v = (names or {}).get(key)
+                if v is None:
+                    return None
+                return v[idx] if v[idx] is not None else v[0]
+            return f
+
+        if t_en:
+            t_en = fill_placeholders(t_en, lookup(0))[0]
+        if t_de:
+            t_de = fill_placeholders(t_de, lookup(1))[0]
+            if t_de == t_en:
+                t_de = None
+        return t_en, t_de
+
+    # -- ETS conditions (Dynamic) rendered as text
+    def pref_text(pref_id, names=None):
         r = pref_by_id.get(pref_id)
         if r is None:
             return short(pref_id) or "?", None
         p = params_by_id.get(r["ref"])
         text = None
         if r.get("text"):
-            text = T.get(pref_id, "Text", r["text"])[0]
+            text = text2(pref_id, "Text", r["text"], names, r.get("text_param"))[0]
         elif p is not None:
-            text = T.get(p["id"], "Text", p["text"])[0]
+            text = text2(p["id"], "Text", p["text"], names, p.get("text_param"))[0]
         if not text and p is not None:
             text = _norm(p.get("name")) or short(p["id"])
         return text or short(pref_id), p
@@ -942,9 +1155,9 @@ def build_record(raw, langs, master, hw, source):
                 return txt
         return None
 
-    def render_cond(cond):
+    def render_cond(cond, names=None):
         pref, test, others = cond
-        text, p = pref_text(pref)
+        text, p = pref_text(pref, names)
         if test is not None:
             vals = test.split()
             if vals and all(_is_intlike(v) for v in vals):
@@ -958,48 +1171,156 @@ def build_record(raw, langs, master, hw, source):
             return "%s %s" % (text, test)
         return "%s = other (not %s)" % (text, " | ".join(others))
 
-    def block_label(b):
+    def block_label(b, names=None):
         if b is None:
             return None
-        _kind, bid, text, pref_id, nm = b
+        _kind, bid, text, pref_id, nm, text_param = b
         if text:
-            return T.get(bid, "Text", text)[0] or None
+            return text2(bid, "Text", text, names, text_param)[0] or None
         if pref_id:
-            return pref_text(pref_id)[0] or None
+            return pref_text(pref_id, names)[0] or None
         return _norm(nm) or None
 
-    def context(entry):
-        if entry is None:
-            return {"ui": False}
-        count, conds, b = entry
+    def context(entry, inst=None):
+        """when / block / seen of a UI reference; for a module instance its
+        own conditions come first, then the innermost ones of the module."""
+        names = inst["names"] if inst else None
+        outer = inst["outer"] if inst else []
         o = {}
-        w = [render_cond(c) for c in conds]
+        inner = [render_cond(c, names) for c in entry[1]] if entry else []
+        keep = MAX_CONDS - len(outer)
+        w = list(outer) + (inner[-keep:] if keep > 0 else [])
         if w:
             o["when"] = w
-        bl = block_label(b)
+        if entry is None:
+            o["ui"] = False
+            return o
+        bl = block_label(entry[2], names)
         if bl:
             o["block"] = bl
-        if count > 1:
-            o["seen"] = count
+        if entry[0] > 1:
+            o["seen"] = entry[0]
         return o
 
+    unsupported = collections.Counter(raw.unsupported)
+
+    # -- module instances: every <Module> (each repetition of a <Repeat>) gets
+    # its argument values; BaseOffset/BaseNumber arguments place its records
+    def repeat_max(pref_id):
+        r = pref_by_id.get(pref_id)
+        p = params_by_id.get(r["ref"]) if r else None
+        ty = raw.types.get(p["type"]) if p and p.get("type") else None
+        if ty and ty.get("kind") == "number" and isinstance(ty.get("max"), int):
+            return ty["max"]
+        if ty and ty.get("kind") == "enum":
+            vals = [_intval(v["value"]) for v in ty.get("values", [])]
+            vals = [v for v in vals if v is not None]
+            return max(vals) if vals else None
+        return None
+
+    instances = []
+    inst_per_def = collections.Counter()
+    alloc_next = {lid: al.get("start") for lid, al in raw.allocators.items()}
+    alloc_users = collections.Counter(
+        g["allocator"] for mod in raw.dynamic.get("modules", [])
+        for g in mod["args"].values() if g.get("allocator"))
+    for mod in raw.dynamic.get("modules", []):
+        md = defs.get(mod["ref"])
+        if md is None:
+            unsupported["module_def_missing"] += 1
+            continue
+        outer = [render_cond(c) for c in mod["conds"][-1:]]
+        rep = mod.get("repeat")
+        count, count_pref = 1, None
+        if rep is not None:
+            if rep.get("count") is not None:
+                count = rep["count"]
+            elif rep.get("pref"):
+                count, count_pref = repeat_max(rep["pref"]), rep["pref"]
+            else:
+                count = None
+            if count is None or count < 0:
+                unsupported["repeat_count_unknown"] += 1
+                continue
+            if count > MAX_REPEAT:
+                unsupported["repeat_instances_capped"] += count - MAX_REPEAT
+                count = MAX_REPEAT
+        group = []
+        for i in range(1, count + 1):
+            values, names, ok = {}, {}, True
+            for arg_id, decl in md.args.items():
+                given = mod["args"].get(arg_id)
+                if given is None:
+                    continue
+                if given.get("allocator"):
+                    lid = given["allocator"]
+                    al = raw.allocators.get(lid)
+                    step = decl.get("allocates")
+                    if al is None or alloc_next.get(lid) is None or not step:
+                        unsupported["allocator_unresolved"] += 1
+                        continue
+                    v = alloc_next[lid]
+                    alloc_next[lid] = v + step
+                    if al.get("max") is not None and v + step > al["max"]:
+                        ok = False
+                    if alloc_users[lid] > 1:
+                        unsupported["allocator_shared"] += 1
+                    values[arg_id] = v
+                    names[decl["name"]] = (str(v), None)
+                elif given.get("text_id") is not None or decl.get("text"):
+                    t_en, t_de = T.get(given.get("text_id"), "Value", given.get("value"))
+                    values[arg_id] = t_en
+                    names[decl["name"]] = (t_en, t_de)
+                else:
+                    values[arg_id] = _int(given.get("value"))
+                    names[decl["name"]] = (_norm(given.get("value")) or "", None)
+            if not ok:
+                unsupported["allocator_overflow"] += 1
+                continue
+            iid = short(mod["id"]) + ("_MI-%d" % i if rep is not None else "")
+            o_outer = list(outer)
+            if count_pref:
+                o_outer.append("%s >= %d" % (pref_text(count_pref)[0], i))
+            label = block_label(md.dynamic.get("first_block"), names)
+            label = label or _norm(mod.get("name")) or "%s %d" % (
+                md.attrs.get("Name") or short(md.full_id), i)
+            group.append({"id": iid, "md": md, "values": values, "names": names,
+                          "outer": o_outer, "label": label, "index": i})
+        if rep is not None and len({g["label"] for g in group}) < len(group):
+            for g in group:
+                g["label"] = "%s #%d" % (g["label"], g["index"])
+        instances.extend(group)
+        inst_per_def[mod["ref"]] += len(group)
+
+    def local_id(x, md):
+        p = md.full_id + "_"
+        return x[len(p):] if x.startswith(p) else short(x)
+
     # -- parameters
-    refs_by_param = collections.defaultdict(list)
-    for r in raw.param_refs:
-        refs_by_param[r["ref"]].append(r)
-    params_out = []
     counts = collections.Counter()
-    tcheck = [0, 0]
+    tcheck = collections.Counter()
     declared_order = raw.options.get("ParameterByteOrder")
     order = byte_order_of(declared_order)
     # discriminating evidence from the segment template (see below)
     evidence = collections.Counter()
-    for seq, p in enumerate(raw.params):
+
+    def make_param(p, inst):
         pid = p["id"]
-        text, text_de = T.get(pid, "Text", p["text"])
-        o = {"id": short(pid), "text": text}
+        names = inst["names"] if inst else None
+        loc = p.get("loc")
+        if loc and loc.get("base"):
+            bv = inst["values"].get(loc["base"]) if inst else None
+            if loc["kind"] != "memory" or not isinstance(bv, int):
+                unsupported["parameters_unplaced"] += 1
+                return None
+            loc = dict(loc, offset=loc["offset"] + bv)
+        text, text_de = text2(pid, "Text", p["text"], names, p.get("text_param"))
+        o = {"id": inst["id"] + "_" + local_id(pid, inst["md"]) if inst else short(pid),
+             "text": text}
         if text_de:
             o["text_de"] = text_de
+        if inst:
+            o["module"] = {"id": inst["id"], "label": inst["label"]}
         nm = _norm(p.get("name"))
         if nm and nm != text and nm != text_de:
             o["name"] = nm
@@ -1015,7 +1336,6 @@ def build_record(raw, langs, master, hw, source):
             o["size_bits"] = size
         if p.get("default") is not None:
             o["default"] = p["default"]
-        loc = p.get("loc")
         if loc and loc["kind"] == "memory":
             o["storage"] = "memory"
             seg = raw.segments.get(loc["segment"])
@@ -1038,10 +1358,12 @@ def build_record(raw, langs, master, hw, source):
             counts["parameters_union"] += 1
         variants = []
         entry, seen = None, 0
+        dyn_pr = (inst["md"].dynamic if inst else raw.dynamic)["pr"]
         for r in refs_by_param.get(pid, []):
+            counts["parameter_refs"] += 1
             v = {}
             if r.get("text"):
-                t2 = T.get(r["id"], "Text", r["text"])[0]
+                t2 = text2(r["id"], "Text", r["text"], names, r.get("text_param"))[0]
                 if t2 and t2 != text:
                     v["text"] = t2
             if r.get("default") is not None and r["default"] != p.get("default"):
@@ -1051,7 +1373,7 @@ def build_record(raw, langs, master, hw, source):
             if v:
                 v["ref"] = short_ref(r["id"], pid)
                 variants.append(v)
-            e = raw.dynamic["pr"].get(r["id"])
+            e = dyn_pr.get(r["id"])
             if e:
                 seen += e[0]
                 if entry is None:
@@ -1060,7 +1382,7 @@ def build_record(raw, langs, master, hw, source):
             o["variants"] = variants[:8]
             if len(variants) > 8:
                 o["variants_total"] = len(variants)
-        ctx = context(entry)
+        ctx = context(entry, inst)
         if seen > 1:
             ctx["seen"] = seen
         o.update(ctx)
@@ -1077,8 +1399,11 @@ def build_record(raw, langs, master, hw, source):
                 off, bit = loc["offset"], loc["bit_offset"]
                 tv = extract_bits(data, off, bit, size, order)
                 if tv is not None:
-                    tcheck[0] += 1
-                    tcheck[1] += int(tv == dv)
+                    tcheck["checked"] += 1
+                    tcheck["match"] += int(tv == dv)
+                    if inst:
+                        tcheck["module_checked"] += 1
+                        tcheck["module_match"] += int(tv == dv)
                 if bit + size <= 8 and size < 8 and off < len(data):
                     msb = (data[off] >> (8 - bit - size)) & ((1 << size) - 1)
                     lsb = (data[off] >> bit) & ((1 << size) - 1)
@@ -1089,26 +1414,27 @@ def build_record(raw, langs, master, hw, source):
                     be, le = int.from_bytes(chunk, "big"), int.from_bytes(chunk, "little")
                     if be != le and dv in (be, le):
                         evidence["big" if dv == be else "little"] += 1
-        o["_seq"] = seq
-        params_out.append(o)
-    params_out.sort(key=lambda o: (0 if o.get("address") is not None else
-                                   1 if o.get("storage") else 2,
-                                   o.get("address") or 0, o.get("bit_offset") or 0, o["_seq"]))
-    for o in params_out:
-        del o["_seq"]
+        return o
 
     # -- com objects with all ComObjectRef variants, fully resolved
-    corefs = collections.defaultdict(list)
-    for r in raw.comobject_refs:
-        corefs[r["ref"]].append(r)
-    cos_out = []
-    for c in raw.comobjects:
+    def make_comobject(c, inst):
         cid = c["id"]
-        text, text_de = T.get(cid, "Text", c["text"])
-        ft, ft_de = T.get(cid, "FunctionText", c["function_text"])
-        o = {"number": c["number"], "id": short(cid), "text": text}
+        names = inst["names"] if inst else None
+        num = c["number"]
+        if c.get("base_number"):
+            bv = inst["values"].get(c["base_number"]) if inst else None
+            if not isinstance(bv, int) or num is None:
+                unsupported["comobjects_unplaced"] += 1
+                return None
+            num += bv
+        text, text_de = text2(cid, "Text", c["text"], names, c.get("text_param"))
+        ft, ft_de = text2(cid, "FunctionText", c["function_text"], names, c.get("text_param"))
+        o = {"number": num, "id": inst["id"] + "_" + local_id(cid, inst["md"]) if inst else short(cid),
+             "text": text}
         if text_de:
             o["text_de"] = text_de
+        if inst:
+            o["module"] = {"id": inst["id"], "label": inst["label"]}
         if ft:
             o["function_text"] = ft
         if ft_de:
@@ -1123,16 +1449,19 @@ def build_record(raw, langs, master, hw, source):
         if c.get("dpt"):
             o["dpt"] = fmt_dpt(c["dpt"])
         variants = []
+        dyn_co = (inst["md"].dynamic if inst else raw.dynamic)["co"]
         for r in corefs.get(cid, []):
             v = {"ref": short_ref(r["id"], cid)}
+            tp = r.get("text_param") or c.get("text_param")
             if r.get("text"):
-                v["text"], vt_de = T.get(r["id"], "Text", r["text"])
-                if vt_de:
-                    v["text_de"] = vt_de
+                v["text"], vt_de = text2(r["id"], "Text", r["text"], names, tp)
             else:
-                v["text"] = text
+                v["text"], vt_de = text2(cid, "Text", c["text"], names, tp)
+            if vt_de:
+                v["text_de"] = vt_de
             if r.get("function_text"):
-                v["function_text"] = T.get(r["id"], "FunctionText", r["function_text"])[0]
+                v["function_text"] = text2(r["id"], "FunctionText", r["function_text"],
+                                           names, tp)[0]
             elif ft:
                 v["function_text"] = ft
             vsize = r.get("size") or c.get("size")
@@ -1145,11 +1474,54 @@ def build_record(raw, langs, master, hw, source):
             dpt = r.get("dpt") or c.get("dpt")
             if dpt:
                 v["dpt"] = fmt_dpt(dpt)
-            v.update(context(raw.dynamic["co"].get(r["id"])))
+            v.update(context(dyn_co.get(r["id"]), inst))
             variants.append(v)
+        if text and "{{" in text:
+            # The object's own text only names a placeholder ({{0}} without a
+            # text parameter): show what its variants resolve to.
+            best = collections.Counter(v["text"] for v in variants
+                                       if v.get("text") and "{{" not in v["text"]).most_common(1)
+            if best:
+                o["text"] = best[0][0]
+                o.pop("text_de", None)
         o["variants"] = variants
-        cos_out.append(o)
+        counts["comobject_refs"] += len(variants)
+        return o
+
+    params_out, cos_out = [], []
+
+    def add(lst, o):
+        if o is not None:
+            o["_seq"] = len(lst)
+            lst.append(o)
+            return 1
+        return 0
+
+    for p in raw.params:
+        add(params_out, make_param(p, None))
+    for c in raw.comobjects:
+        add(cos_out, make_comobject(c, None))
+    mod_params = mod_cos = 0
+    for inst in instances:
+        for p in inst["md"].params:
+            mod_params += add(params_out, make_param(p, inst))
+        for c in inst["md"].comobjects:
+            mod_cos += add(cos_out, make_comobject(c, inst))
+
+    def param_order(o):
+        if o.get("address") is not None:
+            return (0, "", o["address"], o.get("bit_offset") or 0, o["_seq"])
+        if o.get("storage") == "memory":
+            return (1, o.get("segment") or "", o.get("offset") or 0, o.get("bit_offset") or 0,
+                    o["_seq"])
+        return (2 if o.get("storage") else 3, "", 0, 0, o["_seq"])
+
+    params_out.sort(key=param_order)
+    for o in params_out:
+        del o["_seq"]
     cos_out.sort(key=lambda o: (o["number"] if o["number"] is not None else 1 << 30, o["id"]))
+    for o in cos_out:
+        del o["_seq"]
 
     # -- products
     prods = []
@@ -1175,15 +1547,25 @@ def build_record(raw, langs, master, hw, source):
             if mask.get(k):
                 mask_out[k] = mask[k]
 
-    counts = {"comobjects": len(raw.comobjects), "comobject_refs": len(raw.comobject_refs),
-              "parameters": len(raw.params), "parameters_memory": counts["parameters_memory"],
+    left = sum(1 for o in params_out if "{{" in (o.get("text") or ""))
+    left += sum(1 for o in cos_out if "{{" in (o.get("text") or ""))
+    left += sum(1 for o in cos_out for v in o["variants"] if "{{" in (v.get("text") or ""))
+    counts = {"comobjects": len(cos_out), "comobject_refs": counts["comobject_refs"],
+              "parameters": len(params_out), "parameters_memory": counts["parameters_memory"],
               "parameters_union": counts["parameters_union"],
               "parameters_property": counts["parameters_property"],
               "parameters_virtual": counts["parameters_virtual"],
-              "parameter_refs": len(raw.param_refs),
-              "template_check": {"checked": tcheck[0], "match": tcheck[1]}}
-    if raw.skipped_module_records:
-        counts["module_records_skipped"] = raw.skipped_module_records
+              "parameter_refs": counts["parameter_refs"],
+              "template_check": {"checked": tcheck["checked"], "match": tcheck["match"]}}
+    if defs or instances:
+        counts.update({"module_defs": len(defs), "module_instances": len(instances),
+                       "module_parameters": mod_params, "module_comobjects": mod_cos,
+                       "template_check_modules": {"checked": tcheck["module_checked"],
+                                                  "match": tcheck["module_match"]}})
+    if unsupported:
+        counts["module_unsupported"] = dict(sorted(unsupported.items()))
+    if left:
+        counts["texts_with_placeholders"] = left
     byte_order = {"declared": declared_order or "not stated (BigEndian assumed)",
                   "used": order,
                   "template_evidence": {"big": evidence["big"], "little": evidence["little"]},
@@ -1213,6 +1595,14 @@ def build_record(raw, langs, master, hw, source):
         "counts": counts, "types": types_out, "comobjects": cos_out, "parameters": params_out,
         "source": source,
     }
+    if defs:
+        # arguments: name -> step an allocator advances by (null if none), "text"
+        rec["modules"] = [{"id": short(did), "name": md.attrs.get("Name"),
+                           "arguments": {d["name"]: "text" if d["text"] else d["allocates"]
+                                         for d in md.args.values()},
+                           "parameters": len(md.params), "comobjects": len(md.comobjects),
+                           "instances": inst_per_def[did]}
+                          for did, md in defs.items()]
     if name_de:
         rec["name_de"] = name_de
     if orig:
@@ -1523,6 +1913,35 @@ def _write_index(data_dir, apps, removed=()):
             pass
 
 
+def _reset_stale_index_locked(data_dir, log=None):
+    """An index written in another record format (SCHEMA_VERSION) is
+    discarded, so that the sync rebuilds it from the product files.  Returns
+    the old format, None when the index is current or does not exist yet."""
+    p = _paths(data_dir)
+    found = [d.get("schema") for d in (_load_json(p["index"]), _load_json(p["files"]))
+             if d is not None]
+    stale = [v for v in found if v != SCHEMA_VERSION]
+    if not stale:
+        return None
+    old = stale[0] if stale[0] is not None else "unknown"
+    atomic_write_json(p["index"], _build_index({}))     # nothing points at the records now
+    try:
+        names = os.listdir(p["apps"])
+    except FileNotFoundError:
+        names = []
+    for fn in names:
+        if fn.endswith(".json"):
+            try:
+                os.remove(os.path.join(p["apps"], fn))
+            except FileNotFoundError:
+                pass
+    atomic_write_json(p["files"], _empty_files())
+    if log:
+        log("%s index format %s, this version writes %s: rebuilding the index from the "
+            "product files" % (_utc_now(), old, SCHEMA_VERSION))
+    return old
+
+
 def _remove_source_locked(data_dir, source):
     p = _paths(data_dir)
     index = _load_json(p["index"]) or _empty_index()
@@ -1612,17 +2031,25 @@ def _ingest_locked(path, data_dir, source, label=None, log=None):
                 written[app_id] = entry
                 product_ids.update(pr["order_number"] for pr in rec["products"])
                 c = rec["counts"]
-                per_app.append({"app_id": app_id, "name": rec["name"],
-                                "products": len(rec["products"]),
-                                "comobjects": c["comobjects"],
-                                "comobject_refs": c["comobject_refs"],
-                                "parameters": c["parameters"],
-                                "parameters_memory": c["parameters_memory"],
-                                "parameters_union": c["parameters_union"],
-                                "template_check": c["template_check"],
-                                "byte_order": rec["byte_order"]})
+                pa = {"app_id": app_id, "name": rec["name"],
+                      "products": len(rec["products"]),
+                      "comobjects": c["comobjects"],
+                      "comobject_refs": c["comobject_refs"],
+                      "parameters": c["parameters"],
+                      "parameters_memory": c["parameters_memory"],
+                      "parameters_union": c["parameters_union"],
+                      "template_check": c["template_check"],
+                      "byte_order": rec["byte_order"]}
+                for k in ("module_instances", "module_parameters", "module_comobjects",
+                          "module_unsupported"):
+                    if c.get(k):
+                        pa[k] = c[k]
+                per_app.append(pa)
                 if rec["byte_order"].get("warning"):
                     warnings.append("%s: %s" % (app_id, rec["byte_order"]["warning"]))
+                if c.get("module_unsupported"):
+                    warnings.append("%s: ETS module features not resolved: %s" % (
+                        app_id, ", ".join("%s=%d" % kv for kv in c["module_unsupported"].items())))
     if not written:
         raise IngestError("no application program could be distilled from %s" % source)
     previous = {a for a, e in apps.items() if source in e.get("sources", [])}
@@ -1658,6 +2085,7 @@ def _ingest_locked(path, data_dir, source, label=None, log=None):
 def ingest_file(path, data_dir, source=None, log=None):
     """Index one product file (or an extracted directory) as `source`."""
     with _IngestLock(data_dir):
+        _reset_stale_index_locked(data_dir, log)
         return _ingest_locked(path, data_dir, source or os.path.basename(path.rstrip("/")),
                               log=log)
 
@@ -1725,6 +2153,9 @@ def sync_products(products_dir, data_dir, settle=SETTLE_SECONDS, log=None):
         p = _paths(data_dir)
         for d in (data_dir, p["apps"], p["tmp"]):
             os.makedirs(d, exist_ok=True)
+        old_schema = _reset_stale_index_locked(data_dir, log)
+        if old_schema is not None:
+            summary["rebuilt_from_schema"] = old_schema
         state = _load_json(p["files"]) or _empty_files()
         files = state.setdefault("files", {})
         present = product_files(products_dir)
@@ -1828,6 +2259,7 @@ def store_upload(products_dir, data_dir, tmp_path, name, sha):
     products_dir = os.path.abspath(products_dir)
     with _IngestLock(data_dir):
         p = _paths(data_dir)
+        _reset_stale_index_locked(data_dir)     # the next scan reads the other files again
         state = _load_json(p["files"]) or _empty_files()
         files = state.setdefault("files", {})
         for rel, r in sorted(files.items()):
@@ -1903,6 +2335,26 @@ def _prepare_dirs(products_dir, data_dir):
 # data access for the server
 # ---------------------------------------------------------------------------
 
+def _load_record(path):
+    """json.load with repeated strings shared: module instances repeat the
+    same condition and label texts thousands of times."""
+    pool = {}
+
+    def hook(pairs):
+        d = {}
+        for k, v in pairs:
+            t = v.__class__
+            if t is str:
+                v = pool.setdefault(v, v)
+            elif t is list and v and v[0].__class__ is str:
+                v = [pool.setdefault(x, x) if x.__class__ is str else x for x in v]
+            d[k] = v
+        return d
+
+    with open(path, "rb") as f:
+        return json.load(f, object_pairs_hook=hook)
+
+
 class Store:
     def __init__(self, data_dir):
         self.data_dir = os.path.abspath(data_dir)
@@ -1952,8 +2404,7 @@ class Store:
         path = os.path.join(self.data_dir, "apps", real + ".json")
         try:
             size = os.path.getsize(path)
-            with open(path, "rb") as f:
-                rec = json.load(f)
+            rec = _load_record(path)
         except FileNotFoundError:
             return None
         with self._lock:
@@ -2039,6 +2490,51 @@ def parse_address(v, key="address"):
 def _words_match(query, fields):
     hay = " ".join(f for f in fields if f).lower()
     return all(w in hay for w in query.lower().split())
+
+
+def _module_match(e, wanted):
+    """Module instance by label ('Channel B') or id: 'MD-1_M-2' is that
+    instance (with its repetitions), 'MD-1' every instance of definition MD-1."""
+    m = e.get("module")
+    if not m:
+        return False
+    w = wanted.strip().lower()
+    iid = (m.get("id") or "").lower()
+    return w == (m.get("label") or "").lower() or iid == w or iid.startswith(w + "_")
+
+
+def _module_label(e):
+    return (e.get("module") or {}).get("label")
+
+
+def _segment_arg(rec, args):
+    """The 'segment' argument as the program's segment id, None if absent."""
+    seg = _arg_str(args, "segment")
+    if seg is None:
+        return None
+    ids = [s["id"] for s in rec.get("segments", [])]
+    for i in ids:
+        if i.lower() == seg.lower():
+            return i
+    raise ToolError("invalid_argument", "%s is not a segment of this program" % seg,
+                    segments=ids[:20])
+
+
+def _relative_hint(rec):
+    rel = [s["id"] for s in rec.get("segments", []) if s.get("relative")]
+    if not rel:
+        return None
+    return ("parameters of this program live in relative segment %s: pass segment and the "
+            "offset within it as address" % " / ".join(rel[:4]))
+
+
+def _place(p, segment):
+    """Address of a memory parameter, or its offset when `segment` is given."""
+    if segment is None:
+        return p.get("address")
+    if p.get("storage") == "memory" and p.get("segment") == segment:
+        return p.get("offset")
+    return None
 
 
 def need_app(store, args):
@@ -2192,6 +2688,12 @@ def tool_application(store, args, budget):
         o["tables"] = rec.get("tables", {})
         o["byte_order"] = rec.get("byte_order", {})
         o["counts"] = rec.get("counts", {})
+        mods = rec.get("modules")
+        if mods:
+            cap_m = (None, 16, 8, 3)[level]
+            o["modules"] = mods if cap_m is None else mods[:cap_m]
+            if cap_m is not None and len(mods) > cap_m:
+                o["modules_total"] = len(mods)
         lp = rec.get("load_procedure", {})
         steps = lp.get("steps", [])
         o["load_procedure"] = {"source": lp.get("source"),
@@ -2208,6 +2710,8 @@ def tool_application(store, args, budget):
 
 def _render_comobject(c, level):
     o = {"number": c["number"], "text": c["text"]}
+    if c.get("module"):
+        o["module"] = c["module"]["label"]
     if level == 0 and c.get("text_de"):
         o["text_de"] = c["text_de"]
     if c.get("function_text"):
@@ -2290,6 +2794,7 @@ def tool_comobjects(store, args, budget):
             raise ToolError("invalid_argument",
                             "numbers must be a list of up to 512 integers 0..65535")
     query = _arg_str(args, "query")
+    module = _arg_str(args, "module")
     offset = _arg_int(args, "offset", 0, 0, 1 << 30)
     limit = _arg_int(args, "limit", 40, 1, 200)
     wanted = set(numbers) if numbers is not None else None
@@ -2297,9 +2802,11 @@ def tool_comobjects(store, args, budget):
     for c in rec.get("comobjects", []):
         if wanted is not None and c["number"] not in wanted:
             continue
+        if module and not _module_match(c, module):
+            continue
         if query:
             fields = [c.get("text"), c.get("text_de"), c.get("function_text"),
-                      c.get("function_text_de"), c.get("name")]
+                      c.get("function_text_de"), c.get("name"), _module_label(c)]
             for v in c.get("variants", []):
                 fields += [v.get("text"), v.get("text_de"), v.get("function_text")]
             if not _words_match(query, fields):
@@ -2350,6 +2857,8 @@ def _enum_text(ty, value):
 
 def _render_param(p, types, level, order="big"):
     o = {"id": p["id"], "text": p["text"]}
+    if p.get("module"):
+        o["module"] = p["module"]["label"]
     if level == 0 and p.get("text_de"):
         o["text_de"] = p["text_de"]
     if level == 0 and p.get("name"):
@@ -2400,6 +2909,8 @@ def _render_param(p, types, level, order="big"):
 def tool_parameters(store, args, budget):
     rec = need_app(store, args)
     query = _arg_str(args, "query")
+    module = _arg_str(args, "module")
+    segment = _segment_arg(rec, args)
     address = parse_address(args["address"]) if args.get("address") is not None else None
     include_virtual = _arg_bool(args, "include_virtual", False)
     offset = _arg_int(args, "offset", 0, 0, 1 << 30)
@@ -2408,12 +2919,17 @@ def tool_parameters(store, args, budget):
     for p in rec.get("parameters", []):
         if not include_virtual and not p.get("storage"):
             continue
+        if segment is not None and _place(p, segment) is None:
+            continue
         if address is not None:
-            a = p.get("address")
+            a = _place(p, segment)
             if a is None or not a <= address < a + _param_nbytes(p):
                 continue
+        if module and not _module_match(p, module):
+            continue
         if query:
-            fields = [p.get("text"), p.get("text_de"), p.get("name"), p.get("block"), p.get("id")]
+            fields = [p.get("text"), p.get("text_de"), p.get("name"), p.get("block"), p.get("id"),
+                      _module_label(p)]
             fields += [v.get("text") for v in p.get("variants", [])]
             if not _words_match(query, fields):
                 continue
@@ -2428,9 +2944,14 @@ def tool_parameters(store, args, budget):
                       "members share memory: only the one matching the channel mode is valid."}
     if bo.get("warning"):
         header["byte_order_warning"] = bo["warning"]
+    if segment is not None:
+        header["segment"] = segment
     if address is not None:
-        header["address"] = address
-        header["address_hex"] = "0x%04X" % address
+        key = "segment_offset" if segment is not None else "address"   # "offset" pages
+        header[key] = address
+        header[key + "_hex"] = "0x%04X" % address
+        if segment is None and not items and _relative_hint(rec):
+            header["hint"] = _relative_hint(rec)
     return _page(items, offset, limit, lambda p, lv: _render_param(p, types, lv, order),
                  header, "parameters", budget)
 
@@ -2439,6 +2960,7 @@ def tool_decode(store, args, budget):
     rec = need_app(store, args)
     if args.get("address") is None:
         raise ToolError("invalid_argument", "address is required")
+    segment = _segment_arg(rec, args)
     base = parse_address(args["address"])
     hexdata = args.get("data")
     if not isinstance(hexdata, str):
@@ -2458,7 +2980,7 @@ def tool_decode(store, args, budget):
     order = bo.get("used", "big")
     values, partial = [], []
     for p in rec.get("parameters", []):
-        a, size = p.get("address"), p.get("size_bits")
+        a, size = _place(p, segment), p.get("size_bits")
         if a is None or not size:
             continue
         nb = _param_nbytes(p)
@@ -2468,8 +2990,15 @@ def tool_decode(store, args, budget):
             partial.append(p["id"])
             continue
         ty = types.get(p.get("type")) if p.get("type") else None
-        o = {"id": p["id"], "text": p["text"], "address_hex": "0x%04X" % a,
-             "bit_offset": p.get("bit_offset"), "size_bits": size}
+        o = {"id": p["id"], "text": p["text"]}
+        if p.get("module"):
+            o["module"] = p["module"]["label"]
+        if segment is None:
+            o["address_hex"] = "0x%04X" % a
+        else:
+            o["offset"] = a
+        o["bit_offset"] = p.get("bit_offset")
+        o["size_bits"] = size
         kind = ty.get("kind") if ty else None
         v = None
         if kind in ("number", "enum") and size <= 64:
@@ -2491,12 +3020,20 @@ def tool_decode(store, args, budget):
         if p.get("when"):
             o["when"] = p["when"]
         values.append(o)
-    header = {"app_id": rec["app_id"], "address": base, "address_hex": "0x%04X" % base,
-              "length": len(data), "byte_order": order,
-              "note": "Union members are all decoded: only the one whose 'when' matches the "
-                      "configured channel mode is meaningful. " + SLOT_NOTE}
+    header = {"app_id": rec["app_id"]}
+    if segment is not None:
+        header.update({"segment": segment, "segment_offset": base,
+                       "segment_offset_hex": "0x%04X" % base})
+    else:
+        header.update({"address": base, "address_hex": "0x%04X" % base})
+    header.update({"length": len(data), "byte_order": order,
+                   "note": "Union members and alternative modules are all decoded: only the one "
+                           "whose 'when' matches the configured channel mode is meaningful. "
+                           + SLOT_NOTE})
     if bo.get("warning"):
         header["byte_order_warning"] = bo["warning"]
+    if segment is None and not values and not partial and _relative_hint(rec):
+        header["hint"] = _relative_hint(rec)
     if partial:
         header["partial"] = partial[:20]
         if len(partial) > 20:
@@ -2524,6 +3061,8 @@ _APP_ID_PROP = {"type": "string",
                 "description": "ApplicationId the device reports, 10 hex digits, e.g. FFF0123456"}
 _ADDR_PROP = {"type": ["integer", "string"],
               "description": "Memory address: integer or '0x4A2F'"}
+_SEGMENT_PROP = {"type": "string", "description": "Relative segment: address = offset in it"}
+_MODULE_PROP = {"type": "string", "description": "Module instance label or id"}
 
 TOOLS = [
     {"name": "prod-applications",
@@ -2552,13 +3091,14 @@ TOOLS = [
          "(channel mode) that shows it; text/function_text/dpt only where they differ. A "
          "name labels the SLOT, not the function: in another mode the same number may do "
          "something else (a 'slat position' slot can switch a pump). Pick the variant "
-         "whose size_bits matches the size the device reports. Filter: numbers, query. "
-         "Paginated."),
+         "whose size_bits matches the size the device reports. Filter: numbers, query, "
+         "module (instance of an ETS module). Paginated."),
      "inputSchema": {"type": "object", "properties": dict({
          "app_id": _APP_ID_PROP,
          "numbers": {"type": "array", "items": {"type": "integer", "minimum": 0,
                                                 "maximum": 65535}},
-         "query": {"type": "string"}}, **_PAGE_PROPS), "required": ["app_id"]},
+         "query": {"type": "string"},
+         "module": _MODULE_PROP}, **_PAGE_PROPS), "required": ["app_id"]},
      "annotations": {"readOnlyHint": True}},
     {"name": "prod-parameters",
      "description": (
@@ -2567,24 +3107,28 @@ TOOLS = [
          "address in byte_order, >> shift, & mask), type (enum / min-max / text), "
          "default, union, 'when' (channel mode that shows it). Union members share "
          "memory; only the one matching the mode is valid. Names label slots, not "
-         "functions. Filter: query (words) or address (parameters occupying that byte); "
-         "include_virtual adds ETS-only parameters without storage. Paginated."),
+         "functions. Filter: query (words), module (instance of an ETS module), address "
+         "(parameters occupying that byte; with segment: offset in it); include_virtual "
+         "adds ETS-only parameters without storage. Paginated."),
      "inputSchema": {"type": "object", "properties": dict({
          "app_id": _APP_ID_PROP,
          "query": {"type": "string"},
+         "module": _MODULE_PROP,
          "address": _ADDR_PROP,
+         "segment": _SEGMENT_PROP,
          "include_virtual": {"type": "boolean"}}, **_PAGE_PROPS), "required": ["app_id"]},
      "annotations": {"readOnlyHint": True}},
     {"name": "prod-decode",
      "description": (
-         "Decode bytes read from device memory (starting at address) into parameter "
-         "values: MSB-first bit offsets, the program's byte order. Only parameters fully "
-         "inside the bytes; cut-off ones are listed in 'partial'. All union members are "
-         "decoded: 'when' says which applies. Pure computation, no device access. "
-         "Paginated."),
+         "Decode bytes read from device memory (starting at address, or at an offset "
+         "in segment) into parameter values: MSB-first bit offsets, the program's byte "
+         "order. Only parameters fully inside the bytes; cut-off ones are listed in "
+         "'partial'. All union members and alternative modules are decoded: 'when' says "
+         "which applies. Pure computation, no device access. Paginated."),
      "inputSchema": {"type": "object", "properties": dict({
          "app_id": _APP_ID_PROP,
          "address": _ADDR_PROP,
+         "segment": _SEGMENT_PROP,
          "data": {"type": "string", "description": "Hex bytes as read, e.g. '0A1B2C'"}},
          **_PAGE_PROPS), "required": ["app_id", "address", "data"]},
      "annotations": {"readOnlyHint": True}},

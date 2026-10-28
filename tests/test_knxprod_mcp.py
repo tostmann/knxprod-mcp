@@ -15,9 +15,15 @@ Optional test against a real product file you own (never committed):
     KNXPROD_TEST_REAL_DATA=/path/to/file.knxprod python3 tests/test_knxprod_mcp.py
       KNXPROD_TEST_APP_ID=<10 hex digits>     an ApplicationId inside that file
       KNXPROD_TEST_OBJECTS=0,2,16             com-object numbers it must return
+
+Optional check of ETS module instances in a real product file you own:
+
+    KNXPROD_TEST_MODULE_DATA=/path/to/file.knxprod \
+    KNXPROD_TEST_MODULE_APPS=<app id>[,<app id>...] python3 tests/test_knxprod_mcp.py TestRealModules
 """
 
 import base64
+import collections
 import contextlib
 import http.client
 import json
@@ -45,12 +51,17 @@ import knxprod_mcp as K  # noqa: E402
 FIXTURE = os.path.join(HERE, "fixture")
 APP_XML = os.path.join(FIXTURE, "M-FFF0", "M-FFF0_A-1234-56-ABCD.xml")
 APP2_XML = os.path.join(FIXTURE, "M-FFF0", "M-FFF0_A-00AB-01-1111-OFFF1.xml")
+APP3_XML = os.path.join(FIXTURE, "M-FFF0", "M-FFF0_A-0C0D-21-5A5A.xml")
 REAL = os.environ.get("KNXPROD_TEST_REAL_DATA")
 REAL_APP = os.environ.get("KNXPROD_TEST_APP_ID")
 REAL_OBJECTS = [int(x) for x in (os.environ.get("KNXPROD_TEST_OBJECTS") or "").split(",")
                 if x.strip()]
+REAL_MODULES = os.environ.get("KNXPROD_TEST_MODULE_DATA")
+REAL_MODULE_APPS = [K.normalize_app_id(x) for x in
+                    (os.environ.get("KNXPROD_TEST_MODULE_APPS") or "").split(",") if x.strip()]
 APP1 = "FFF0123456"
 APP2 = "FFF000AB01"
+APP3 = "FFF00C0D21"           # built from ETS modules
 ENV_KEYS = ("KNXPROD_DIR", "KNXPROD_DATA", "KNXPROD_BIND", "KNXPROD_PORT",
             "KNXPROD_ALLOWED_HOSTS", "KNXPROD_UPLOAD_ORIGINS", "KNXPROD_SCAN_INTERVAL",
             "KNXPROD_ALLOW_ANY_BIND", "KNXPROD_MDNS", "KNXPROD_MDNS_NAME", "KNXPROD_MDNS_HOSTNAME",
@@ -81,7 +92,8 @@ def members(*parts, app2_name=None):
              "hardware": ("M-FFF0/Hardware.xml", _read(os.path.join(FIXTURE, "M-FFF0",
                                                                     "Hardware.xml"))),
              "app1": ("M-FFF0/M-FFF0_A-1234-56-ABCD.xml", _read(APP_XML)),
-             "app2": ("M-FFF0/M-FFF0_A-00AB-01-1111-OFFF1.xml", app2)}
+             "app2": ("M-FFF0/M-FFF0_A-00AB-01-1111-OFFF1.xml", app2),
+             "app3": ("M-FFF0/M-FFF0_A-0C0D-21-5A5A.xml", _read(APP3_XML))}
     return [table[p] for p in parts]
 
 
@@ -644,7 +656,7 @@ class TestMcpDispatch(unittest.TestCase):
         res, o = self.tool("prod-parameters", {"app_id": APP1, "address": "nowhere"})
         self.assertTrue(res["isError"])
         res, o = self.tool("prod-applications", {"manufacturer": "synthetic"})
-        self.assertEqual(o["total"], 2)
+        self.assertEqual(o["total"], 3)
         res, o = self.tool("prod-applications", {"query": "TEST-0003"})
         self.assertEqual([a["app_id"] for a in o["applications"]], [APP2])
 
@@ -661,6 +673,282 @@ class TestMcpDispatch(unittest.TestCase):
                 break
             off = o["next_offset"]
         self.assertEqual(seen, [p["id"] for p in rec["parameters"]])
+
+
+# ---------------------------------------------------------------------------
+# 4b. ETS modules: a definition instantiated several times (program APP3)
+# ---------------------------------------------------------------------------
+
+def segment_data(xml_path, seg_suffix):
+    for el in ET.parse(xml_path).getroot().iter():
+        if el.tag.endswith("Segment") and el.get("Id", "").endswith(seg_suffix):
+            return base64.b64decode([c for c in el if c.tag.endswith("}Data")][0].text)
+    raise KeyError(seg_suffix)
+
+
+def distill_xml(xml):
+    """build_record of a program given as XML text (for variants of APP3)."""
+    path = tempfile.mktemp(prefix="knxprod-mcp-xml-")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(xml)
+        with open(path, "rb") as f:
+            raws, langs = K.parse_application_xml(f)
+    finally:
+        os.remove(path)
+    return K.build_record(raws[0], langs, {"manufacturers": {}, "masks": {}},
+                          {"programs": {}, "products": {}, "langs": {}}, {})
+
+
+class TestModules(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = _tmpdir()
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+        cls.data = os.path.join(cls.tmp, "data")
+        src = os.path.join(cls.tmp, "modules.knxprod")
+        with open(src, "wb") as f:
+            f.write(zip_bytes(members("master", "app3")))
+        cls.summary = K.ingest_file(src, cls.data)
+        cls.store = K.Store(cls.data)
+        cls.rec = cls.store.app(APP3)
+        cls.p = {p["id"]: p for p in cls.rec["parameters"]}
+        cls.c = {c["id"]: c for c in cls.rec["comobjects"]}
+
+    def tool(self, name, args):
+        r = K.handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": name, "arguments": args}}, self.store)
+        self.assertLessEqual(len(K._dumps(r).encode()), K.RESPONSE_BUDGET)
+        return r["result"], json.loads(r["result"]["content"][0]["text"])
+
+    def test_counts(self):
+        c = self.rec["counts"]
+        self.assertEqual((c["module_defs"], c["module_instances"]), (4, 8))
+        self.assertEqual((c["parameters"], c["module_parameters"]), (24, 20))
+        self.assertEqual((c["comobjects"], c["module_comobjects"]), (14, 13))
+        self.assertEqual(c["template_check"], {"checked": 19, "match": 17})
+        self.assertEqual(c["template_check_modules"], {"checked": 16, "match": 14})
+        for key in ("module_unsupported", "texts_with_placeholders", "module_records_skipped"):
+            self.assertNotIn(key, c)
+        self.assertEqual([(m["id"], m["name"], m["parameters"], m["comobjects"], m["instances"])
+                          for m in self.rec["modules"]],
+                         [("MD-1", "ModuleDefSwitch", 5, 2, 2), ("MD-2", "ModuleDefDimmer", 2, 1, 1),
+                          ("MD-3", "ModuleDefSensor", 2, 2, 3), ("MD-4", "ModuleDefScene", 1, 1, 2)])
+        self.assertEqual(self.rec["modules"][0]["arguments"],
+                         {"ParamOffsBase": 16, "ObjNumberBase": 4, "ChName": "text"})
+        self.assertEqual(self.summary["per_app"][0]["module_instances"], 8)
+        self.assertFalse([w for w in self.summary["warnings"] if "module" in w])
+
+    def test_addresses_from_base_offset(self):
+        p = self.p
+        # segment 0x4800; ParamOffsBase 16 (Left) and 32 (Right) from NumericArg
+        for pid, addr in (("MD-1_M-1_P-2", 0x4810), ("MD-1_M-1_P-3", 0x4812),
+                          ("MD-1_M-1_UP-4", 0x4814), ("MD-1_M-1_UP-5", 0x4814),
+                          ("MD-2_M-2_P-1", 0x4810), ("MD-2_M-2_P-2", 0x4812),
+                          ("MD-1_M-3_P-2", 0x4820), ("MD-1_M-3_P-3", 0x4822),
+                          ("MD-1_M-3_UP-4", 0x4824), ("MD-1_M-3_UP-5", 0x4824),
+                          ("MD-4_M-5_MI-1_P-1", 0x4850), ("MD-4_M-5_MI-2_P-1", 0x4858)):
+            self.assertEqual((p[pid]["address"], p[pid]["bit_offset"]), (addr, 0), pid)
+        self.assertEqual(p["MD-1_M-3_UP-5"]["union"], {"size_bits": 8, "default": False})
+        # a <Repeat> with allocators, placed in a relative segment
+        for i, off in ((1, 1), (2, 11), (3, 21)):
+            q = p["MD-3_M-4_MI-%d_P-1" % i]
+            self.assertEqual((q["segment"], q["offset"], q.get("address"), q["relative"]),
+                             ("RS-04-00000", off, None, True))
+        self.assertNotIn("storage", p["MD-1_M-3_P-1"])               # text parameter, no memory
+        # the manufacturer's template holds each instance's defaults right there
+        tpl = segment_data(APP3_XML, "_AS-4800")
+        for pid in ("MD-1_M-1_P-3", "MD-1_M-3_P-3", "MD-1_M-3_UP-4", "MD-4_M-5_MI-2_P-1"):
+            q = p[pid]
+            v = K.extract_bits(tpl, q["address"] - 0x4800, q["bit_offset"], q["size_bits"])
+            self.assertEqual(v, int(q["default"]), pid)
+
+    def test_comobject_numbers_from_base_number(self):
+        got = sorted((c["number"], c["id"]) for c in self.rec["comobjects"])
+        self.assertEqual(got, [
+            (0, "O-0"), (1, "MD-1_M-1_O-1"), (1, "MD-2_M-2_O-1"), (2, "MD-1_M-1_O-2"),
+            (5, "MD-1_M-3_O-1"), (6, "MD-1_M-3_O-2"),
+            (20, "MD-3_M-4_MI-1_O-1"), (21, "MD-3_M-4_MI-1_O-2"), (22, "MD-3_M-4_MI-2_O-1"),
+            (23, "MD-3_M-4_MI-2_O-2"), (24, "MD-3_M-4_MI-3_O-1"), (25, "MD-3_M-4_MI-3_O-2"),
+            (30, "MD-4_M-5_MI-1_O-1"), (31, "MD-4_M-5_MI-2_O-1")])
+        ids = [x["id"] for x in self.rec["parameters"] + self.rec["comobjects"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_labels_and_texts(self):
+        p, c = self.p, self.c
+        self.assertEqual(p["MD-1_M-1_P-2"]["module"], {"id": "MD-1_M-1", "label": "Channel Left"})
+        self.assertEqual(p["MD-2_M-2_P-1"]["module"], {"id": "MD-2_M-2", "label": "Channel Left"})
+        self.assertEqual(p["MD-1_M-3_P-2"]["module"]["label"], "Channel Right")
+        self.assertEqual([p["MD-3_M-4_MI-%d_P-1" % i]["module"]["label"] for i in (1, 2, 3)],
+                         ["Sensor 1", "Sensor 2", "Sensor 3"])
+        self.assertEqual([p["MD-4_M-5_MI-%d_P-1" % i]["module"]["label"] for i in (1, 2)],
+                         ["Scene #1", "Scene #2"])                    # label without argument
+        self.assertNotIn("module", p["P-1"])
+        # {{argument}} in parameter, object and block texts, translated text argument
+        self.assertEqual((p["MD-3_M-4_MI-2_P-1"]["text"], p["MD-3_M-4_MI-2_P-1"]["text_de"]),
+                         ("Sensor 2 offset (0.1 K)", "Sensor 2 Offset (0,1 K)"))
+        self.assertEqual(p["MD-1_M-3_P-1"]["text"], "Channel Right description")
+        self.assertEqual(p["MD-1_M-1_P-3"]["block"], "Channel Left - switching")
+        self.assertEqual(c["MD-3_M-4_MI-3_O-1"]["text"], "Sensor 3 temperature")
+        # {{0}} = the text parameter (empty by default), {{0:default}}
+        v = c["MD-1_M-3_O-1"]["variants"][0]
+        self.assertEqual((v["text"], v["text_de"]), ("Channel Right", "Kanal Rechts"))
+        self.assertEqual(c["MD-1_M-1_O-2"]["variants"][0]["text"], "Channel Left status")
+        # {{0}} outside modules: the object takes its variant's resolved text
+        self.assertEqual((c["O-0"]["text"], c["O-0"]["variants"][0]["text"]),
+                         ("Test device", "Test device"))
+
+    def test_conditions(self):
+        p = self.p
+        self.assertEqual(p["MD-1_M-1_P-3"]["when"], ["Channel Left mode = 1 (switch)",
+                                                     "Switch-on delay active = 1 (enabled)"])
+        self.assertEqual(p["MD-2_M-2_P-1"]["when"], ["Channel Left mode = 2 (dimmer)"])
+        self.assertEqual(p["MD-1_M-3_P-3"]["when"][0], "Channel Right mode = 1 (switch)")
+        self.assertEqual(p["MD-3_M-4_MI-3_P-2"]["when"], ["Number of sensors >= 3"])
+        self.assertNotIn("when", p["MD-4_M-5_MI-1_P-1"])
+        self.assertEqual((p["MD-1_M-1_UP-5"]["ui"], p["MD-1_M-1_UP-5"]["when"]),
+                         (False, ["Channel Left mode = 1 (switch)"]))
+        self.assertEqual(self.c["MD-3_M-4_MI-2_O-1"]["variants"][0]["when"],
+                         ["Number of sensors >= 2"])
+
+    def test_records_are_stable(self):
+        data = os.path.join(self.tmp, "again")
+        K.ingest_file(FIXTURE, data)                     # other input form, other order
+        other = load_json(os.path.join(data, "apps", APP3 + ".json"))
+        for key in ("parameters", "comobjects", "counts", "modules", "segments"):
+            self.assertEqual(other[key], self.rec[key], key)
+
+    def test_tools(self):
+        res, o = self.tool("prod-comobjects", {"app_id": APP3, "numbers": [1, 22]})
+        self.assertEqual([(c["number"], c["module"]) for c in o["comobjects"]],
+                         [(1, "Channel Left"), (1, "Channel Left"), (22, "Sensor 2")])
+        res, o = self.tool("prod-comobjects", {"app_id": APP3, "module": "Sensor 3"})
+        self.assertEqual([c["number"] for c in o["comobjects"]], [24, 25])
+        res, o = self.tool("prod-comobjects", {"app_id": APP3, "query": "kanal rechts"})
+        self.assertEqual([c["number"] for c in o["comobjects"]], [5])
+        res, o = self.tool("prod-parameters", {"app_id": APP3, "module": "channel left"})
+        self.assertEqual(sorted(p["id"] for p in o["parameters"]), [
+            "MD-1_M-1_P-2", "MD-1_M-1_P-3", "MD-1_M-1_UP-4", "MD-1_M-1_UP-5",
+            "MD-2_M-2_P-1", "MD-2_M-2_P-2"])
+        res, o = self.tool("prod-parameters", {"app_id": APP3, "module": "MD-3_M-4"})
+        self.assertEqual(o["total"], 6)                  # every repetition of the <Repeat>
+        res, o = self.tool("prod-parameters", {"app_id": APP3, "module": "MD-1"})
+        self.assertEqual(o["total"], 8)                  # every instance of the definition
+        res, o = self.tool("prod-parameters", {"app_id": APP3, "address": "0x4810"})
+        self.assertEqual(sorted((p["id"], p["module"]) for p in o["parameters"]),
+                         [("MD-1_M-1_P-2", "Channel Left"), ("MD-2_M-2_P-1", "Channel Left")])
+        res, o = self.tool("prod-parameters", {"app_id": APP3, "segment": "rs-04-00000",
+                                               "address": 13})
+        self.assertEqual([p["id"] for p in o["parameters"]], ["MD-3_M-4_MI-2_P-2"])
+        self.assertEqual((o["segment"], o["segment_offset"]), ("RS-04-00000", 13))
+        res, o = self.tool("prod-parameters", {"app_id": APP3, "address": 13})
+        self.assertEqual(o["total"], 0)
+        self.assertIn("RS-04-00000", o["hint"])
+        res, o = self.tool("prod-parameters", {"app_id": APP3, "segment": "RS-9", "address": 1})
+        self.assertTrue(res["isError"])
+        self.assertEqual(o["segments"], ["AS-4800", "RS-04-00000"])
+        res, o = self.tool("prod-application", {"app_id": APP3})
+        self.assertEqual(o["counts"]["module_instances"], 8)
+        self.assertEqual([m["id"] for m in o["modules"]], ["MD-1", "MD-2", "MD-3", "MD-4"])
+
+    def test_decode(self):
+        tpl = segment_data(APP3_XML, "_AS-4800")
+        res, o = self.tool("prod-decode", {"app_id": APP3, "address": 0x4800, "data": tpl.hex(),
+                                           "limit": 200})
+        vals = {v["id"]: v for v in o["values"]}
+        self.assertEqual((vals["MD-1_M-3_P-3"]["value"], vals["MD-1_M-3_P-3"]["module"],
+                          vals["MD-1_M-3_P-3"]["address_hex"]), (300, "Channel Right", "0x4822"))
+        self.assertEqual(vals["MD-1_M-1_UP-4"]["value"], 5)
+        self.assertEqual(vals["MD-2_M-2_P-1"]["value"], 0x80)       # the alternative module
+        self.assertEqual(vals["MD-4_M-5_MI-2_P-1"]["value"], 1)
+        rs = segment_data(APP3_XML, "_RS-04-00000")
+        res, o = self.tool("prod-decode", {"app_id": APP3, "segment": "RS-04-00000",
+                                           "address": 10, "data": rs[10:20].hex()})
+        self.assertEqual((o["segment"], o["segment_offset"], o["offset"]), ("RS-04-00000", 10, 0))
+        self.assertEqual([(v["id"], v["offset"], v["value"], v["module"]) for v in o["values"]],
+                         [("MD-3_M-4_MI-2_P-1", 11, 20, "Sensor 2"),
+                          ("MD-3_M-4_MI-2_P-2", 12, 60, "Sensor 2")])
+        res, o = self.tool("prod-decode", {"app_id": APP3, "address": 10, "data": "00"})
+        self.assertEqual(o["values"], [])
+        self.assertIn("RS-04-00000", o["hint"])
+
+    def test_budget_paging(self):
+        for tool, key in ((K.tool_parameters, "parameters"), (K.tool_comobjects, "comobjects")):
+            seen, off = [], 0
+            while True:
+                text = tool(self.store, {"app_id": APP3, "offset": off, "include_virtual": True},
+                            900)
+                self.assertLessEqual(K._esc_len(text), 900)
+                o = json.loads(text)
+                seen += [x["id"] if key == "parameters" else x["number"] for x in o[key]]
+                if o["next_offset"] is None:
+                    break
+                off = o["next_offset"]
+            self.assertEqual(seen, [x["id"] if key == "parameters" else x["number"]
+                                    for x in self.rec[key]])
+
+    def test_unsupported_features_are_counted(self):
+        xml = _read(APP3_XML).decode("utf-8")
+        pre = "M-FFF0_A-0C0D-21-5A5A_"
+
+        def change(old, new):
+            nonlocal xml
+            self.assertEqual(xml.count(old), 1, old)
+            xml = xml.replace(old, new)
+
+        # a module definition nested in MD-1, instantiated inside MD-1
+        change('<ModuleDef Id="%sMD-1" Name="ModuleDefSwitch">' % pre,
+               '<ModuleDef Id="%sMD-1" Name="ModuleDefSwitch"><SubModuleDefs>'
+               '<ModuleDef Id="%sMD-1_SM-1" Name="Sub"><Static><Parameters>'
+               '<Parameter Id="%sMD-1_SM-1_P-1" Name="N" Text="Nested parameter" '
+               'ParameterType="%sPT-Byte" Value="0"><Memory CodeSegment="%sAS-4800" Offset="0" '
+               'BitOffset="0" /></Parameter></Parameters></Static></ModuleDef></SubModuleDefs>'
+               % ((pre,) * 5))
+        change('<ParameterRefRef RefId="%sMD-1_P-1_R-1" />' % pre,
+               '<ParameterRefRef RefId="%sMD-1_P-1_R-1" /><Module Id="%sMD-1_SM-1_M-1" '
+               'RefId="%sMD-1_SM-1" />' % (pre, pre, pre))
+        # channel Right without its ParamOffsBase argument
+        change('<NumericArg RefId="%sMD-1_A-1" Value="32" />' % pre, '')
+        # a repetition without a count, an allocator that runs out
+        change('Name="Scenes" Count="2"', 'Name="Scenes"')
+        change('Name="SensorObjNumber" Start="20" maxInclusive="26"',
+               'Name="SensorObjNumber" Start="20" maxInclusive="24"')
+        rec = distill_xml(xml)
+        c = rec["counts"]
+        self.assertEqual(c["module_unsupported"], {
+            "allocator_overflow": 1, "module_def_nested": 1, "module_in_module_def": 1,
+            "parameters_unplaced": 4, "repeat_count_unknown": 1})
+        texts = [p["text"] for p in rec["parameters"]]
+        self.assertNotIn("Nested parameter", texts)
+        self.assertEqual(c["module_instances"], 5)                   # 3 channels + 2 sensors
+        ids = {p["id"] for p in rec["parameters"]}
+        self.assertIn("MD-1_M-3_P-1", ids)                           # needs no argument
+        self.assertNotIn("MD-1_M-3_P-2", ids)
+        self.assertNotIn("MD-3_M-4_MI-3_P-1", ids)
+        self.assertEqual(sorted(x["number"] for x in rec["comobjects"] if
+                                x["id"].startswith("MD-1_M-3")), [5, 6])   # numbers still known
+
+    def test_placeholder_naming_a_parameter_ref(self):
+        # older schemas: {{226}} = the parameter behind ParameterRef ..._R-226
+        xml = _read(APP3_XML).decode("utf-8").replace("_P-4_R-4", "_P-4_R-226")
+        xml = xml.replace('Text="{{0}}" TextParameterRefId="M-FFF0_A-0C0D-21-5A5A_P-4_R-226"',
+                          'Text="Heartbeat: {{226}}"')
+        rec = distill_xml(xml)
+        o0 = [c for c in rec["comobjects"] if c["id"] == "O-0"][0]
+        self.assertEqual((o0["text"], o0["variants"][0]["text"]),
+                         ("Heartbeat: Test device", "Heartbeat: Test device"))
+        self.assertNotIn("texts_with_placeholders", rec["counts"])
+
+    def test_placeholders(self):
+        f = K.fill_placeholders
+        names = {"ChNo": "B", "Empty": ""}.get
+        self.assertEqual(f("Channel {{ChNo}}: {{Empty}}", names), ("Channel B", 0))
+        self.assertEqual(f("{{Empty:Channel {{ChNo}}}} status", names), ("Channel B status", 0))
+        self.assertEqual(f("{{Unknown}} and {{ChNo}}", names), ("{{Unknown}} and B", 1))
+        self.assertEqual(f("{{Unknown:fallback}}", names), ("fallback", 0))
+        self.assertEqual(f("no placeholder", names), ("no placeholder", 0))
+        self.assertEqual(f("broken {{ChNo", names), ("broken {{ChNo", 0))
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +1225,46 @@ class TestProductDirectory(unittest.TestCase):
         s = self.sync()
         self.assertEqual(s["removed"], ["a.knxprod"])
         self.assertEqual(sorted(self.index()), [APP2])
+
+    def test_index_of_an_older_format_is_rebuilt(self):
+        self.put("a.knxprod", full_knxprod())
+        self.sync()
+        p = K._paths(self.data)
+        for key in ("index", "files"):
+            d = load_json(p[key])
+            d["schema"] = K.SCHEMA_VERSION - 1
+            K.atomic_write_json(p[key], d)
+        old = load_json(os.path.join(p["apps"], APP1 + ".json"))
+        old.update(schema=K.SCHEMA_VERSION - 1, parameters=[])
+        K.atomic_write_json(os.path.join(p["apps"], APP1 + ".json"), old)
+        lines = []
+        s = self.sync(log=lines.append)
+        self.assertEqual(s["rebuilt_from_schema"], K.SCHEMA_VERSION - 1)
+        self.assertEqual((s["added"], s["unchanged"], s["apps_total"]), (["a.knxprod"], 0, 2))
+        self.assertTrue(any("rebuilding the index" in line for line in lines), lines)
+        self.assertEqual(load_json(p["index"])["schema"], K.SCHEMA_VERSION)
+        self.assertEqual(load_json(p["files"])["schema"], K.SCHEMA_VERSION)
+        rec = load_json(os.path.join(p["apps"], APP1 + ".json"))
+        self.assertEqual((rec["schema"], len(rec["parameters"])), (K.SCHEMA_VERSION, 11))
+        s = self.sync()
+        self.assertNotIn("rebuilt_from_schema", s)
+        self.assertEqual(s["unchanged"], 1)
+
+    def test_server_start_rebuilds_an_older_index(self):
+        self.put("a.knxprod", full_knxprod())
+        self.sync()
+        p = K._paths(self.data)
+        for key in ("index", "files"):                     # as an older version left it
+            d = load_json(p[key])
+            d.pop("schema")
+            K.atomic_write_json(p[key], d)
+        srv = Server(self.products, self.data)
+        self.addCleanup(srv.stop)
+        self.assertTrue(any("rebuilding the index" in line for line in srv.lines), srv.lines)
+        self.assertEqual(srv.health()["apps"], 2)
+        res, o, _ = srv.tool("prod-parameters", {"app_id": APP1, "address": "0x4A64"})
+        self.assertEqual(sorted(x["id"] for x in o["parameters"]), ["UP-10", "UP-11"])
+        self.assertEqual(load_json(p["files"])["schema"], K.SCHEMA_VERSION)
 
     def test_upload_naming(self):
         os.makedirs(self.data, exist_ok=True)
@@ -1693,6 +2021,143 @@ class TestRealData(unittest.TestCase):
                                          "arguments": {"app_id": app_id}}}, store)
             self.assertLessEqual(len(K._dumps(r).encode()), K.RESPONSE_BUDGET)
         self.report["largest_tools_call_body"] = worst
+
+
+class TestRealModules(unittest.TestCase):
+    """ETS module instances in a real product file (opt-in, see the docstring)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not REAL_MODULES or not REAL_MODULE_APPS:
+            raise unittest.SkipTest("set KNXPROD_TEST_MODULE_DATA and KNXPROD_TEST_MODULE_APPS")
+        cls.tmp = _tmpdir()
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+        cls.data = os.path.join(cls.tmp, "index")
+        cls.summary = K.ingest_file(REAL_MODULES, cls.data)
+        cls.store = K.Store(cls.data)
+        cls.report = {}
+        # the manufacturer's segment templates, straight from the file
+        cls.templates = {}
+        with K.SourceSet(REAL_MODULES, cls.tmp) as src:
+            for m in src.members:
+                if m.kind == "app":
+                    with m.open() as f:
+                        raws, _ = K.parse_application_xml(f)
+                    for raw in raws:
+                        rec_id = K.normalize_app_id(raw.full_id)
+                        cls.templates[rec_id] = {k[len(raw.full_id) + 1:]: v
+                                                 for k, v in raw.seg_data.items()}
+
+    @classmethod
+    def tearDownClass(cls):
+        sys.stderr.write("\nREAL-MODULE REPORT %s\n" % json.dumps(cls.report, indent=1))
+
+    def tool(self, name, args):
+        r = K.handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": name, "arguments": args}}, self.store)
+        self.assertLessEqual(len(K._dumps(r).encode()), K.RESPONSE_BUDGET)
+        self.assertFalse(r["result"]["isError"], r)
+        return json.loads(r["result"]["content"][0]["text"])
+
+    def test_instances(self):
+        for app in REAL_MODULE_APPS:
+            rec = self.store.app(app)
+            self.assertIsNotNone(rec, app)
+            c = rec["counts"]
+            # every module record placed: nothing skipped, nothing left unresolved
+            self.assertGreater(c.get("module_instances", 0), 0, app)
+            self.assertNotIn("module_unsupported", c, app)
+            self.assertNotIn("module_records_skipped", c, app)
+            rep = self.report.setdefault(app, {})
+            rep.update({k: c.get(k) for k in ("parameters", "comobjects", "module_instances",
+                                              "module_parameters", "module_comobjects",
+                                              "texts_with_placeholders")})
+            ids = [x["id"] for x in rec["parameters"] + rec["comobjects"]]
+            self.assertEqual(len(ids), len(set(ids)), app)
+            # per definition: an instance is the first one's layout, shifted by its
+            # base arguments -- at most one distinct shift per numeric argument
+            numeric = {m["id"]: [a for a, v in m["arguments"].items() if v != "text"]
+                       for m in rec["modules"]}
+            per_def = collections.defaultdict(dict)
+            for p in rec["parameters"]:
+                if p.get("module") and p.get("storage") == "memory":
+                    iid = p["module"]["id"]
+                    local = p["id"][len(iid) + 1:]
+                    per_def[iid.split("_M-")[0]].setdefault(iid, {})[local] = p["offset"]
+            for d, insts in per_def.items():
+                layouts = list(insts.values())
+                if len(layouts) < 2:
+                    continue
+                shifts = set()
+                for lay in layouts[1:]:
+                    common = set(layouts[0]) & set(lay)
+                    self.assertTrue(common, (app, d))
+                    diff = {lay[k] - layouts[0][k] for k in common}
+                    self.assertLessEqual(len(diff), len(numeric[d]), (app, d, sorted(diff)[:5]))
+                    self.assertTrue(any(diff), (app, d))         # not all at the same place
+                    shifts.add(tuple(sorted(diff)))
+                rep.setdefault("instance_shifts", {})[d] = sorted(shifts)[:4]
+            labels = {p["module"]["label"] for p in rec["parameters"] if p.get("module")}
+            self.assertTrue(all(lbl and "{{" not in lbl for lbl in labels), app)
+            rep["labels"] = sorted(labels)[:6]
+
+    def test_decode_an_instance_parameter(self):
+        """The last instance's parameters (largest base) decoded through
+        prod-decode: from the manufacturer's template where it holds the
+        default (an independent check of the placement), otherwise from bytes
+        built from the default."""
+        for app in REAL_MODULE_APPS:
+            rec = self.store.app(app)
+            tpls = self.templates.get(app) or {}
+            seg_ids = {s["id"]: s for s in rec["segments"]}
+            order = rec["byte_order"]["used"]
+            cands = []
+            for p in reversed(rec["parameters"]):
+                ty = rec["types"].get(p.get("type"), {})
+                if (p.get("module") and p.get("storage") == "memory" and not p.get("union")
+                        and ty.get("kind") in ("number", "enum") and p.get("size_bits")
+                        and p["size_bits"] <= 32 and K._intval(p.get("default"))):
+                    cands.append(p)
+            self.assertTrue(cands, app)
+            p, source = cands[0], "default"
+            for q in cands:
+                tpl = tpls.get(q["segment"])
+                if tpl and K.extract_bits(tpl, q["offset"], q["bit_offset"], q["size_bits"],
+                                          order) == int(q["default"]):
+                    p, source = q, "template"
+                    break
+            nbytes = K._param_nbytes(p)
+            want = int(p["default"]) & ((1 << p["size_bits"]) - 1)
+            if source == "template":
+                buf = tpls[p["segment"]][p["offset"]:p["offset"] + nbytes]
+            else:
+                shift = nbytes * 8 - p["bit_offset"] - p["size_bits"]
+                buf = (want << shift).to_bytes(nbytes, "big")
+            args = {"app_id": app, "data": buf.hex()}
+            if seg_ids[p["segment"]].get("relative"):
+                args.update(segment=p["segment"], address=p["offset"])
+            else:
+                args["address"] = p["address"]
+            o = self.tool("prod-decode", args)
+            got = {v["id"]: v for v in o["values"]}
+            self.assertEqual(got[p["id"]]["value"], want, (app, p["id"]))
+            self.assertEqual(got[p["id"]]["module"], p["module"]["label"])
+            self.report.setdefault(app, {})["decoded"] = {
+                "id": p["id"], "module": p["module"]["label"], "text": p["text"],
+                "value": want, "bytes_from": source}
+            self.report[app]["template_check_modules"] = rec["counts"].get(
+                "template_check_modules")
+
+    def test_tools_within_budget(self):
+        for app in REAL_MODULE_APPS:
+            rec = self.store.app(app)
+            label = next(p["module"]["label"] for p in rec["parameters"] if p.get("module"))
+            for name, args in (("prod-parameters", {"module": label}),
+                               ("prod-comobjects", {"module": label}),
+                               ("prod-application", {})):
+                o = self.tool(name, dict(args, app_id=app))
+                if name != "prod-application":
+                    self.assertGreater(o["total"], 0, (app, name))
 
 
 if __name__ == "__main__":
