@@ -1,0 +1,5 @@
+# The image needs the server and the license, nothing else. Product files and
+# index folders must never end up in a build context.
+*
+!knxprod_mcp.py
+!LICENSE

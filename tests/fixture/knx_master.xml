@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SYNTHETIC test fixture written for knxprod-mcp.  Not KNX master data. -->
+<KNX xmlns="http://knx.org/xml/project/20">
+  <MasterData Version="1" Signature="">
+    <MaskVersions>
+      <MaskVersion Id="MV-0701" MaskVersion="1793" Name="7.1" ManagementModel="BimM112" MediumTypeRefId="MT-0">
+        <Procedures>
+          <Procedure ProcedureType="Unload" ProcedureSubType="all" Access="remote">
+            <LdCtrlConnect />
+            <LdCtrlUnload LsmIdx="1" />
+            <LdCtrlDisconnect />
+          </Procedure>
+        </Procedures>
+      </MaskVersion>
+      <MaskVersion Id="MV-07B0" MaskVersion="1968" Name="System B" ManagementModel="SystemB" MediumTypeRefId="MT-0">
+        <Procedures>
+          <Procedure ProcedureType="Load" ProcedureSubType="all" Access="remote">
+            <LdCtrlConnect />
+            <LdCtrlMerge MergeId="1" />
+            <LdCtrlMerge MergeId="2" />
+            <LdCtrlRestart />
+            <LdCtrlDisconnect />
+          </Procedure>
+        </Procedures>
+      </MaskVersion>
+    </MaskVersions>
+    <Manufacturers>
+      <Manufacturer Id="M-FFF0" KnxManufacturerId="65520" Name="Synthetic Test Manufacturer" />
+      <Manufacturer Id="M-FFF1" KnxManufacturerId="65521" Name="Synthetic OEM Origin" />
+    </Manufacturers>
+  </MasterData>
+</KNX>

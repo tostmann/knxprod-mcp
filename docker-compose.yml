@@ -1,0 +1,20 @@
+# knxprod-mcp: product files in ./knxprod, the index in ./knxprod-index.
+# Create both folders before the first start (see README).
+services:
+  knxprod-mcp:
+    build: .
+    image: knxprod-mcp:local
+    ports:
+      - "8095:8095"
+    volumes:
+      - ./knxprod:/knxprod
+      - ./knxprod-index:/data
+    # Run as the owner of the two folders.
+    user: "${KNXPROD_UID:-1000}:${KNXPROD_GID:-1000}"
+    environment:
+      # Extra host names clients use to reach this server (comma separated).
+      # IP addresses, localhost and *.local names always work.
+      KNXPROD_ALLOWED_HOSTS: ""
+      # Seconds between scans of ./knxprod for new, changed or removed files.
+      KNXPROD_SCAN_INTERVAL: "10"
+    restart: unless-stopped

@@ -1,0 +1,35 @@
+# Never in git
+CLAUDE.md
+MEMORY.md
+GEMINI.md
+FACTS.md
+HARDWARE_STATUS.md
+.env
+.env.*
+*.key
+*.pem
+*.log
+schematics/
+datasheets/
+datasheet/
+__pycache__/
+*.pyc
+.claude/
+
+# Manufacturer product files and everything derived from them stay out of
+# git: product directory, index directory, archives, extracted XML.  Only the
+# synthetic test fixture under tests/fixture/ is tracked.
+knxprod/
+knxprod-index/
+data/
+*.knxprod
+*.zip
+*.xml.gz
+*.tmp
+knx_master.xml
+Hardware.xml
+Catalog.xml
+Baggages.xml
+M-*_A-*.xml
+*.signature
+!tests/fixture/**

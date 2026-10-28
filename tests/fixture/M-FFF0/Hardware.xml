@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SYNTHETIC test fixture written for knxprod-mcp.  Not manufacturer data. -->
+<KNX xmlns="http://knx.org/xml/project/20" CreatedBy="knxprod-mcp-tests" ToolVersion="0">
+  <ManufacturerData>
+    <Manufacturer RefId="M-FFF0">
+      <Hardware>
+        <Hardware Id="M-FFF0_H-TEST-1" Name="Testaktor 2/4fach" SerialNumber="TEST" VersionNumber="1">
+          <Products>
+            <Product Id="M-FFF0_H-TEST-1_P-TEST.2D0001" Text="Test actuator 2-gang" OrderNumber="TEST-0001" DefaultLanguage="en-US" />
+            <Product Id="M-FFF0_H-TEST-1_P-TEST.2D0002" Text="Test actuator 4-gang" OrderNumber="TEST-0002" DefaultLanguage="en-US" />
+          </Products>
+          <Hardware2Programs>
+            <Hardware2Program Id="M-FFF0_H-TEST-1_HP-1234-56-ABCD" MediumTypes="MT-0">
+              <ApplicationProgramRef RefId="M-FFF0_A-1234-56-ABCD" />
+            </Hardware2Program>
+          </Hardware2Programs>
+        </Hardware>
+        <Hardware Id="M-FFF0_H-TEST-2" Name="Testaktor OEM" SerialNumber="TEST2" VersionNumber="1">
+          <Products>
+            <Product Id="M-FFF0_H-TEST-2_P-TEST.2D0003" Text="Testaktor OEM" OrderNumber="TEST-0003" DefaultLanguage="de-DE" />
+          </Products>
+          <Hardware2Programs>
+            <Hardware2Program Id="M-FFF0_H-TEST-2_HP-00AB-01-1111-OFFF1" MediumTypes="MT-0">
+              <ApplicationProgramRef RefId="M-FFF0_A-00AB-01-1111-OFFF1" />
+            </Hardware2Program>
+          </Hardware2Programs>
+        </Hardware>
+      </Hardware>
+      <Languages>
+        <Language Identifier="de-DE">
+          <TranslationUnit RefId="M-FFF0_H-TEST-1_P-TEST.2D0001">
+            <TranslationElement RefId="M-FFF0_H-TEST-1_P-TEST.2D0001">
+              <Translation AttributeName="Text" Text="Testaktor 2fach" />
+            </TranslationElement>
+          </TranslationUnit>
+        </Language>
+        <Language Identifier="en-US">
+          <TranslationUnit RefId="M-FFF0_H-TEST-2_P-TEST.2D0003">
+            <TranslationElement RefId="M-FFF0_H-TEST-2_P-TEST.2D0003">
+              <Translation AttributeName="Text" Text="Test actuator OEM" />
+            </TranslationElement>
+          </TranslationUnit>
+        </Language>
+      </Languages>
+    </Manufacturer>
+  </ManufacturerData>
+</KNX>
