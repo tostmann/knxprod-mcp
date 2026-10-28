@@ -111,36 +111,18 @@ SLOT_NOTE = ("Names label slots of the application program, not what an "
 VARIANT_NOTE = ("Pick the variant whose size_bits matches the object size the "
                 "device reports; 'when' is the ETS condition for a variant.")
 
+# The skill an agent reads first: skill/SKILL.md next to this file (in the
+# image /app/skill/SKILL.md), served as an MCP resource.
+SKILL_URI = "skill://knxprod-mcp/SKILL.md"
+SKILL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skill", "SKILL.md")
+SKILL_DESCRIPTION = ("Read this first: the ApplicationId key, the workflow from a device to "
+                     "decoded parameter values, variants, modules, byte order, errors.")
+
 INSTRUCTIONS = (
-    "knxprod-mcp is a read-only service for a private network. It answers "
-    "questions about KNX application programs from the manufacturer product "
-    "files (.knxprod) its operator put into its product directory. The data is "
-    "derived from manufacturer data licensed to that operator: use it to "
-    "understand and configure your own devices, do not republish it.\n"
-    "Identify a device by the ApplicationId it reports: 5 bytes = manufacturer "
-    "(2), application number (2), version (1), written as 10 hex digits, e.g. "
-    "FFF0123456. prod-applications lists what is indexed.\n"
-    "Names name SLOTS, not functions: a com-object or parameter name says which "
-    "slot of the application program it is. What the device really does there "
-    "depends on the channel mode and on the project (in switch mode a 'slat "
-    "position' object may switch a pump). Do not present a name as the function "
-    "of an installation without checking the configuration.\n"
-    "One com-object number can have several variants (ComObjectRef) that differ "
-    "in size, flags or text. Pick the variant whose size_bits matches the object "
-    "size the device itself reports; 'when' shows the ETS condition (channel "
-    "mode) under which a variant is shown.\n"
-    "Channels that a program defines once as an ETS module and instantiates "
-    "several times are listed per instance: such a parameter or com object has "
-    "its own address or number and 'module' (the instance, e.g. 'Channel B'). "
-    "Alternative modules for one channel share memory and object numbers; "
-    "'when' says which one the channel mode selects.\n"
-    "Parameters: address = segment base + offset; in a relative segment (no "
-    "address) pass segment to prod-parameters / prod-decode and use the offset "
-    "within it. bit_offset counts from the MSB "
-    "of the first byte; multi-byte values follow the byte order the program "
-    "declares (byte_order) -- heed a byte_order_warning. Union members share "
-    "memory: only the member whose 'when' matches the configured mode is valid. "
-    "Nothing here writes to a device."
+    "knxprod-mcp answers questions about KNX application programs (com objects, "
+    "parameters, memory layout) from the manufacturer product files (.knxprod) its "
+    "operator supplied. It is read-only and never talks to a KNX bus. START by reading "
+    "the resource " + SKILL_URI + ": the key to a device, the workflow and the pitfalls."
 )
 
 
@@ -3147,6 +3129,24 @@ TOOL_FUNCS = {
 # MCP (JSON-RPC 2.0, stateless Streamable HTTP, JSON responses only)
 # ---------------------------------------------------------------------------
 
+def read_skill():
+    """The text of skill/SKILL.md, None if the file is missing."""
+    try:
+        with open(SKILL_FILE, "rb") as f:
+            return f.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def skill_resource():
+    text = read_skill()
+    if text is None:
+        return None
+    return {"uri": SKILL_URI, "name": "SKILL.md", "title": "knxprod-mcp skill",
+            "description": SKILL_DESCRIPTION, "mimeType": "text/markdown",
+            "size": len(text.encode("utf-8"))}
+
+
 def _rpc_error(mid, code, message):
     return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
 
@@ -3179,7 +3179,8 @@ def handle_rpc(msg, store, notes=None):
     if method == "initialize":
         pv = params.get("protocolVersion")
         result = {"protocolVersion": pv if pv in SUPPORTED_PROTOCOLS else DEFAULT_PROTOCOL,
-                  "capabilities": {"tools": {"listChanged": False}},
+                  "capabilities": {"tools": {"listChanged": False},
+                                   "resources": {"subscribe": False, "listChanged": False}},
                   "serverInfo": {"name": SERVER_NAME, "version": VERSION},
                   "instructions": INSTRUCTIONS}
         return {"jsonrpc": "2.0", "id": mid, "result": result}
@@ -3187,6 +3188,19 @@ def handle_rpc(msg, store, notes=None):
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}}
+    if method == "resources/list":
+        res = skill_resource()
+        return {"jsonrpc": "2.0", "id": mid, "result": {"resources": [res] if res else []}}
+    if method == "resources/templates/list":
+        return {"jsonrpc": "2.0", "id": mid, "result": {"resourceTemplates": []}}
+    if method == "resources/read":
+        uri = params.get("uri")
+        text = read_skill() if uri == SKILL_URI else None
+        if text is None:
+            return {"jsonrpc": "2.0", "id": mid, "error": {
+                "code": -32002, "message": "Resource not found", "data": {"uri": uri}}}
+        return {"jsonrpc": "2.0", "id": mid, "result": {"contents": [
+            {"uri": SKILL_URI, "mimeType": "text/markdown", "text": text}]}}
     if method == "tools/call":
         name = params.get("name")
         func = TOOL_FUNCS.get(name)
@@ -4046,6 +4060,7 @@ class Handler(BaseHTTPRequestHandler):
                                  "files": len(files),
                                  "file_errors": sum(1 for r in files.values()
                                                     if r.get("status") == "error"),
+                                 "skill": os.path.isfile(SKILL_FILE),
                                  "mdns": self.server.mdns_info()})
             else:
                 self._json(404, {"error": "not_found"})
@@ -4305,6 +4320,9 @@ class Service:
         self.port = self.httpd.server_address[1]
         self.scanner = None
         self.mdns = None
+        if read_skill() is None:
+            self.log("%s warning: %s is missing, so the skill resource %s is not served"
+                     % (_utc_now(), SKILL_FILE, SKILL_URI))
 
     def initial_sync(self):
         interval = self.cfg.get("scan_interval", DEFAULT_SCAN_INTERVAL)

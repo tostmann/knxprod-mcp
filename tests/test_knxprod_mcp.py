@@ -565,14 +565,17 @@ class TestMcpDispatch(unittest.TestCase):
             self.assertEqual(res["protocolVersion"], got)
             self.assertEqual(res["serverInfo"]["name"], "knxprod-mcp")
             self.assertIn("tools", res["capabilities"])
-            for phrase in ("read-only", "private network", "SLOTS", "size_bits", "licensed"):
+            self.assertIn("resources", res["capabilities"])
+            for phrase in ("read-only", "never talks to a KNX bus",
+                           "START by reading the resource skill://knxprod-mcp/SKILL.md"):
                 self.assertIn(phrase, res["instructions"])
+            self.assertLess(len(res["instructions"]), 500)          # one short paragraph
 
     def test_notifications_and_unknown(self):
         self.assertIsNone(K.handle_rpc({"jsonrpc": "2.0", "method": "notifications/initialized"},
                                        self.store))
         self.assertEqual(self.rpc("ping")["result"], {})
-        self.assertEqual(self.rpc("resources/list")["error"]["code"], -32601)
+        self.assertEqual(self.rpc("prompts/list")["error"]["code"], -32601)
         self.assertEqual(self.rpc("tools/call", {"name": "nope"})["error"]["code"], -32602)
         self.assertEqual(K.handle_rpc({"id": 1, "method": "ping"}, self.store)["error"]["code"],
                          -32600)
@@ -952,6 +955,117 @@ class TestModules(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 4c. the skill: skill/SKILL.md served as an MCP resource
+# ---------------------------------------------------------------------------
+
+SKILL_PATH = os.path.join(REPO, "skill", "SKILL.md")
+
+
+def dockerignore_keeps(path, patterns):
+    """.dockerignore semantics, simplified: the last matching pattern decides;
+    a pattern also matches every path below a matching directory."""
+    import fnmatch
+    keep = True
+    parts = path.split("/")
+    for pat in patterns:
+        neg = pat.startswith("!")
+        pat = pat[1:] if neg else pat
+        if any(fnmatch.fnmatchcase("/".join(parts[:i]), pat) for i in range(1, len(parts) + 1)):
+            keep = neg
+    return keep
+
+
+class TestSkill(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = _read(SKILL_PATH).decode("utf-8")
+
+    def rpc(self, method, params=None):
+        msg = {"jsonrpc": "2.0", "id": 7, "method": method}
+        if params is not None:
+            msg["params"] = params
+        return K.handle_rpc(msg, None)
+
+    def test_resources_list_and_read(self):
+        r = self.rpc("resources/list")["result"]["resources"]
+        self.assertEqual(len(r), 1)
+        self.assertEqual((r[0]["uri"], r[0]["name"], r[0]["mimeType"]),
+                         ("skill://knxprod-mcp/SKILL.md", "SKILL.md", "text/markdown"))
+        self.assertEqual(r[0]["size"], len(self.text.encode("utf-8")))
+        self.assertIn("first", r[0]["description"])
+        msg = self.rpc("resources/read", {"uri": K.SKILL_URI})
+        self.assertLessEqual(len(K._dumps(msg).encode()), K.RESPONSE_BUDGET)
+        c = msg["result"]["contents"]
+        self.assertEqual(c, [{"uri": K.SKILL_URI, "mimeType": "text/markdown",
+                              "text": self.text}])
+        err = self.rpc("resources/read", {"uri": "skill://other/SKILL.md"})["error"]
+        self.assertEqual((err["code"], err["data"]), (-32002, {"uri": "skill://other/SKILL.md"}))
+        self.assertEqual(self.rpc("resources/templates/list")["result"],
+                         {"resourceTemplates": []})
+
+    def test_missing_file(self):
+        saved = K.SKILL_FILE
+        K.SKILL_FILE = os.path.join(_tmpdir(), "SKILL.md")
+        try:
+            self.assertEqual(self.rpc("resources/list")["result"]["resources"], [])
+            self.assertEqual(self.rpc("resources/read", {"uri": K.SKILL_URI})["error"]["code"],
+                             -32002)
+        finally:
+            shutil.rmtree(os.path.dirname(K.SKILL_FILE), ignore_errors=True)
+            K.SKILL_FILE = saved
+
+    def test_content(self):
+        t = self.text
+        self.assertLessEqual(len(t.encode("utf-8")), 8192)
+        for phrase in (
+                "ships no manufacturer data", "read-only", "never talks to a KNX bus",
+                "object 3, PID 13", "10 hex digits", "knx-prop-read", "prod-applications",
+                "several products", "prod-application ", "prod-comobjects", "prod-parameters",
+                "knx-mem-read", "prod-decode", "size_bits", "configured mode", "SLOT",
+                "MSB", "`union`", "`when`", "module", "byte_order_warning", "load session",
+                "dry run", "`offset`", "next_offset", "12 000 bytes", "unknown_app_id",
+                "upload", "terms"):
+            self.assertIn(phrase, t, phrase)
+        self.assertEqual(t.count("\nWhat "), 2)                         # two examples
+        tools = {x["name"] for x in K.TOOLS}
+        self.assertEqual(set(re.findall(r"\bprod-[a-z]+", t)), tools)
+        # synthetic ids only, nothing that looks like a real program or host
+        self.assertEqual(set(re.findall(r"\b[0-9A-F]{10}\b", t)), {"FFF0123456"})
+        self.assertFalse(re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", t))
+
+    def test_image_contains_the_skill(self):
+        with open(os.path.join(REPO, "Dockerfile")) as f:
+            docker = f.read()
+        self.assertIn('ENTRYPOINT ["python", "/app/knxprod_mcp.py"]', docker)
+        self.assertRegex(docker, r"(?m)^COPY skill/SKILL\.md /app/skill/$")
+        with open(os.path.join(REPO, ".dockerignore")) as f:
+            patterns = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+        self.assertTrue(dockerignore_keeps("skill/SKILL.md", patterns))
+        self.assertTrue(dockerignore_keeps("knxprod_mcp.py", patterns))
+        self.assertFalse(dockerignore_keeps("knxprod/Vendor.knxprod", patterns))
+        self.assertFalse(dockerignore_keeps("tests/fixture/knx_master.xml", patterns))
+        # the server looks for it next to itself: /app/skill/SKILL.md in the image
+        self.assertEqual(os.path.relpath(K.SKILL_FILE, os.path.dirname(K.__file__)),
+                         os.path.join("skill", "SKILL.md"))
+
+    def test_over_http(self):
+        tmp = _tmpdir()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        srv = Server(os.path.join(tmp, "knxprod"), os.path.join(tmp, "index"))
+        self.addCleanup(srv.stop)
+        status, _, body = srv.mcp({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                   "params": {"protocolVersion": "2025-06-18"}})
+        res = json.loads(body)["result"]
+        self.assertIn(K.SKILL_URI, res["instructions"])
+        status, _, body = srv.mcp({"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+                                   "params": {"uri": K.SKILL_URI}})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["result"]["contents"][0]["text"], self.text)
+        self.assertFalse([ln for ln in srv.lines if "SKILL.md is missing" in ln])
+
+
+# ---------------------------------------------------------------------------
 # 5. configuration: flags, environment, defaults
 # ---------------------------------------------------------------------------
 
@@ -1312,6 +1426,7 @@ class TestHttp(unittest.TestCase):
         self.assertEqual((h["ok"], h["apps"], h["files"], h["file_errors"]), (True, 1, 1, 0))
         self.assertEqual(h["mdns"], {"enabled": False, "name": None, "address": None,
                                      "status": "off"})
+        self.assertIs(h["skill"], True)
         self.assertTrue(any("indexed start.knxprod" in ln for ln in self.srv.lines))
 
     def test_b_host_guard(self):

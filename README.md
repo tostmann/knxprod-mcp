@@ -54,6 +54,11 @@ on the LAN via mDNS/DNS-SD, so clients can find it without a URL.
    claude mcp add --transport http knxprod http://<host>:8095/mcp
    ```
 
+   An agent learns how to use the tools from the server itself: it serves a
+   skill as the MCP resource `skill://knxprod-mcp/SKILL.md` (source:
+   [`skill/SKILL.md`](skill/SKILL.md)), and its `initialize` instructions say to
+   read that first.
+
 5. **Add more files** by copying them into the folder: the server picks them up
    within `KNXPROD_SCAN_INTERVAL` seconds. You can also upload them:
 
@@ -188,7 +193,8 @@ python3 knxprod_mcp.py health --data ./knxprod-index                       # 0 i
 
 - `POST /mcp`: MCP over Streamable HTTP. It is stateless (no session id) and
   answers with JSON only (no SSE). Protocol versions 2025-06-18, 2025-03-26 and
-  2024-11-05 are supported.
+  2024-11-05 are supported. Besides the tools it serves one resource, the skill
+  `skill://knxprod-mcp/SKILL.md`.
 - `POST /upload?name=<file>`: the raw file as request body, at most 64 MB. Zip
   archives are checked for path traversal, member count, nesting depth and
   uncompressed size.

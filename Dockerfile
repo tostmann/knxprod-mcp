@@ -24,6 +24,7 @@ RUN groupadd --system --gid 10001 knxprod \
  && chown 10001:10001 /knxprod /data
 
 COPY knxprod_mcp.py LICENSE /app/
+COPY skill/SKILL.md /app/skill/
 
 USER 10001:10001
 VOLUME ["/knxprod", "/data"]
