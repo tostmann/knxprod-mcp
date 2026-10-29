@@ -1404,6 +1404,27 @@ class TestReviewCatalogTemplate(unittest.TestCase):
         return {a: [p["order_number"] for p in load_json(os.path.join(
                     tmp, "data", "apps", a + ".json"))["products"]] for a in (APP1, APP3)}
 
+    def test_a_repeated_program_is_read_once_and_silently(self):
+        # Bundles repeat the same program XML in several nested archives; that
+        # warned "defined twice" for every copy although nothing differed.
+        app1 = _read(APP_XML)
+        tmp = _tmpdir()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for name, second, expect in (("same", app1, []),
+                                     ("diff", app1.replace(b"Test Blind/Switch 1234/5.6",
+                                                           b"Test Blind/Switch 1234/5.6b"),
+                                      ["defined twice with different content"])):
+            path = os.path.join(tmp, name + ".knxprod")
+            with open(path, "wb") as f:
+                f.write(zip_bytes(members("master", "hardware") + [
+                    ("a/M-FFF0/M-FFF0_A-1234-56-ABCD.xml", app1),
+                    ("b/M-FFF0/M-FFF0_A-1234-56-ABCD.xml", second)]))
+            s = K.ingest_file(path, os.path.join(tmp, "data-" + name))
+            got = [w for w in s["warnings"] if "defined twice" in w]
+            self.assertEqual(len(got), len(expect), (name, s["warnings"]))
+            for w, e in zip(got, expect):
+                self.assertIn(e, w)
+
     def test_products_follow_the_catalog(self):
         # Linked per hardware, both programs listed both products.
         self.assertEqual(self.ingest(True), {APP1: ["TEST-0001"], APP3: ["TEST-0002"]})

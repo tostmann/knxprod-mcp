@@ -2210,6 +2210,7 @@ def _ingest_locked(path, data_dir, source, label=None, log=None):
                 if prod not in lst:
                     lst.append(prod)
         hw["programs"].update(by_app)
+        seen_xml = set()
         for m in src.members:
             if m.kind != "app":
                 continue
@@ -2221,6 +2222,11 @@ def _ingest_locked(path, data_dir, source, label=None, log=None):
                     warnings.append("XML error, skipped %s: %s" % (m.name, e))
                     continue
                 digest = hr.finish()
+            if digest in seen_xml:
+                # The same program XML once more: manufacturer bundles repeat it
+                # in several nested archives.  Nothing new, nothing to warn about.
+                continue
+            seen_xml.add(digest)
             for raw in raws:
                 try:
                     rec = build_record(raw, langs, master, hw,
@@ -2232,8 +2238,8 @@ def _ingest_locked(path, data_dir, source, label=None, log=None):
                     continue
                 app_id = rec["app_id"]
                 if app_id in written:
-                    warnings.append("%s defined twice (%s, %s); the later one wins"
-                                    % (app_id, written[app_id]["id"], rec["id"]))
+                    warnings.append("%s defined twice with different content (%s, %s); the "
+                                    "later one wins" % (app_id, written[app_id]["id"], rec["id"]))
                 old_entry = apps.get(app_id)
                 if not rec["products"] and not kinds.get("hardware") and old_entry:
                     old = _load_json(os.path.join(p["apps"], app_id + ".json"))
