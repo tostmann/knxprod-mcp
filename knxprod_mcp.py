@@ -1279,7 +1279,19 @@ def build_record(raw, langs, master, hw, source, rows=None):
                 return txt
         return None
 
+    # The same conditions guard thousands of parameters (every one of a
+    # module instance carries its channel mode): render each once per
+    # instance.  Rendering them again and again was a third of the indexing.
+    rendered = {}
+
     def render_cond(cond, names=None):
+        key = (cond, id(names) if names is not None else None)
+        text = rendered.get(key)
+        if text is None:
+            text = rendered[key] = _render_cond(cond, names)
+        return text
+
+    def _render_cond(cond, names):
         pref, test, others = cond
         text, p = pref_text(pref, names)
         if test is not None:
