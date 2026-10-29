@@ -1024,7 +1024,8 @@ class TestModules(unittest.TestCase):
             self.assertEqual(xml.count(old), 1, old)
             xml = xml.replace(old, new)
 
-        # a module definition nested in MD-1, instantiated inside MD-1
+        # a module definition nested in MD-1, instantiated inside MD-1 (resolved
+        # since 0.6: one per instance of MD-1)
         change('<ModuleDef Id="%sMD-1" Name="ModuleDefSwitch">' % pre,
                '<ModuleDef Id="%sMD-1" Name="ModuleDefSwitch"><SubModuleDefs>'
                '<ModuleDef Id="%sMD-1_SM-1" Name="Sub"><Static><Parameters>'
@@ -1044,11 +1045,11 @@ class TestModules(unittest.TestCase):
         rec = distill_xml(xml)
         c = rec["counts"]
         self.assertEqual(c["module_unsupported"], {
-            "allocator_overflow": 1, "module_def_nested": 1, "module_in_module_def": 1,
-            "parameters_unplaced": 4, "repeat_count_unknown": 1})
-        texts = [p["text"] for p in rec["parameters"]]
-        self.assertNotIn("Nested parameter", texts)
-        self.assertEqual(c["module_instances"], 5)                   # 3 channels + 2 sensors
+            "allocator_overflow": 1, "parameters_unplaced": 4, "repeat_count_unknown": 1})
+        self.assertEqual(sorted(p["id"] for p in rec["parameters"]
+                                if p["text"] == "Nested parameter"),
+                         ["MD-1_M-1_SM-1_M-1_P-1", "MD-1_M-3_SM-1_M-1_P-1"])
+        self.assertEqual(c["module_instances"], 7)    # 3 channels + 2 sensors + 2 nested
         ids = {p["id"] for p in rec["parameters"]}
         self.assertIn("MD-1_M-3_P-1", ids)                           # needs no argument
         self.assertNotIn("MD-1_M-3_P-2", ids)
@@ -1535,6 +1536,92 @@ class TestBackgroundSync(unittest.TestCase):
         self.assertTrue(wait_for(lambda: not get("/healthz")["sync"]["indexing"]))
         self.assertEqual(app1()["app_id"], APP1)
         self.assertTrue(any("2 application program(s)" in ln for ln in lines), lines)
+
+
+def app3_with(*replacements):
+    xml = _read(APP3_XML).decode("utf-8")
+    for a, b in replacements:
+        assert xml.count(a) == 1, a
+        xml = xml.replace(a, b)
+    return xml
+
+
+def app3_nested():
+    """APP3 with three steps in every scene: a definition nested in MD-4,
+    placed by a <Repeat> with MD-4's own allocators and the scene's offset as
+    BaseValue (as manufacturers build groups inside channels)."""
+    p = PRE3
+    sub = ('<SubModuleDefs><ModuleDef Id="{p}MD-4_SM-1" Name="Step"><Arguments>'
+           '<Argument Id="{p}MD-4_SM-1_A-1" Name="StepOffs" Allocates="2" />'
+           '<Argument Id="{p}MD-4_SM-1_A-2" Name="StepNo" Allocates="1" /></Arguments>'
+           '<Static><Parameters><Parameter Id="{p}MD-4_SM-1_P-1" Name="StepValue" '
+           'Text="Step {{{{StepNo}}}} value" ParameterType="{p}PT-Byte" Value="0">'
+           '<Memory CodeSegment="{p}AS-4800" Offset="0" BitOffset="0" '
+           'BaseOffset="{p}MD-4_SM-1_A-1" /></Parameter></Parameters><ParameterRefs>'
+           '<ParameterRef Id="{p}MD-4_SM-1_P-1_R-1" RefId="{p}MD-4_SM-1_P-1" /></ParameterRefs>'
+           '</Static><Dynamic><ParameterBlock Id="{p}MD-4_SM-1_PB-1" Name="Step" '
+           'Text="Step {{{{StepNo}}}}"><ParameterRefRef RefId="{p}MD-4_SM-1_P-1_R-1" />'
+           '</ParameterBlock></Dynamic></ModuleDef></SubModuleDefs>').format(p=p)
+    alloc = ('<Allocators><Allocator Id="{p}MD-4_L-1" Name="StepParams" Start="2" '
+             'maxInclusive="8" /><Allocator Id="{p}MD-4_L-2" Name="StepNo" Start="1" '
+             'maxInclusive="4" /></Allocators>').format(p=p)
+    place = ('<Repeat Id="{p}MD-4_X-1" Name="Steps" Count="3"><Module Id="{p}MD-4_SM-1_M-1" '
+             'RefId="{p}MD-4_SM-1"><NumericArg RefId="{p}MD-4_SM-1_A-1" '
+             'AllocatorRefId="{p}MD-4_L-1" BaseValue="{p}MD-4_A-1" /><NumericArg '
+             'RefId="{p}MD-4_SM-1_A-2" AllocatorRefId="{p}MD-4_L-2" /></Module></Repeat>').format(p=p)
+    corefs = ('<ComObjectRef Id="{p}MD-4_O-1_R-1" RefId="{p}MD-4_O-1" />\n'
+              '                </ComObjectRefs>').format(p=p)
+    return app3_with(
+        (corefs, corefs + alloc),
+        ('<Dynamic>\n                <ParameterBlock Id="{p}MD-4_PB-1"'.format(p=p),
+         sub + '<Dynamic>\n                <ParameterBlock Id="{p}MD-4_PB-1"'.format(p=p)),
+        ('<ComObjectRefRef RefId="{p}MD-4_O-1_R-1" />'.format(p=p),
+         '<ComObjectRefRef RefId="{p}MD-4_O-1_R-1" />'.format(p=p) + place))
+
+
+class TestNestedModules(unittest.TestCase):
+
+    def test_steps_inside_every_scene(self):
+        # Scene offsets come from the program's allocator (80, 88); every
+        # scene counts its own steps from 2 in steps of 2 and adds its offset.
+        rec = distill_xml(app3_nested())
+        steps = sorted((p["id"], p["address"], p["text"], p["module"]["label"])
+                       for p in rec["parameters"] if "_SM-1_" in p["id"])
+        base = 18432
+        self.assertEqual(steps, [
+            ("MD-4_M-5_MI-1_SM-1_M-1_MI-1_P-1", base + 82, "Step 1 value", "Step 1"),
+            ("MD-4_M-5_MI-1_SM-1_M-1_MI-2_P-1", base + 84, "Step 2 value", "Step 2"),
+            ("MD-4_M-5_MI-1_SM-1_M-1_MI-3_P-1", base + 86, "Step 3 value", "Step 3"),
+            ("MD-4_M-5_MI-2_SM-1_M-1_MI-1_P-1", base + 90, "Step 1 value", "Step 1"),
+            ("MD-4_M-5_MI-2_SM-1_M-1_MI-2_P-1", base + 92, "Step 2 value", "Step 2"),
+            ("MD-4_M-5_MI-2_SM-1_M-1_MI-3_P-1", base + 94, "Step 3 value", "Step 3")])
+        mods = {m["id"]: m for m in rec["modules"]}
+        self.assertEqual((mods["MD-4_SM-1"]["inside"], mods["MD-4_SM-1"]["instances"]),
+                         ("MD-4", 6))
+        self.assertNotIn("module_unsupported", rec["counts"])
+        plain = distill_xml(_read(APP3_XML).decode("utf-8"))["counts"]["module_instances"]
+        self.assertEqual(rec["counts"]["module_instances"], plain + 6)
+
+    def test_a_count_parameter_before_a_shared_allocator_is_flagged(self):
+        # The sensors' repeat is counted by a parameter; a module placed after
+        # it on the same allocators lies wherever that count ends.
+        p = PRE3
+        extra = ('<Module Id="{p}MD-3_M-9" RefId="{p}MD-3"><NumericArg RefId="{p}MD-3_A-1" '
+                 'AllocatorRefId="{p}L-1" /><NumericArg RefId="{p}MD-3_A-2" AllocatorRefId="{p}L-2" />'
+                 '<NumericArg RefId="{p}MD-3_A-3" AllocatorRefId="{p}L-3" /></Module>').format(p=p)
+        rep = '<Repeat Id="{p}X-2" Name="Scenes" Count="2">'.format(p=p)
+        room = (('Name="SensorParamOffs" Start="0" maxInclusive="30"',
+                 'Name="SensorParamOffs" Start="0" maxInclusive="40"'),
+                ('Name="SensorObjNumber" Start="20" maxInclusive="26"',
+                 'Name="SensorObjNumber" Start="20" maxInclusive="28"'),
+                ('Name="SensorNo" Start="1" maxInclusive="4"',
+                 'Name="SensorNo" Start="1" maxInclusive="5"'))
+        after = distill_xml(app3_with((rep, extra + rep), *room))
+        self.assertEqual(after["counts"]["module_unsupported"].get("allocator_after_variable_repeat"), 1)
+        sensors = '<Repeat Id="{p}X-1" Name="Sensors"'.format(p=p)
+        before = distill_xml(app3_with((sensors, extra + sensors), *room))
+        self.assertNotIn("allocator_after_variable_repeat",
+                         before["counts"].get("module_unsupported", {}))
 
 
 # ---------------------------------------------------------------------------

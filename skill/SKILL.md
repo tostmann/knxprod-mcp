@@ -79,7 +79,10 @@ every tool.
   with `module` (label or id).
   Alternative modules for one channel (switch / dimmer) share memory and
   object numbers; `when` says which one the channel mode selects.
-  `prod-application` lists the module definitions.
+  `prod-application` lists the module definitions (`inside`: nested in
+  another). `counts.module_unsupported` names what is not placed;
+  `allocator_after_variable_repeat`: addresses depend on a count set on the
+  device, so read that count before trusting them.
 
 ## Conditions: `when` and `when_any`
 

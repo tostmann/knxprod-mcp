@@ -180,7 +180,10 @@ Some things to keep in mind:
   channel. Each instance is listed on its own: its parameters get their own
   addresses, its com objects their own numbers, and `module` names the instance
   (for example `Channel B`). Repetitions (`Repeat`, allocators) are expanded the
-  same way. What cannot be resolved is counted in `counts.module_unsupported`.
+  same way, and so are modules placed inside module definitions (scene groups
+  inside a channel, for example). What cannot be resolved is counted in
+  `counts.module_unsupported`; `allocator_after_variable_repeat` means that
+  where an instance lies depends on a count configured on the device.
 - Programs that keep their parameters in a relative segment have offsets but no
   absolute addresses. Pass `segment` to `prod-parameters` and `prod-decode` and
   give the offset within that segment as `address`.

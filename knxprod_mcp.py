@@ -47,7 +47,11 @@ Parser traps this code is built around:
    with BaseOffset and a <ComObject> with BaseNumber are placed by the value
    each <Module> instance passes for that argument (NumericArg Value, or the
    next value of an Allocator for each repetition of a <Repeat>).  Every
-   instance is distilled into records of its own.
+   instance is distilled into records of its own.  A definition can place
+   modules of its own (SubModuleDefs): their arguments add the value of an
+   argument of the enclosing instance (BaseValue) to a literal or to the next
+   value of an allocator, and an allocator declared inside a definition
+   counts from its start again in every instance of it.
 """
 
 import argparse
@@ -116,6 +120,7 @@ MAX_CONDS = 12                     # ETS conditions kept per place, outermost fi
 MAX_ALTS = 8                       # distinct condition sets (UI places) kept per object/parameter
 BYTE_ORDER_MIN_EVIDENCE = 3        # template defaults needed before a byte-order warning
 MAX_REPEAT = 256                   # module instances expanded per <Repeat>
+MAX_MODULE_DEPTH = 4               # modules placed inside module definitions, levels
 
 SLOT_NOTE = ("Names label slots of the application program, not what an "
              "installation uses them for; the channel mode decides.")
@@ -437,11 +442,13 @@ def _collect_translation(langs, lang, el):
 
 class _RawApp:
     """Everything of one <ApplicationProgram>, still with full XML ids.  Each
-    <ModuleDef> gets an instance of its own for the records it defines."""
+    <ModuleDef>, nested ones too, gets an instance of its own for the records
+    it defines."""
 
-    def __init__(self, attrs):
+    def __init__(self, attrs, parent=None):
         self.attrs = attrs
         self.full_id = attrs.get("Id", "")
+        self.parent = parent            # a nested ModuleDef: the full id of the enclosing one
         self.segments = {}
         self.seg_data = {}
         self.types = {}
@@ -455,7 +462,7 @@ class _RawApp:
         self.dynamic = {"co": {}, "pr": {}, "modules": [], "first_block": None}
         self.module_defs = {}           # ModuleDef Id -> _RawApp with its records
         self.args = {}                  # in a ModuleDef: Argument Id -> declaration
-        self.allocators = {}            # Allocator Id -> {name, start, max}
+        self.allocators = {}            # Allocator Id -> {name, start, max}, declared here
         self.unsupported = collections.Counter()
 
     # -- Static/Code
@@ -682,13 +689,13 @@ def _when_fields(alts):
     return o
 
 
-def walk_dynamic(dyn, in_module=False):
+def walk_dynamic(dyn):
     """Record, per ComObjectRef/ParameterRef id, how often the ETS UI shows it,
     every distinct set of innermost conditions (choose/when) it is shown under
-    and the block of its first occurrence; and every <Module> instance with its
-    arguments, conditions
-    and enclosing <Repeat>.  Iterative: the nesting can be deep.  Modules
-    inside a module definition and repeats inside repeats are only counted."""
+    and the block of its first occurrence; and every <Module> placed here with
+    its arguments, conditions and enclosing <Repeat> -- in the program and in
+    a module definition alike.  Iterative: the nesting can be deep.  Repeats
+    inside repeats are only counted."""
     co, pr, modules = {}, {}, []
     unsupported = collections.Counter()
     first_block = None
@@ -725,8 +732,6 @@ def walk_dynamic(dyn, in_module=False):
             _note_ref(co, c.get("RefId"), conds, block)
         elif k == "ParameterRefRef":
             _note_ref(pr, c.get("RefId"), conds, block)
-        elif k in ("Module", "Repeat") and in_module:
-            unsupported["%s_in_module_def" % k.lower()] += 1
         elif k == "Repeat" and repeat is not None:
             unsupported["repeat_in_repeat"] += 1
         elif k == "Module":
@@ -735,7 +740,8 @@ def walk_dynamic(dyn, in_module=False):
                 ak = _local(a.tag)
                 if ak == "NumericArg":
                     args[a.get("RefId")] = {"value": a.get("Value"),
-                                            "allocator": a.get("AllocatorRefId")}
+                                            "allocator": a.get("AllocatorRefId"),
+                                            "base": a.get("BaseValue")}
                 elif ak == "TextArg":
                     args[a.get("RefId")] = {"value": a.get("Value"), "text_id": a.get("Id")}
             modules.append({"id": c.get("Id"), "ref": c.get("RefId"), "name": c.get("Name"),
@@ -770,13 +776,13 @@ def parse_application_xml(stream):
     <Parameter> children of a <Union> are deliberately NOT handled at their
     own end events: clearing them there would wipe Offset/BitOffset before
     the union is processed (trap 4).  Records inside a <ModuleDef> go to that
-    definition; a definition nested inside another one is only counted."""
+    definition, a nested definition's to the nested one."""
     apps = []
     langs = {}
     cur = None
     lang = None
     tags = []
-    defs = []                       # open <ModuleDef>s: _RawApp, None when nested
+    defs = []                       # open <ModuleDef>s, innermost last
     for event, el in ET.iterparse(stream, events=("start", "end")):
         tag = _local(el.tag)
         if event == "start":
@@ -785,13 +791,9 @@ def parse_application_xml(stream):
                 cur = _RawApp(dict(el.attrib))
                 defs = []
             elif cur is not None and tag == "ModuleDef":
-                if defs:
-                    defs.append(None)
-                    cur.unsupported["module_def_nested"] += 1
-                else:
-                    md = _RawApp(dict(el.attrib))
-                    cur.module_defs[md.full_id] = md
-                    defs.append(md)
+                md = _RawApp(dict(el.attrib), parent=defs[-1].full_id if defs else None)
+                cur.module_defs[md.full_id] = md
+                defs.append(md)
             elif cur is not None and not defs and tag in (
                     "ComObjectTable", "AddressTable", "AssociationTable"):
                 cur.tables[tag] = dict(el.attrib)
@@ -815,8 +817,6 @@ def parse_application_xml(stream):
             el.clear()
             continue
         target = defs[-1] if defs else cur
-        if target is None:                  # inside a nested definition
-            continue
         if tag == "AbsoluteSegment" and parent == "Code":
             cur.add_abs_segment(el)
             el.clear()
@@ -845,13 +845,13 @@ def parse_application_xml(stream):
             target.add_argument(el)
             el.clear()
         elif tag == "Allocator" and parent == "Allocators":
-            cur.add_allocator(el)
+            target.add_allocator(el)
             el.clear()
         elif tag == "LoadProcedure" and parent == "LoadProcedures":
             cur.add_load_procedure(el)
             el.clear()
         elif tag == "Dynamic" and parent in ("ApplicationProgram", "ModuleDef"):
-            dyn = walk_dynamic(el, in_module=target is not cur)
+            dyn = walk_dynamic(el)
             cur.unsupported.update(dyn.pop("unsupported"))
             target.dynamic = dyn
             el.clear()
@@ -1361,83 +1361,124 @@ def build_record(raw, langs, master, hw, source, rows=None):
             return max(vals) if vals else None
         return None
 
-    instances = []
-    inst_per_def = collections.Counter()
-    alloc_next = {lid: al.get("start") for lid, al in raw.allocators.items()}
-    alloc_users = collections.Counter(
-        g["allocator"] for mod in raw.dynamic.get("modules", [])
-        for g in mod["args"].values() if g.get("allocator"))
-    for mod in raw.dynamic.get("modules", []):
-        md = defs.get(mod["ref"])
-        if md is None:
-            unsupported["module_def_missing"] += 1
-            continue
-        outer = [render_cond(c) for c in mod["conds"]]     # every condition placing it
-        rep = mod.get("repeat")
-        count, count_pref = 1, None
-        if rep is not None:
-            if rep.get("count") is not None:
-                count = rep["count"]
-            elif rep.get("pref"):
-                count, count_pref = repeat_max(rep["pref"]), rep["pref"]
-            else:
-                count = None
-            if count is None or count < 0:
-                unsupported["repeat_count_unknown"] += 1
-                continue
-            if count > MAX_REPEAT:
-                unsupported["repeat_instances_capped"] += count - MAX_REPEAT
-                count = MAX_REPEAT
-        group = []
-        for i in range(1, count + 1):
-            values, names, ok = {}, {}, True
-            for arg_id, decl in md.args.items():
-                given = mod["args"].get(arg_id)
-                if given is None:
-                    continue
-                if given.get("allocator"):
-                    lid = given["allocator"]
-                    al = raw.allocators.get(lid)
-                    step = decl.get("allocates")
-                    if al is None or alloc_next.get(lid) is None or not step:
-                        unsupported["allocator_unresolved"] += 1
-                        continue
-                    v = alloc_next[lid]
-                    alloc_next[lid] = v + step
-                    if al.get("max") is not None and v + step > al["max"]:
-                        ok = False
-                    if alloc_users[lid] > 1:
-                        unsupported["allocator_shared"] += 1
-                    values[arg_id] = v
-                    names[decl["name"]] = (str(v), None)
-                elif given.get("text_id") is not None or decl.get("text"):
-                    t_en, t_de = T.get(given.get("text_id"), "Value", given.get("value"))
-                    values[arg_id] = t_en
-                    names[decl["name"]] = (t_en, t_de)
-                else:
-                    values[arg_id] = _int(given.get("value"))
-                    names[decl["name"]] = (_norm(given.get("value")) or "", None)
-            if not ok:
-                unsupported["allocator_overflow"] += 1
-                continue
-            iid = short(mod["id"]) + ("_MI-%d" % i if rep is not None else "")
-            o_outer = list(outer)
-            if count_pref:
-                o_outer.append("%s >= %d" % (pref_text(count_pref)[0], i))
-            label = block_label(md.dynamic.get("first_block"), names)
-            label = label or _norm(mod.get("name")) or "%s %d" % (
-                md.attrs.get("Name") or short(md.full_id), i)
-            group.append({"id": iid, "md": md, "values": values, "names": names,
-                          "outer": o_outer, "label": label, "index": i})
-        if rep is not None and len({g["label"] for g in group}) < len(group):
-            for g in group:
-                g["label"] = "%s #%d" % (g["label"], g["index"])
-        instances.extend(group)
-        inst_per_def[mod["ref"]] += len(group)
-
     def local_id(x, md):
         p = md.full_id + "_"
         return x[len(p):] if x.startswith(p) else short(x)
+
+    instances = []
+    inst_per_def = collections.Counter()
+    allocators = dict(raw.allocators)
+    for md in defs.values():
+        allocators.update(md.allocators)
+
+    def counters_for(decls):
+        # one counter per allocator: [next value, a repeat counted by a
+        # parameter took from it -- later values depend on the configuration]
+        return {lid: [al.get("start"), False] for lid, al in decls.items()}
+
+    def expand(placements, parent, counters, depth):
+        """Instances of the modules `placements` puts (the program's, or those
+        of the definition of `parent`), each repetition of a <Repeat> one, in
+        document order; then, inside each, the modules of its definition."""
+        pnames = parent["names"] if parent else None
+        for mod in placements:
+            md = defs.get(mod["ref"])
+            if md is None:
+                unsupported["module_def_missing"] += 1
+                continue
+            # every condition placing it, the enclosing instance's first
+            outer = (list(parent["outer"]) if parent else []) + [
+                render_cond(c, pnames) for c in mod["conds"]]
+            rep = mod.get("repeat")
+            count, count_pref = 1, None
+            if rep is not None:
+                if rep.get("count") is not None:
+                    count = rep["count"]
+                elif rep.get("pref"):
+                    count, count_pref = repeat_max(rep["pref"]), rep["pref"]
+                else:
+                    count = None
+                if count is None or count < 0:
+                    unsupported["repeat_count_unknown"] += 1
+                    continue
+                if count > MAX_REPEAT:
+                    unsupported["repeat_instances_capped"] += count - MAX_REPEAT
+                    count = MAX_REPEAT
+            used = [g["allocator"] for g in mod["args"].values() if g.get("allocator")]
+            shifted = any(counters.get(lid, [None, False])[1] for lid in used)
+            group = []
+            for i in range(1, count + 1):
+                values, names, ok = {}, {}, True
+                for arg_id, decl in md.args.items():
+                    given = mod["args"].get(arg_id)
+                    if given is None:
+                        continue
+                    base = 0
+                    if given.get("base"):
+                        base = parent["values"].get(given["base"]) if parent else None
+                        if not isinstance(base, int):
+                            unsupported["argument_base_unresolved"] += 1
+                            continue
+                    if given.get("allocator"):
+                        lid = given["allocator"]
+                        al, cell = allocators.get(lid), counters.get(lid)
+                        step = decl.get("allocates")
+                        if al is None or cell is None or cell[0] is None or not step:
+                            unsupported["allocator_unresolved"] += 1
+                            continue
+                        v = cell[0]
+                        cell[0] = v + step
+                        if al.get("max") is not None and v + step > al["max"]:
+                            ok = False
+                        values[arg_id] = v + base
+                        names[decl["name"]] = (str(v + base), None)
+                    elif given.get("text_id") is not None or decl.get("text"):
+                        t_en, t_de = T.get(given.get("text_id"), "Value", given.get("value"))
+                        values[arg_id] = t_en
+                        names[decl["name"]] = (t_en, t_de)
+                    else:
+                        lit = _int(given.get("value"))
+                        v = lit + base if lit is not None else (base if given.get("base") else None)
+                        values[arg_id] = v
+                        names[decl["name"]] = (str(v) if given.get("base") else
+                                               _norm(given.get("value")) or "", None)
+                if not ok:
+                    unsupported["allocator_overflow"] += 1
+                    continue
+                if shifted:
+                    # an earlier repeat counted by a parameter took from the same
+                    # allocator: where this instance lies depends on that count
+                    unsupported["allocator_after_variable_repeat"] += 1
+                iid = ((parent["id"] + "_" + local_id(mod["id"], parent["md"])) if parent
+                       else short(mod["id"])) + ("_MI-%d" % i if rep is not None else "")
+                o_outer = list(outer)
+                if count_pref:
+                    o_outer.append("%s >= %d" % (pref_text(count_pref, pnames)[0], i))
+                label = block_label(md.dynamic.get("first_block"), names)
+                label = label or _norm(mod.get("name")) or "%s %d" % (
+                    md.attrs.get("Name") or short(md.full_id), i)
+                group.append({"id": iid, "md": md, "values": values, "names": names,
+                              "outer": o_outer, "label": label, "index": i})
+            if count_pref:
+                for lid in used:
+                    if lid in counters:
+                        counters[lid][1] = True
+            if rep is not None and len({g["label"] for g in group}) < len(group):
+                for g in group:
+                    g["label"] = "%s #%d" % (g["label"], g["index"])
+            for inst in group:
+                instances.append(inst)
+                inst_per_def[mod["ref"]] += 1
+                inner = md.dynamic.get("modules", [])
+                if not inner:
+                    continue
+                if depth >= MAX_MODULE_DEPTH:
+                    unsupported["module_depth_capped"] += 1
+                    continue
+                # the definition's own allocators count afresh in every instance
+                expand(inner, inst, dict(counters, **counters_for(md.allocators)), depth + 1)
+
+    expand(raw.dynamic.get("modules", []), None, counters_for(raw.allocators), 1)
 
     # -- parameters
     blank_tpl = {sid: not d or max(collections.Counter(d).values()) >= 0.95 * len(d)
@@ -1798,12 +1839,16 @@ def build_record(raw, langs, master, hw, source, rows=None):
     }
     if defs:
         # arguments: name -> step an allocator advances by (null if none), "text"
-        rec["modules"] = [{"id": short(did), "name": md.attrs.get("Name"),
-                           "arguments": {d["name"]: "text" if d["text"] else d["allocates"]
-                                         for d in md.args.values()},
-                           "parameters": len(md.params), "comobjects": len(md.comobjects),
-                           "instances": inst_per_def[did]}
-                          for did, md in defs.items()]
+        rec["modules"] = []
+        for did, md in defs.items():
+            m = {"id": short(did), "name": md.attrs.get("Name"),
+                 "arguments": {d["name"]: "text" if d["text"] else d["allocates"]
+                               for d in md.args.values()},
+                 "parameters": len(md.params), "comobjects": len(md.comobjects),
+                 "instances": inst_per_def[did]}
+            if md.parent:
+                m["inside"] = short(md.parent)
+            rec["modules"].append(m)
     if name_de:
         rec["name_de"] = name_de
     if orig:
