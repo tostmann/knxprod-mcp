@@ -852,6 +852,10 @@ class TestModules(unittest.TestCase):
         # {{0}} = the text parameter (empty by default), {{0:default}}
         v = c["MD-1_M-3_O-1"]["variants"][0]
         self.assertEqual((v["text"], v["text_de"]), ("Channel Right", "Kanal Rechts"))
+        # every ref brings its own text: the template's "Switch" is never shown
+        self.assertEqual((c["MD-1_M-3_O-1"]["text"], c["MD-1_M-3_O-1"]["text_de"]),
+                         ("Channel Right", "Kanal Rechts"))
+        self.assertEqual(c["MD-1_M-1_O-1"]["text"], "Channel Left")
         self.assertEqual(c["MD-1_M-1_O-2"]["variants"][0]["text"], "Channel Left status")
         # {{0}} outside modules: the object takes its variant's resolved text
         self.assertEqual((c["O-0"]["text"], c["O-0"]["variants"][0]["text"]),

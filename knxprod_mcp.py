@@ -77,8 +77,8 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.4.1"
-SCHEMA_VERSION = 4                 # distilled record format; another value rebuilds the index
+VERSION = "0.4.2"
+SCHEMA_VERSION = 5                 # distilled record format; another value rebuilds the index
 SERVER_NAME = "knxprod-mcp"
 
 DEFAULT_DATA = "/data"
@@ -1509,14 +1509,22 @@ def build_record(raw, langs, master, hw, source):
                 v["dpt"] = fmt_dpt(dpt)
             v.update(context(dyn_co.get(r["id"]), inst))
             variants.append(v)
-        if text and "{{" in text:
-            # The object's own text only names a placeholder ({{0}} without a
-            # text parameter): show what its variants resolve to.
+        refs = corefs.get(cid, [])
+        if text and ("{{" in text or (refs and all(r.get("text") for r in refs))):
+            # Show what the variants resolve to when the object's own text only
+            # names a placeholder ({{0}} without a text parameter), or when
+            # every ref brings its own text, so ETS never shows the object's:
+            # a module template says "Channel A" for the object of every channel.
             best = collections.Counter(v["text"] for v in variants
                                        if v.get("text") and "{{" not in v["text"]).most_common(1)
             if best:
                 o["text"] = best[0][0]
-                o.pop("text_de", None)
+                de = next((v["text_de"] for v in variants
+                           if v.get("text") == o["text"] and v.get("text_de")), None)
+                if de:
+                    o["text_de"] = de
+                else:
+                    o.pop("text_de", None)
         o["variants"] = variants
         counts["comobject_refs"] += len(variants)
         return o
