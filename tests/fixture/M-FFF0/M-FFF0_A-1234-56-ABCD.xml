@@ -10,7 +10,8 @@
     4. union members must keep their attributes until the union is processed
     5. one parameter shown in several places of the UI (two refs of P-4 under
        two scene settings, ref P-6_R-7 and ComObjectRef O-0_R-4 in both
-       channel modes): every place counts, not only the first
+       channel modes): every place counts, not only the first; a hidden
+       ref (Access None: P-6_R-14, P-5_R-15) shows nothing
 -->
 <KNX xmlns="http://knx.org/xml/project/20" CreatedBy="knxprod-mcp-tests" ToolVersion="0">
   <ManufacturerData>
@@ -95,7 +96,9 @@
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-4_R-5" RefId="M-FFF0_A-1234-56-ABCD_P-4" />
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-4_R-13" RefId="M-FFF0_A-1234-56-ABCD_P-4" />
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-5_R-6" RefId="M-FFF0_A-1234-56-ABCD_P-5" />
+              <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-5_R-15" RefId="M-FFF0_A-1234-56-ABCD_P-5" Access="None" />
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-6_R-7" RefId="M-FFF0_A-1234-56-ABCD_P-6" />
+              <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-6_R-14" RefId="M-FFF0_A-1234-56-ABCD_P-6" Access="None" />
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-7_R-8" RefId="M-FFF0_A-1234-56-ABCD_P-7" />
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_UP-10_R-10" RefId="M-FFF0_A-1234-56-ABCD_UP-10" />
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_UP-11_R-11" RefId="M-FFF0_A-1234-56-ABCD_UP-11" />
@@ -156,9 +159,12 @@
                     <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_UP-11_R-11" />
                     <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_UP-12_R-12" />
                     <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_P-6_R-7" />
+                    <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_P-5_R-15" />
                     <ComObjectRefRef RefId="M-FFF0_A-1234-56-ABCD_O-0_R-4" />
                   </when>
-                  <when default="true" />
+                  <when default="true">
+                    <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_P-6_R-14" />
+                  </when>
                 </choose>
                 <ComObjectRefRef RefId="M-FFF0_A-1234-56-ABCD_O-0_R-1" />
                 <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_P-2_R-3" />

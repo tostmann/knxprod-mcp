@@ -73,7 +73,8 @@ every tool.
 `when` lists ETS conditions that must all hold for a variant or parameter to
 apply, usually the channel mode. `when_any` appears when ETS shows the item in
 several places: besides `when`, ONE of its condition sets must hold. Neither
-field: ETS shows it unconditionally. Check conditions against values decoded
+field: ETS shows it unconditionally. Only places ETS shows count; with
+`ui: false` ETS never shows the item, and a `when` says where it sits. Check conditions against values decoded
 from the device, not against defaults.
 
 ## Byte order

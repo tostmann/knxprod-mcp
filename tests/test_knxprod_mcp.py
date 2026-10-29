@@ -444,11 +444,14 @@ class TestDistill(unittest.TestCase):
                                           ["Scene 1 active = 1 (enabled)"]])
         self.assertNotIn("ui", p4)
         self.assertEqual(p4["seen"], 2)
-        p6 = by_id(ps, "P-6")                       # one ref, shown in both modes
-        self.assertNotIn("when", p6)
+        p6 = by_id(ps, "P-6")                       # one ref, shown in both modes;
+        self.assertNotIn("when", p6)                # a hidden one under "other" adds nothing
         self.assertEqual(p6["when_any"], [["Channel 1 operating mode = 1 (Blind)"],
                                           ["Channel 1 operating mode = 2 (Switch)"]])
         self.assertEqual(p6["seen"], 2)
+        p5 = by_id(ps, "P-5")                       # only a hidden ref: never shown
+        self.assertEqual((p5["ui"], p5["when"]), (False, ["Channel 1 operating mode = 2 (Switch)"]))
+        self.assertNotIn("seen", p5)
         o0 = {v["ref"]: v for v in [c for c in self.rec["comobjects"]
                                     if c["number"] == 0][0]["variants"]}
         self.assertNotIn("when", o0["R-1"])

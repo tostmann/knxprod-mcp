@@ -148,7 +148,8 @@ Some things to keep in mind:
 - `when` lists the ETS conditions under which a variant or parameter applies,
   usually the channel mode. When ETS shows an item in several places, `when`
   keeps what all of them share and `when_any` lists the alternatives, one of
-  which must hold as well.
+  which must hold as well. Places where it is hidden (`Access="None"`) do not
+  count; an item ETS never shows gets `ui: false`.
 - Multi-byte parameter values follow the byte order the program declares. The
   indexer compares that declaration with the defaults in the manufacturer's
   memory template and adds a `byte_order_warning` when they disagree.

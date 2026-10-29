@@ -78,7 +78,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 VERSION = "0.4.2"
-SCHEMA_VERSION = 5                 # distilled record format; another value rebuilds the index
+SCHEMA_VERSION = 6                 # distilled record format; another value rebuilds the index
 SERVER_NAME = "knxprod-mcp"
 
 DEFAULT_DATA = "/data"
@@ -1392,7 +1392,7 @@ def build_record(raw, langs, master, hw, source):
             o["union"] = p["union"]
             counts["parameters_union"] += 1
         variants = []
-        shown = []
+        shown, hidden = [], []
         dyn_pr = (inst["md"].dynamic if inst else raw.dynamic)["pr"]
         for r in refs_by_param.get(pid, []):
             counts["parameter_refs"] += 1
@@ -1410,15 +1410,25 @@ def build_record(raw, langs, master, hw, source):
                 variants.append(v)
             e = dyn_pr.get(r["id"])
             if e:
-                shown.append(e)
+                # A ref with Access None sits in the ETS tree but is never shown.
+                (hidden if (r.get("access") or access) == "None" else shown).append(e)
         if variants:
             o["variants"] = variants[:8]
             if len(variants) > 8:
                 o["variants_total"] = len(variants)
-        # Every reference counts: a parameter the UI shows through one ref in
-        # blind mode and through another in roller-shutter mode applies in both,
-        # and taking the first ref's conditions alone said otherwise.
-        o.update(context(_merge_entries(shown), inst))
+        # Every visible reference counts: a parameter the UI shows through one
+        # ref in blind mode and through another in roller-shutter mode applies
+        # in both, and taking the first ref's conditions alone said otherwise.
+        # Hidden refs say nothing about when ETS shows it — counting them made
+        # a status parameter look visible with status signals switched off.
+        # Shown nowhere: ui false, and `when` tells where it sits in the tree.
+        if shown:
+            o.update(context(_merge_entries(shown), inst))
+        else:
+            ctx = context(_merge_entries(hidden), inst)
+            ctx.pop("seen", None)
+            ctx["ui"] = False
+            o.update(ctx)
         # Self-check of the layout conventions against the manufacturer's
         # segment template, which usually (not always) carries the defaults.
         # Only cases where the alternatives give DIFFERENT values count as
