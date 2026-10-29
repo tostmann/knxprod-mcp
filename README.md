@@ -183,7 +183,9 @@ Some things to keep in mind:
   same way, and so are modules placed inside module definitions (scene groups
   inside a channel, for example). What cannot be resolved is counted in
   `counts.module_unsupported`; `allocator_after_variable_repeat` means that
-  where an instance lies depends on a count configured on the device.
+  where an instance lies depends on a repetition count set in ETS, which the
+  device usually does not keep: such instances are laid out with every count
+  at its maximum.
 - Programs that keep their parameters in a relative segment have offsets but no
   absolute addresses. Pass `segment` to `prod-parameters` and `prod-decode` and
   give the offset within that segment as `address`.
