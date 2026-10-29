@@ -577,6 +577,16 @@ class TestZipSafety(unittest.TestCase):
         self.assertIn("expands more than %d:1" % K.ZIP_MAX_RATIO, str(cm.exception))
         self.assertEqual(len(self._open(make_knxprod(self.tmp))), 4)   # real XML passes
 
+    def test_macos_shadow_files_are_skipped_silently(self):
+        # AppleDouble files share the real file's name but hold no product data
+        path = self._zip("mac.zip", [("M-FFF0/knx_master.xml", b"<KNX/>"),
+                                     ("__MACOSX/M-FFF0/._knx_master.xml", b"\x00\x05\x16\x07"),
+                                     ("__MACOSX/._inner.zip", b"\x00\x05\x16\x07"),
+                                     ("._Vendor.knxprod", b"\x00\x05\x16\x07")])
+        with K.SourceSet(path, os.path.join(self.tmp, "t")) as src:
+            self.assertEqual([m.name for m in src.members], ["mac.zip!M-FFF0/knx_master.xml"])
+            self.assertEqual(src.warnings, [])
+
     def test_member_count_cap(self):
         path = self._zip("many.zip", [("f%d.txt" % i, b"x") for i in range(10)])
         with self.assertRaises(K.IngestError):
@@ -1324,6 +1334,53 @@ CATALOG = """<?xml version="1.0" encoding="utf-8"?>
 <CatalogItem Id="M-FFF0_CI-2" Name="4-gang" Number="2" DefaultLanguage="en-US"
   ProductRefId="M-FFF0_H-TEST-1_P-TEST.2D0002" Hardware2ProgramRefId="M-FFF0_H-TEST-1_HP-0C0D-21-5A5A" />
 </CatalogSection></Catalog></Manufacturer></ManufacturerData></KNX>"""
+
+
+def byte_order_case(declared, be, le):
+    """APP1 declaring `declared`, plus `be` / `le` 16-bit parameters whose
+    template bytes hold their default big- / little-endian (offsets 30..45)."""
+    xml = _read(APP_XML).decode("utf-8")
+    m = re.search(r'(<AbsoluteSegment Id="%sAS-4A00"[^>]*>\s*<Data>)([^<]*)(</Data>)' % PRE1, xml)
+    data = bytearray(base64.b64decode(m.group(2)))
+    params, refs = "", ""
+    for i, little in enumerate([False] * be + [True] * le):
+        off, v, n = 30 + 2 * i, 0x0102 + i, 40 + i      # 01 02 reversed differs
+        data[off:off + 2] = v.to_bytes(2, "little" if little else "big")
+        params += ('<Parameter Id="{p}P-{n}" Name="W{n}" Text="Word {n}" ParameterType="{p}PT-Word" '
+                   'Access="ReadWrite" Value="{v}"><Memory CodeSegment="{p}AS-4A00" BitOffset="0" '
+                   'Offset="{off}" /></Parameter>').format(p=PRE1, n=n, v=v, off=off)
+        refs += '<ParameterRef Id="{p}P-{n}_R-{n}" RefId="{p}P-{n}" />'.format(p=PRE1, n=n)
+    xml = xml[:m.start(2)] + base64.b64encode(bytes(data)).decode() + xml[m.end(2):]
+    xml = xml.replace('<Options ParameterByteOrder="BigEndian" />',
+                      '<Options ParameterByteOrder="%s" />' % declared)
+    xml = xml.replace('<Union SizeInBit="16">', params + '<Union SizeInBit="16">', 1)
+    xml = xml.replace("</ParameterRefs>", refs + "</ParameterRefs>")
+    return distill_xml(xml)["byte_order"]
+
+
+class TestByteOrderEvidence(unittest.TestCase):
+    """A byte-order warning needs evidence: one coincidental default warned
+    programs whose template agreed with their declaration 165 times of 167."""
+
+    def test_one_contrary_default_is_no_evidence(self):
+        bo = byte_order_case("LittleEndian", 0, 0)     # the fixture's one big-endian word
+        self.assertEqual(bo["template_evidence"], {"big": 1, "little": 0})
+        self.assertNotIn("warning", bo)
+
+    def test_clear_contrary_evidence_warns(self):
+        bo = byte_order_case("LittleEndian", 2, 0)
+        self.assertEqual(bo["template_evidence"], {"big": 3, "little": 0})
+        self.assertIn("read as big-endian", bo["warning"])
+        bo = byte_order_case("BigEndian", 0, 4)
+        self.assertEqual(bo["template_evidence"], {"big": 1, "little": 4})
+        self.assertIn("read as little-endian", bo["warning"])
+
+    def test_a_mixed_template_says_so(self):
+        bo = byte_order_case("BigEndian", 2, 4)
+        self.assertEqual(bo["template_evidence"], {"big": 3, "little": 4})
+        self.assertIn("mixes byte orders (3 multi-byte defaults read big-endian, 4 little-endian)",
+                      bo["warning"])
+        self.assertNotIn("warning", byte_order_case("BigEndian", 3, 4))   # 4 : 4
 
 
 class TestReviewCatalogTemplate(unittest.TestCase):

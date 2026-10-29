@@ -78,7 +78,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 VERSION = "0.5.1"
-SCHEMA_VERSION = 8                 # distilled record format; another value rebuilds the index
+SCHEMA_VERSION = 9                 # distilled record format; another value rebuilds the index
 SERVER_NAME = "knxprod-mcp"
 
 DEFAULT_DATA = "/data"
@@ -110,6 +110,7 @@ ZIP_MAX_DEPTH = 3
 CACHE_BYTES = 24 << 20             # app JSON kept in memory, counted by file size
 MAX_CONDS = 12                     # ETS conditions kept per place, outermost first (when_more beyond)
 MAX_ALTS = 8                       # distinct condition sets (UI places) kept per object/parameter
+BYTE_ORDER_MIN_EVIDENCE = 3        # template defaults needed before a byte-order warning
 MAX_REPEAT = 256                   # module instances expanded per <Repeat>
 
 SLOT_NOTE = ("Names label slots of the application program, not what an "
@@ -1742,12 +1743,22 @@ def build_record(raw, langs, master, hw, source):
                   "template_evidence": {"big": evidence["big"], "little": evidence["little"]},
                   "bit_order_evidence": {"msb_first": evidence["msb_first"],
                                          "lsb_first": evidence["lsb_first"]}}
+    # Warn on evidence, not on one coincidence: a single default that happens
+    # to match the reversed bytes warned programs whose template agrees with
+    # their declared order 165 times out of 167.
     other = "little" if order == "big" else "big"
-    if evidence[other] > evidence[order]:
+    contra, pro = evidence[other], evidence[order]
+    if contra >= BYTE_ORDER_MIN_EVIDENCE and contra > 2 * pro:
         byte_order["warning"] = (
             "multi-byte defaults in this program's segment template read as %s-endian, "
             "although it declares %s; check multi-byte values on a device before "
             "writing them" % (other, declared_order or "nothing"))
+    elif contra >= BYTE_ORDER_MIN_EVIDENCE and pro >= BYTE_ORDER_MIN_EVIDENCE and contra > pro:
+        byte_order["warning"] = (
+            "this program's segment template mixes byte orders (%d multi-byte defaults read "
+            "big-endian, %d little-endian), it declares %s; check multi-byte values on a "
+            "device before writing them" % (evidence["big"], evidence["little"],
+                                            declared_order or "nothing"))
 
     rec = {
         "schema": SCHEMA_VERSION, "app_id": app_id, "aliases": aliases, "id": full_id,
@@ -1793,7 +1804,13 @@ _APP_FILE_RE = re.compile(r"^m-[0-9a-f]{4}_a-[0-9a-f]{4}-[0-9a-f]{2}-.*\.xml$")
 
 
 def classify_member(name):
-    base = name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    path = name.replace("\\", "/")
+    base = path.rsplit("/", 1)[-1].lower()
+    # macOS copies carry AppleDouble shadows (`._name`, under `__MACOSX/`) that
+    # share the name of the real file but hold no product data; one
+    # manufacturer bundle produced 80 "not a zip" warnings from them.
+    if base.startswith("._") or "__MACOSX/" in path:
+        return None
     if base == "knx_master.xml":
         return "master"
     if base == "hardware.xml":
