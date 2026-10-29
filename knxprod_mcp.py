@@ -85,7 +85,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 SCHEMA_VERSION = 10                # index database format; another value rebuilds the index
 DB_NAME = "index.sqlite"
 SERVER_NAME = "knxprod-mcp"
