@@ -183,7 +183,16 @@ Some things to keep in mind:
   same way, and so are modules placed inside module definitions (scene groups
   inside a channel, for example). What cannot be resolved is counted in
   `counts.module_unsupported`; `allocator_after_variable_repeat` means that
-  where an instance lies depends on a count configured on the device.
+  where an instance lies depends on a repetition count set in ETS.
+  `prod-application` names those count parameters in `layout_counts`; `stored`
+  says whether the device holds the value (usually it does not: the count is
+  an ETS-only setting). Take them from the ETS project or ask the installer,
+  and pass them as `counts` (`{"P-1": 2}`) to
+  `prod-parameters`, `prod-comobjects` and `prod-decode`: the program is then
+  laid out again from its product file for exactly these counts (the last four
+  layouts are kept), and `layout.counts_used` in the reply says which counts
+  were applied. Ids no repetition is counted by are listed in
+  `layout.counts_unknown`.
 - Programs that keep their parameters in a relative segment have offsets but no
   absolute addresses. Pass `segment` to `prod-parameters` and `prod-decode` and
   give the offset within that segment as `address`.

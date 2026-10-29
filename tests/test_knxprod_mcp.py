@@ -43,6 +43,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from unittest import mock
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -792,7 +793,7 @@ def segment_data(xml_path, seg_suffix):
     raise KeyError(seg_suffix)
 
 
-def distill_xml(xml):
+def distill_xml(xml, counts=None):
     """build_record of a program given as XML text (for variants of APP3)."""
     path = tempfile.mktemp(prefix="knxprod-mcp-xml-")
     try:
@@ -803,7 +804,7 @@ def distill_xml(xml):
     finally:
         os.remove(path)
     return K.build_record(raws[0], langs, {"manufacturers": {}, "masks": {}},
-                          {"programs": {}, "products": {}, "langs": {}}, {})
+                          {"programs": {}, "products": {}, "langs": {}}, {}, counts=counts)
 
 
 class TestModules(unittest.TestCase):
@@ -1538,6 +1539,27 @@ class TestBackgroundSync(unittest.TestCase):
         self.assertTrue(any("2 application program(s)" in ln for ln in lines), lines)
 
 
+def app3_sensor_after_sensors(before=False, virtual=False):
+    """APP3 with one more sensor placed on the sensors' allocators after their
+    repeat, which a parameter counts (or before it); the allocators have room
+    for the fourth.  `virtual`: the count is not kept in device memory."""
+    p = PRE3
+    extra = ('<Module Id="{p}MD-3_M-9" RefId="{p}MD-3"><NumericArg RefId="{p}MD-3_A-1" '
+             'AllocatorRefId="{p}L-1" /><NumericArg RefId="{p}MD-3_A-2" AllocatorRefId="{p}L-2" />'
+             '<NumericArg RefId="{p}MD-3_A-3" AllocatorRefId="{p}L-3" /></Module>').format(p=p)
+    at = ('<Repeat Id="{p}X-1" Name="Sensors"' if before else
+          '<Repeat Id="{p}X-2" Name="Scenes" Count="2">').format(p=p)
+    return app3_with((at, extra + at),
+                     ('Name="SensorParamOffs" Start="0" maxInclusive="30"',
+                      'Name="SensorParamOffs" Start="0" maxInclusive="40"'),
+                     ('Name="SensorObjNumber" Start="20" maxInclusive="26"',
+                      'Name="SensorObjNumber" Start="20" maxInclusive="28"'),
+                     ('Name="SensorNo" Start="1" maxInclusive="4"',
+                      'Name="SensorNo" Start="1" maxInclusive="5"'),
+                     *([('Value="2">\n                <Memory CodeSegment="{p}AS-4800" Offset="0" '
+                         'BitOffset="0" />\n'.format(p=p), 'Value="2">\n')] if virtual else []))
+
+
 def app3_with(*replacements):
     xml = _read(APP3_XML).decode("utf-8")
     for a, b in replacements:
@@ -1605,23 +1627,160 @@ class TestNestedModules(unittest.TestCase):
     def test_a_count_parameter_before_a_shared_allocator_is_flagged(self):
         # The sensors' repeat is counted by a parameter; a module placed after
         # it on the same allocators lies wherever that count ends.
-        p = PRE3
-        extra = ('<Module Id="{p}MD-3_M-9" RefId="{p}MD-3"><NumericArg RefId="{p}MD-3_A-1" '
-                 'AllocatorRefId="{p}L-1" /><NumericArg RefId="{p}MD-3_A-2" AllocatorRefId="{p}L-2" />'
-                 '<NumericArg RefId="{p}MD-3_A-3" AllocatorRefId="{p}L-3" /></Module>').format(p=p)
-        rep = '<Repeat Id="{p}X-2" Name="Scenes" Count="2">'.format(p=p)
-        room = (('Name="SensorParamOffs" Start="0" maxInclusive="30"',
-                 'Name="SensorParamOffs" Start="0" maxInclusive="40"'),
-                ('Name="SensorObjNumber" Start="20" maxInclusive="26"',
-                 'Name="SensorObjNumber" Start="20" maxInclusive="28"'),
-                ('Name="SensorNo" Start="1" maxInclusive="4"',
-                 'Name="SensorNo" Start="1" maxInclusive="5"'))
-        after = distill_xml(app3_with((rep, extra + rep), *room))
+        after = distill_xml(app3_sensor_after_sensors())
         self.assertEqual(after["counts"]["module_unsupported"].get("allocator_after_variable_repeat"), 1)
-        sensors = '<Repeat Id="{p}X-1" Name="Sensors"'.format(p=p)
-        before = distill_xml(app3_with((sensors, extra + sensors), *room))
+        self.assertEqual(after["layout_counts"],
+                         [{"id": "P-1", "text": "Number of sensors", "max": 3, "stored": True}])
+        # most real programs keep such a count in ETS only
+        virtual = distill_xml(app3_sensor_after_sensors(virtual=True))
+        self.assertFalse(virtual["layout_counts"][0]["stored"])
+        before = distill_xml(app3_sensor_after_sensors(before=True))
         self.assertNotIn("allocator_after_variable_repeat",
                          before["counts"].get("module_unsupported", {}))
+        self.assertNotIn("layout_counts", before)
+
+    def test_the_count_set_on_the_device_places_what_follows(self):
+        xml = app3_sensor_after_sensors()
+        numbers = lambda rec: {c["id"]: c["number"] for c in rec["comobjects"] if "MD-3" in c["id"]}
+        offset = lambda rec: by_id(rec["parameters"], "MD-3_M-9_P-1")["offset"]
+        most = distill_xml(xml)                     # three sensors, the most there can be
+        self.assertEqual((numbers(most)["MD-3_M-9_O-1"], offset(most)), (26, 31))
+        one = distill_xml(xml, counts={"P-1": 1})
+        self.assertEqual(numbers(one), {"MD-3_M-4_MI-1_O-1": 20, "MD-3_M-4_MI-1_O-2": 21,
+                                        "MD-3_M-9_O-1": 22, "MD-3_M-9_O-2": 23})
+        self.assertEqual(offset(one), 11)
+        self.assertEqual(by_id(one["parameters"], "MD-3_M-9_P-1")["text"], "Sensor 2 offset (0.1 K)")
+        self.assertNotIn("module_unsupported", one["counts"])
+        self.assertNotIn("layout_counts", one)
+        self.assertEqual(one["layout"], {"counts_used": {"P-1": 1}, "counts_unknown": []})
+        none = distill_xml(xml, counts={"P-1": 0})
+        self.assertEqual(numbers(none), {"MD-3_M-9_O-1": 20, "MD-3_M-9_O-2": 21})
+        # more than the parameter allows: its maximum; an id that counts
+        # nothing changes nothing and is named
+        self.assertEqual(distill_xml(xml, counts={"P-1": 9})["layout"]["counts_used"], {"P-1": 3})
+        other = distill_xml(xml, counts={"P-9": 2})
+        self.assertEqual(other["layout"], {"counts_used": {}, "counts_unknown": ["P-9"]})
+        self.assertEqual(numbers(other), numbers(most))
+
+
+class TestDeviceCounts(unittest.TestCase):
+    """The tools laid out for the counts a device is configured with: the
+    program is read again from its product file."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = _tmpdir()
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+        cls.products = os.path.join(cls.tmp, "knxprod")
+        cls.data = os.path.join(cls.tmp, "index")
+        write_file(os.path.join(cls.products, "sensors.knxprod"), zip_bytes(
+            members("master", "hardware")
+            + [("M-FFF0/M-FFF0_A-0C0D-21-5A5A.xml", app3_sensor_after_sensors().encode())]))
+        stale = os.path.join(cls.data, "tmp", "layout-stale")
+        os.makedirs(stale)
+        cls.srv = Server(cls.products, cls.data)
+        cls.addClassCleanup(cls.srv.stop)
+        cls.stale = stale
+
+    def tool(self, name, **args):
+        return self.srv.tool(name, dict(args, app_id=APP3))[:2]
+
+    def test_application_names_the_counts(self):
+        _, o = self.tool("prod-application")
+        self.assertEqual(o["layout_counts"],
+                         [{"id": "P-1", "text": "Number of sensors", "max": 3, "stored": True}])
+        self.assertIn("ETS project", o["note"])
+
+    def test_objects_parameters_and_decode_follow_the_counts(self):
+        _, o = self.tool("prod-comobjects", numbers=[26])
+        self.assertEqual([(c["number"], c["module"]) for c in o["comobjects"]], [(26, "Sensor 4")])
+        self.assertNotIn("layout", o)
+        _, o = self.tool("prod-comobjects", numbers=[22, 26], counts={"P-1": 1})
+        self.assertEqual([(c["number"], c["module"]) for c in o["comobjects"]], [(22, "Sensor 2")])
+        self.assertEqual(o["missing_numbers"], [26])
+        self.assertEqual(o["layout"], {"counts_used": {"P-1": 1}, "counts_unknown": []})
+        _, o = self.tool("prod-parameters", module="MD-3_M-9", counts={"P-1": 1})
+        p = by_id(o["parameters"], "MD-3_M-9_P-1")
+        self.assertEqual((p["segment"], p["offset"], p["text"]),
+                         ("RS-04-00000", 11, "Sensor 2 offset (0.1 K)"))
+        self.assertEqual(o["layout"]["counts_used"], {"P-1": 1})
+        _, o = self.tool("prod-decode", segment="RS-04-00000", address=11, data="05",
+                         counts={"P-1": 1})
+        self.assertEqual([v["id"] for v in o["values"]], ["MD-3_M-9_P-1"])
+        _, o = self.tool("prod-decode", segment="RS-04-00000", address=11, data="05")
+        self.assertEqual([v["id"] for v in o["values"]], ["MD-3_M-4_MI-2_P-1"])
+
+    def test_layouts_are_kept_a_few_at_a_time(self):
+        store = self.srv.svc.httpd.store
+        for n in (0, 1, 2, 3, 1, 0):
+            self.tool("prod-comobjects", numbers=[20], counts={"P-1": n})
+        self.assertEqual(len(store._layouts), K.LAYOUT_CACHE)
+        dirs = [d for d, _ in store._layouts.values()]
+        self.tool("prod-comobjects", numbers=[20], counts={"P-9": 1})
+        self.assertEqual(len(store._layouts), K.LAYOUT_CACHE)
+        self.assertFalse(os.path.exists(dirs[0]))   # the oldest went, with its files
+        self.assertTrue(all(os.path.isdir(d) for d in dirs[1:]))
+        self.assertFalse(os.path.exists(self.stale))   # an earlier run's at start
+
+    def test_a_slow_layout_asks_to_come_back(self):
+        # A stick forwards a call for 10 s; a large program takes longer to
+        # lay out.  The work goes on, the call says to ask again.
+        gate, compute = threading.Event(), K.Store._compute_layout
+
+        def slow(store, *a):
+            gate.wait(10)
+            return compute(store, *a)
+
+        with mock.patch.object(K, "LAYOUT_WAIT", 0.05), \
+                mock.patch.object(K.Store, "_compute_layout", slow):
+            res, o = self.tool("prod-parameters", counts={"P-1": 2, "P-7": 1})
+            self.assertEqual((res["isError"], o["error"]), (True, "layout_pending"))
+            self.assertIn("ask again", o["hint"])
+            self.assertEqual(self.tool("prod-parameters", counts={"P-1": 3, "P-7": 1})[1]["error"],
+                             "layout_pending")
+            self.assertEqual(self.tool("prod-parameters", counts={"P-1": 1, "P-7": 1})[1]["error"],
+                             "layout_busy")
+            gate.set()
+            self.assertTrue(wait_for(lambda: not self.srv.svc.httpd.store._jobs))
+            res, o = self.tool("prod-parameters", counts={"P-1": 2, "P-7": 1})
+        self.assertFalse(res["isError"])
+        self.assertEqual(o["layout"], {"counts_used": {"P-1": 2}, "counts_unknown": ["P-7"]})
+
+    def test_bad_counts_are_refused(self):
+        for bad in ({"P-1": -1}, {"P-1": "2"}, {"P-1": True}, [1], {"P-1": 70000}):
+            res, o = self.tool("prod-parameters", counts=bad)
+            self.assertTrue(res["isError"], bad)
+            self.assertEqual(o["error"], "invalid_argument", bad)
+
+    def test_an_index_of_0_6_0_reads_such_files_again(self):
+        # 0.6.0 flagged these programs without naming the counts
+        data = os.path.join(self.tmp, "index-0.6.0")
+        K.sync_products(self.products, data, settle=0)
+        con = index_db(data)
+        try:
+            pk, header = con.execute("SELECT pk, header FROM programs WHERE app_id = ?",
+                                     (APP3,)).fetchone()
+            h = K._unpack(header)
+            del h["layout_counts"]
+            con.execute("UPDATE programs SET header = ? WHERE pk = ?", (K._pack(h), pk))
+            con.execute("DELETE FROM meta WHERE key = 'layout_counts'")
+        finally:
+            con.close()
+        lines = []
+        K.sync_products(self.products, data, settle=0, log=lines.append)
+        self.assertEqual(record(data, APP3)["layout_counts"][0]["id"], "P-1")
+        self.assertTrue(any("reading 1 product file(s) again" in ln for ln in lines), lines)
+        lines = []
+        K.sync_products(self.products, data, settle=0, log=lines.append)
+        self.assertFalse(any("again" in ln for ln in lines), lines)
+
+    def test_without_the_product_file_there_is_no_layout(self):
+        store = K.Store(self.data)
+        self.addCleanup(store.close)
+        store.products_dir = os.path.join(self.tmp, "elsewhere")
+        with self.assertRaises(K.ToolError) as cm:
+            K.tool_parameters(store, {"app_id": APP3, "counts": {"P-1": 1}}, 100000)
+        self.assertEqual(cm.exception.payload["error"], "layout_unavailable")
 
 
 # ---------------------------------------------------------------------------
