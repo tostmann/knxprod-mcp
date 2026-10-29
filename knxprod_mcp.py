@@ -75,7 +75,6 @@ import sqlite3
 import stat
 import struct
 import sys
-import tempfile
 import threading
 import time
 import traceback
@@ -122,9 +121,6 @@ MAX_ALTS = 8                       # distinct condition sets (UI places) kept pe
 BYTE_ORDER_MIN_EVIDENCE = 3        # template defaults needed before a byte-order warning
 MAX_REPEAT = 256                   # module instances expanded per <Repeat>
 MAX_MODULE_DEPTH = 4               # modules placed inside module definitions, levels
-LAYOUT_CACHE = 4                   # programs laid out for device counts, kept
-LAYOUT_JOBS = 2                    # ... and laid out at the same time, at most
-LAYOUT_WAIT = 7.0                  # s a call waits for one; a stick forwards for 10 s
 
 SLOT_NOTE = ("Names label slots of the application program, not what an "
              "installation uses them for; the channel mode decides.")
@@ -1057,11 +1053,7 @@ def fill_placeholders(text, lookup):
     return _norm(out), unresolved
 
 
-def build_record(raw, langs, master, hw, source, rows=None, counts=None):
-    """The distilled record of one application program.  `rows` takes its
-    parameters and com objects as they are made (_RowSink); `counts` gives
-    repetitions counted by a parameter the count a device is configured with,
-    {parameter id: n} -- without, each is laid out to its maximum."""
+def build_record(raw, langs, master, hw, source, rows=None):
     a = raw.attrs
     full_id = raw.full_id
     prefix = full_id + "_"
@@ -1380,13 +1372,9 @@ def build_record(raw, langs, master, hw, source, rows=None, counts=None):
         allocators.update(md.allocators)
 
     def counters_for(decls):
-        # one counter per allocator: [next value, the count parameter of a
-        # repeat that took from it without a known count -- later values depend
-        # on what a device is configured with]
-        return {lid: [al.get("start"), None] for lid, al in decls.items()}
-
-    dev_counts = counts or {}          # `counts` names the statistics further down
-    counts_used, count_info, layout_counts, count_stored = {}, {}, [], {}
+        # one counter per allocator: [next value, a repeat counted by a
+        # parameter took from it -- later values depend on the configuration]
+        return {lid: [al.get("start"), False] for lid, al in decls.items()}
 
     def expand(placements, parent, counters, depth):
         """Instances of the modules `placements` puts (the program's, or those
@@ -1402,22 +1390,12 @@ def build_record(raw, langs, master, hw, source, rows=None, counts=None):
             outer = (list(parent["outer"]) if parent else []) + [
                 render_cond(c, pnames) for c in mod["conds"]]
             rep = mod.get("repeat")
-            count, count_pref, count_id = 1, None, None
+            count, count_pref = 1, None
             if rep is not None:
                 if rep.get("count") is not None:
                     count = rep["count"]
                 elif rep.get("pref"):
                     count, count_pref = repeat_max(rep["pref"]), rep["pref"]
-                    # the count parameter as the tools name it, in its instance
-                    r = pref_by_id.get(count_pref)
-                    pid = r["ref"] if r else count_pref
-                    count_id = (parent["id"] + "_" + local_id(pid, parent["md"]) if parent
-                                else short(pid))
-                    count_info[count_id] = (pref_text(count_pref, pnames)[0], count)
-                    if count_id in dev_counts:
-                        count = min(dev_counts[count_id], count) if count is not None \
-                            else dev_counts[count_id]
-                        counts_used[count_id] = count
                 else:
                     count = None
                 if count is None or count < 0:
@@ -1427,7 +1405,7 @@ def build_record(raw, langs, master, hw, source, rows=None, counts=None):
                     unsupported["repeat_instances_capped"] += count - MAX_REPEAT
                     count = MAX_REPEAT
             used = [g["allocator"] for g in mod["args"].values() if g.get("allocator")]
-            shifted = [counters[lid][1] for lid in used if lid in counters and counters[lid][1]]
+            shifted = any(counters.get(lid, [None, False])[1] for lid in used)
             group = []
             for i in range(1, count + 1):
                 values, names, ok = {}, {}, True
@@ -1471,9 +1449,6 @@ def build_record(raw, langs, master, hw, source, rows=None, counts=None):
                     # an earlier repeat counted by a parameter took from the same
                     # allocator: where this instance lies depends on that count
                     unsupported["allocator_after_variable_repeat"] += 1
-                    for cid in shifted:
-                        if cid not in layout_counts:
-                            layout_counts.append(cid)
                 iid = ((parent["id"] + "_" + local_id(mod["id"], parent["md"])) if parent
                        else short(mod["id"])) + ("_MI-%d" % i if rep is not None else "")
                 o_outer = list(outer)
@@ -1484,10 +1459,10 @@ def build_record(raw, langs, master, hw, source, rows=None, counts=None):
                     md.attrs.get("Name") or short(md.full_id), i)
                 group.append({"id": iid, "md": md, "values": values, "names": names,
                               "outer": o_outer, "label": label, "index": i})
-            if count_pref and count_id not in counts_used:
+            if count_pref:
                 for lid in used:
-                    if lid in counters and not counters[lid][1]:
-                        counters[lid][1] = count_id
+                    if lid in counters:
+                        counters[lid][1] = True
             if rep is not None and len({g["label"] for g in group}) < len(group):
                 for g in group:
                     g["label"] = "%s #%d" % (g["label"], g["index"])
@@ -1560,8 +1535,6 @@ def build_record(raw, langs, master, hw, source, rows=None, counts=None):
             counts["parameters_property"] += 1
         else:
             counts["parameters_virtual"] += 1
-        if o["id"] in count_info:
-            count_stored[o["id"]] = "storage" in o
         if "union" in p:
             o["union"] = p["union"]
             counts["parameters_union"] += 1
@@ -1876,15 +1849,6 @@ def build_record(raw, langs, master, hw, source, rows=None, counts=None):
             if md.parent:
                 m["inside"] = short(md.parent)
             rec["modules"].append(m)
-    if layout_counts:
-        # take these from the ETS project and pass them as counts: then every
-        # instance lies where the device has it
-        # `stored`: the device holds the count; mostly it is an ETS-only setting
-        rec["layout_counts"] = [{"id": cid, "text": count_info[cid][0], "max": count_info[cid][1],
-                                 "stored": count_stored.get(cid, False)} for cid in layout_counts]
-    if dev_counts:
-        rec["layout"] = {"counts_used": counts_used,
-                         "counts_unknown": sorted(k for k in dev_counts if k not in count_info)}
     if name_de:
         rec["name_de"] = name_de
     if orig:
@@ -2338,7 +2302,7 @@ def _db_path(data_dir):
     return os.path.join(data_dir, DB_NAME)
 
 
-def _open_writer(data_dir, log=None, private=False):
+def _open_writer(data_dir, log=None):
     """The index database for writing, the caller holding _IngestLock.  It is
     created when missing and emptied when it is in another format (the JSON
     index of 0.5 is removed then), so that the sync rebuilds it from the
@@ -2346,12 +2310,8 @@ def _open_writer(data_dir, log=None, private=False):
     os.makedirs(data_dir, exist_ok=True)
     con = sqlite3.connect(_db_path(data_dir), timeout=60, isolation_level=None)
     try:
-        if private:
-            con.execute("PRAGMA journal_mode=OFF")
-            con.execute("PRAGMA synchronous=OFF")
-        else:
-            con.execute("PRAGMA journal_mode=WAL")
-            con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
         con.execute("PRAGMA journal_size_limit=%d" % (64 << 20))
         old = _ensure_schema_locked(con, data_dir, log)
     except BaseException:
@@ -2465,46 +2425,25 @@ def _store_program_locked(con, rec, sink, source):
 def index_record(data_dir, rec, source="record"):
     """Write one distilled record (a dict as build_record returns it without
     `rows`) to the index: for tests and tools that build records themselves."""
-    with _IngestLock(data_dir):
-        return _write_record(data_dir, rec, source)
-
-
-def _write_record(data_dir, rec, source, private=False):
-    """index_record without the lock.  `private`: an index nobody else writes
-    and nobody needs after a crash (a layout for counts set in ETS), written
-    without journal and fsync and without waiting for a running sync."""
     sink = _RowSink()
     for p in rec.get("parameters", []):
         sink.add("parameter", p)
     for c in rec.get("comobjects", []):
         sink.add("comobject", c)
-    con, _ = _open_writer(data_dir, private=private)
-    try:
-        con.execute("BEGIN IMMEDIATE")
+    with _IngestLock(data_dir):
+        con, _ = _open_writer(data_dir)
         try:
-            pk, _ = _store_program_locked(con, rec, sink, source)
-            _touch_generation(con)
-            con.execute("COMMIT")
-        except BaseException:
-            con.execute("ROLLBACK")
-            raise
-    finally:
-        con.close()
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                pk, _ = _store_program_locked(con, rec, sink, source)
+                _touch_generation(con)
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+        finally:
+            con.close()
     return pk
-
-
-def _read_program(path, label, member, full_id, tmp):
-    """The raw program `full_id` and its languages, from member `member` of
-    product file `path` (opened under the label it was indexed with)."""
-    with SourceSet(path, tmp, label=label) as src:
-        for m in src.members:
-            if m.kind == "app" and m.name == member:
-                with m.open() as f:
-                    raws, langs = parse_application_xml(f)
-                for raw in raws:
-                    if raw.full_id.upper() == full_id.upper():
-                        return raw, langs
-    return None, None
 
 
 def _drop_source_locked(con, source, pks):
@@ -2859,33 +2798,7 @@ def sync_products(products_dir, data_dir, settle=SETTLE_SECONDS, log=None, state
     return summary
 
 
-def _mark_for_layout_counts_locked(con, log=None):
-    """Once per index: 0.6.0 flagged programs whose layout depends on counts
-    set in ETS without naming those counts.  Their product files are
-    read again, so that prod-application lists them."""
-    if con.execute("SELECT 1 FROM meta WHERE key = 'layout_counts'").fetchone():
-        return
-    rels = set()
-    for pk, header in con.execute("SELECT pk, header FROM programs").fetchall():
-        h = _unpack(header)
-        if ("allocator_after_variable_repeat" in h.get("counts", {}).get("module_unsupported", {})
-                and "layout_counts" not in h):
-            rels.update(r[0] for r in con.execute("SELECT rel FROM sources WHERE pk = ?", (pk,)))
-    con.execute("BEGIN IMMEDIATE")
-    try:
-        con.executemany("UPDATE files SET reingest = 1 WHERE rel = ?", ((r,) for r in rels))
-        con.execute("INSERT INTO meta(key, value) VALUES ('layout_counts', '1')")
-        con.execute("COMMIT")
-    except BaseException:
-        con.execute("ROLLBACK")
-        raise
-    if rels and log:
-        log("%s reading %d product file(s) again: their programs now name the device counts "
-            "their layout depends on" % (_utc_now(), len(rels)))
-
-
 def _sync_locked(con, products_dir, data_dir, settle, log, summary, state=None):
-    _mark_for_layout_counts_locked(con, log)
     files = {r[0]: {"sha256": r[1], "size": r[2], "mtime_ns": r[3], "reingest": r[4]}
              for r in con.execute("SELECT rel, sha256, size, mtime_ns, reingest FROM files")}
     present = product_files(products_dir)
@@ -3054,12 +2967,6 @@ def _prepare_dirs(products_dir, data_dir):
                     os.remove(full)
         except OSError:
             pass
-    try:
-        for fn in os.listdir(tmp):                  # layouts of an earlier run
-            if fn.startswith("layout-"):
-                shutil.rmtree(os.path.join(tmp, fn), ignore_errors=True)
-    except OSError:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -3204,10 +3111,6 @@ class Store:
         self._pool = []
         self._entries = (None, [])
         self.sync_state = None              # the Service's SyncState, if any
-        self.products_dir = None            # set by the server: layouts are read from there
-        self._layouts = collections.OrderedDict()   # (full id, counts) -> (dir, Store)
-        self._jobs = {}                     # layouts being computed: key -> job
-        self._closed = False
 
     @contextlib.contextmanager
     def reader(self):
@@ -3228,7 +3131,7 @@ class Store:
                     con = None
             if con is not None:
                 with self._lock:
-                    if len(self._pool) < 8 and not self._closed:
+                    if len(self._pool) < 8:
                         self._pool.append(con)
                         con = None
                 if con is not None:
@@ -3236,89 +3139,9 @@ class Store:
 
     def close(self):
         with self._lock:
-            self._closed = True                     # a reader still at work closes its own
             pool, self._pool = self._pool, []
-            layouts, self._layouts = list(self._layouts.values()), collections.OrderedDict()
         for con in pool:
             con.close()
-        for d, st in layouts:
-            st.close()
-            shutil.rmtree(d, ignore_errors=True)
-
-    def layout(self, prog, counts, master):
-        """A Store holding `prog` laid out for `counts` (repetition counts as
-        set in ETS), computed again from its product file.  The last
-        LAYOUT_CACHE are kept.  Large programs take longer than a client
-        waits: the work goes on in the background and the call says to ask
-        again."""
-        key = (prog.full_id.upper(), tuple(sorted(counts.items())))
-        with self._lock:
-            hit = self._layouts.get(key)
-            if hit is not None:
-                self._layouts.move_to_end(key)
-                return hit[1]
-            job = self._jobs.get(key)
-            if job is None:
-                if len(self._jobs) >= LAYOUT_JOBS:
-                    raise ToolError("layout_busy", "%d other layouts are being computed"
-                                    % len(self._jobs), hint="ask again in a few seconds")
-                job = self._jobs[key] = {"done": threading.Event(), "error": None,
-                                         "store": None, "t0": time.monotonic()}
-                threading.Thread(target=self._lay_out, args=(key, job, prog, counts, master),
-                                 name="layout", daemon=True).start()
-        if not job["done"].wait(LAYOUT_WAIT):
-            raise ToolError("layout_pending", "laying %s out for these counts takes a while "
-                            "(%.0f s so far)" % (prog.full_id, time.monotonic() - job["t0"]),
-                            hint="ask again with the same counts in a few seconds")
-        if job["error"] is not None:
-            raise job["error"]
-        return job["store"]
-
-    def _lay_out(self, key, job, prog, counts, master):
-        try:
-            job["store"] = self._compute_layout(key, prog, counts, master)
-        except ToolError as e:
-            job["error"] = e
-        except Exception as e:              # a program this version cannot lay out
-            job["error"] = ToolError("layout_failed", "%s: %s" % (type(e).__name__, e))
-        finally:
-            with self._lock:
-                self._jobs.pop(key, None)
-            job["done"].set()
-
-    def _compute_layout(self, key, prog, counts, master):
-        src = prog.header.get("source") or {}
-        tmp = os.path.join(self.data_dir, "tmp")
-        os.makedirs(tmp, exist_ok=True)
-        raw = label = None
-        for rel in prog.sources:                    # the product file the program came from
-            path = os.path.join(self.products_dir, rel) if self.products_dir else None
-            if path and os.path.exists(path):
-                raw, langs = _read_program(path, rel, src.get("member"), prog.full_id, tmp)
-                if raw is not None:
-                    label = rel
-                    break
-        if raw is None:
-            raise ToolError("layout_unavailable", "the product file of %s is not at hand, so it "
-                            "cannot be laid out for these counts" % prog.full_id)
-        rec = build_record(raw, langs, master, {"programs": {}, "products": {}, "langs": {},
-                                                "h2p": {}}, src, counts=counts)
-        rec["products"] = prog.header.get("products", [])
-        d = tempfile.mkdtemp(prefix="layout-", dir=tmp)
-        _write_record(d, rec, label, private=True)
-        st = Store(d)
-        with self._lock:
-            if self._closed:
-                old = [(d, st)]
-            else:
-                self._layouts[key] = (d, st)
-                old = []
-                while len(self._layouts) > LAYOUT_CACHE:
-                    old.append(self._layouts.popitem(last=False)[1])
-        for od, ost in old:
-            ost.close()
-            shutil.rmtree(od, ignore_errors=True)
-        return st
 
     def entries(self):
         """List entries in app_id order, each with its pk and product files
@@ -3491,30 +3314,6 @@ def _relative_hint(rec):
         return None
     return ("parameters of this program live in relative segment %s: pass segment and the "
             "offset within it as address" % " / ".join(rel[:4]))
-
-
-def _arg_counts(args):
-    v = args.get("counts")
-    if v is None or v == {}:
-        return None
-    if not isinstance(v, dict) or len(v) > 256 or not all(
-            isinstance(k, str) and len(k) <= 160 and isinstance(n, int)
-            and not isinstance(n, bool) and 0 <= n <= 65535 for k, n in v.items()):
-        raise ToolError("invalid_argument", "counts must be an object {parameter id: count "
-                        "0..65535}, at most 256 of them (see layout_counts in prod-application)")
-    return v
-
-
-def _counted(store, args, budget, func):
-    """Answer `func` from the program laid out for the counts a device is
-    configured with: where module instances lie can depend on them."""
-    counts = _arg_counts(args)
-    with store.reader() as db:
-        prog = need_app(db, args)
-        master = db.one("SELECT value FROM meta WHERE key = 'master'")
-    master = json.loads(master) if master else {"manufacturers": {}, "masks": {}}
-    laid = store.layout(prog, counts, master)
-    return func(laid, dict(args, app_id=prog.full_id, counts=None), budget)
 
 
 def need_app(db, args):
@@ -3712,11 +3511,6 @@ def tool_application(store, args, budget):
         o["tables"] = rec.get("tables", {})
         o["byte_order"] = rec.get("byte_order", {})
         o["counts"] = rec.get("counts", {})
-        if rec.get("layout_counts"):
-            # where some module instances lie depends on repeat counts set in ETS
-            o["layout_counts"] = rec["layout_counts"][:16 if cap_p is None else 4]
-            if len(rec["layout_counts"]) > len(o["layout_counts"]):
-                o["layout_counts_total"] = len(rec["layout_counts"])
         mods = rec.get("modules")
         if mods:
             cap_m = (None, 16, 8, 3)[level]
@@ -3734,11 +3528,6 @@ def tool_application(store, args, budget):
         if prog.equivalent:
             o["equivalent_programs"] = prog.equivalent[:8 if cap_p is None else 3]
         o["note"] = SLOT_NOTE
-        if rec.get("layout_counts"):
-            o["note"] += (" Where some module instances lie depends on the layout_counts, "
-                          "repetition counts set in ETS (stored false: not held by the device). "
-                          "Take them from the ETS project or ask the installer, and pass them "
-                          "as counts to prod-parameters, prod-comobjects and prod-decode.")
         return o
 
     return _fit_single(build, len(caps), budget)
@@ -3898,8 +3687,6 @@ def _query_where(w, a, query):
 
 
 def tool_comobjects(store, args, budget):
-    if args.get("counts"):
-        return _counted(store, args, budget, tool_comobjects)
     with store.reader() as db:
         prog = need_app(db, args)
         rec = prog.header
@@ -3931,8 +3718,6 @@ def tool_comobjects(store, args, budget):
         where = " AND ".join(w)
         header = {"app_id": rec["app_id"], "name": rec["name"],
                   "note": SLOT_NOTE + " " + VARIANT_NOTE}
-        if rec.get("layout"):
-            header["layout"] = rec["layout"]
         if wanted is not None:
             found = {r[0] for r in db.rows("SELECT DISTINCT number FROM comobjects WHERE "
                                            + where, a)}
@@ -4101,8 +3886,6 @@ def _param_where(prog, segment=None, address=None, module=None, query=None,
 
 
 def tool_parameters(store, args, budget):
-    if args.get("counts"):
-        return _counted(store, args, budget, tool_parameters)
     with store.reader() as db:
         prog = need_app(db, args)
         rec = prog.header
@@ -4125,8 +3908,6 @@ def tool_parameters(store, args, budget):
                       "members share memory: only the one matching the channel mode is valid."}
     if bo.get("warning"):
         header["byte_order_warning"] = bo["warning"]
-    if rec.get("layout"):
-        header["layout"] = rec["layout"]
     if segment is not None:
         header["segment"] = segment
     if address is not None:
@@ -4140,8 +3921,6 @@ def tool_parameters(store, args, budget):
 
 
 def tool_decode(store, args, budget):
-    if args.get("counts"):
-        return _counted(store, args, budget, tool_decode)
     with store.reader() as db:
         prog = need_app(db, args)
         rec = prog.header
@@ -4245,8 +4024,6 @@ def tool_decode(store, args, budget):
                        "segment_offset_hex": "0x%04X" % base})
     else:
         header.update({"address": base, "address_hex": "0x%04X" % base})
-    if rec.get("layout"):
-        header["layout"] = rec["layout"]
     header.update({"length": len(data), "byte_order": order,
                    "note": "Union members and alternative modules are all decoded: only the one "
                            "whose 'when' (and one of its 'when_any') matches the configured "
@@ -4281,7 +4058,7 @@ def tool_decode(store, args, budget):
 # Kept short on purpose: gateways that federate these tools merge them into
 # their own tools/list, and small devices have small buffers.
 _PAGE_PROPS = {
-    "offset": {"type": "integer", "minimum": 0},
+    "offset": {"type": "integer", "minimum": 0, "description": "Start index (default 0)"},
     "limit": {"type": "integer", "minimum": 1, "maximum": 200,
               "description": "Max items; replies may hold fewer"},
 }
@@ -4291,7 +4068,6 @@ _ADDR_PROP = {"type": ["integer", "string"],
               "description": "Memory address: integer or '0x4A2F'"}
 _SEGMENT_PROP = {"type": "string", "description": "Relative segment: address = offset in it"}
 _MODULE_PROP = {"type": "string", "description": "Module instance label or id"}
-_COUNTS_PROP = {"type": "object", "description": "{id: n} as set in ETS (layout_counts)"}
 
 TOOLS = [
     {"name": "prod-applications",
@@ -4299,7 +4075,7 @@ TOOLS = [
          "List ingested KNX application programs (from .knxprod files): app_id, "
          "manufacturer, name, version, mask, order numbers. Filter by manufacturer (name "
          "or id) and/or query (words in name, order number, product text). Paginated: "
-         "reply has total and next_offset (null = end)."),
+         "offset/limit, reply has total and next_offset (null = end)."),
      "inputSchema": {"type": "object", "properties": dict({
          "manufacturer": {"type": "string"},
          "query": {"type": "string"}}, **_PAGE_PROPS)},
@@ -4308,8 +4084,8 @@ TOOLS = [
      "description": (
          "One application program by app_id: products, mask, memory segments (address, "
          "size, load state machine), group address / association / com-object table "
-         "locations, byte order, counts, load procedure, layout_counts. An unknown "
-         "version returns candidates."),
+         "locations, byte order, counts, load procedure. An unknown version returns "
+         "candidates."),
      "inputSchema": {"type": "object", "properties": {"app_id": _APP_ID_PROP},
                      "required": ["app_id"]},
      "annotations": {"readOnlyHint": True}},
@@ -4320,9 +4096,10 @@ TOOLS = [
          "(channel mode) that shows it, 'when_any' = one of these must hold too; "
          "text/function_text/dpt only where they differ. A "
          "name labels the SLOT, not the function: in another mode the same number may do "
-         "something else. Pick the variant "
+         "something else (a 'slat position' slot can switch a pump). Pick the variant "
          "whose size_bits matches the size the device reports. Filter: numbers, query, "
-         "module (instance of an ETS module). Paginated."),
+         "module (instance of an ETS module). Paginated; very many variants come in "
+         "parts (variant_offset)."),
      "inputSchema": {"type": "object", "properties": dict({
          "app_id": _APP_ID_PROP,
          "numbers": {"type": "array", "items": {"type": "integer", "minimum": 0,
@@ -4330,8 +4107,7 @@ TOOLS = [
          "query": {"type": "string"},
          "module": _MODULE_PROP,
          "variant_offset": {"type": "integer", "minimum": 0,
-                            "description": "Next part of an object's variants"},
-         "counts": _COUNTS_PROP},
+                            "description": "Next part of an object's variants"}},
          **_PAGE_PROPS), "required": ["app_id"]},
      "annotations": {"readOnlyHint": True}},
     {"name": "prod-parameters",
@@ -4351,8 +4127,7 @@ TOOLS = [
          "module": _MODULE_PROP,
          "address": _ADDR_PROP,
          "segment": _SEGMENT_PROP,
-         "include_virtual": {"type": "boolean"}, "counts": _COUNTS_PROP}, **_PAGE_PROPS),
-         "required": ["app_id"]},
+         "include_virtual": {"type": "boolean"}}, **_PAGE_PROPS), "required": ["app_id"]},
      "annotations": {"readOnlyHint": True}},
     {"name": "prod-decode",
      "description": (
@@ -4365,8 +4140,7 @@ TOOLS = [
          "app_id": _APP_ID_PROP,
          "address": _ADDR_PROP,
          "segment": _SEGMENT_PROP,
-         "data": {"type": "string", "description": "Hex bytes as read, e.g. '0A1B2C'"},
-         "counts": _COUNTS_PROP},
+         "data": {"type": "string", "description": "Hex bytes as read, e.g. '0A1B2C'"}},
          **_PAGE_PROPS), "required": ["app_id", "address", "data"]},
      "annotations": {"readOnlyHint": True}},
 ]
@@ -5529,7 +5303,6 @@ def make_server(bind, port, data_dir, products_dir, allowed_hosts=(), upload_ori
         httpd.server_close()
         raise ConfigError("cannot listen on %s port %d: %s" % (b or "*", port, e.strerror or e))
     httpd.store = Store(data_dir)
-    httpd.store.products_dir = os.path.abspath(products_dir)
     httpd.data_dir = os.path.abspath(data_dir)
     httpd.products_dir = os.path.abspath(products_dir)
     httpd.extra_hosts = frozenset(normalize_host_entry(h) for h in allowed_hosts)

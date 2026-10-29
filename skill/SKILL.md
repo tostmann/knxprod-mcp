@@ -81,10 +81,8 @@ every tool.
   object numbers; `when` says which one the channel mode selects.
   `prod-application` lists the module definitions (`inside`: nested in
   another). `counts.module_unsupported` names what is not placed;
-  `allocator_after_variable_repeat`: addresses depend on repeat counts set
-  in ETS, listed in `layout_counts` (`stored` false: not on the device). Get
-  them from the ETS project or the installer, pass `counts` {id: n} to the
-  other tools; `layout.counts_used` confirms them.
+  `allocator_after_variable_repeat`: addresses depend on a count set on the
+  device, so read that count before trusting them.
 
 ## Conditions: `when` and `when_any`
 
