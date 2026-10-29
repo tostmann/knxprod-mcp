@@ -68,6 +68,14 @@ every tool.
   object numbers; `when` says which one the channel mode selects.
   `prod-application` lists the module definitions.
 
+## Conditions: `when` and `when_any`
+
+`when` lists ETS conditions that must all hold for a variant or parameter to
+apply, usually the channel mode. `when_any` appears when ETS shows the item in
+several places: besides `when`, ONE of its condition sets must hold. Neither
+field: ETS shows it unconditionally. Check conditions against values decoded
+from the device, not against defaults.
+
 ## Byte order
 
 Multi-byte values follow the byte order the program declares (`byte_order`).

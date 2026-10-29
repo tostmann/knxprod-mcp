@@ -8,6 +8,9 @@
     3. attribute order CodeSegment, BitOffset, Offset (a regex for
        Offset="..." finds the BitOffset first)
     4. union members must keep their attributes until the union is processed
+    5. one parameter shown in several places of the UI (two refs of P-4 under
+       two scene settings, ref P-6_R-7 and ComObjectRef O-0_R-4 in both
+       channel modes): every place counts, not only the first
 -->
 <KNX xmlns="http://knx.org/xml/project/20" CreatedBy="knxprod-mcp-tests" ToolVersion="0">
   <ManufacturerData>
@@ -90,6 +93,7 @@
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-2_R-3" RefId="M-FFF0_A-1234-56-ABCD_P-2" />
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-3_R-4" RefId="M-FFF0_A-1234-56-ABCD_P-3" Value="120" />
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-4_R-5" RefId="M-FFF0_A-1234-56-ABCD_P-4" />
+              <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-4_R-13" RefId="M-FFF0_A-1234-56-ABCD_P-4" />
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-5_R-6" RefId="M-FFF0_A-1234-56-ABCD_P-5" />
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-6_R-7" RefId="M-FFF0_A-1234-56-ABCD_P-6" />
               <ParameterRef Id="M-FFF0_A-1234-56-ABCD_P-7_R-8" RefId="M-FFF0_A-1234-56-ABCD_P-7" />
@@ -104,6 +108,7 @@
             </ComObjectTable>
             <ComObjectRefs>
               <ComObjectRef Id="M-FFF0_A-1234-56-ABCD_O-0_R-1" RefId="M-FFF0_A-1234-56-ABCD_O-0" />
+              <ComObjectRef Id="M-FFF0_A-1234-56-ABCD_O-0_R-4" RefId="M-FFF0_A-1234-56-ABCD_O-0" Text="Switch (expert)" />
               <ComObjectRef Id="M-FFF0_A-1234-56-ABCD_O-1_R-2" RefId="M-FFF0_A-1234-56-ABCD_O-1" />
               <ComObjectRef Id="M-FFF0_A-1234-56-ABCD_O-1_R-3" RefId="M-FFF0_A-1234-56-ABCD_O-1" Text="Switch pump" ObjectSize="1 Bit" ReadFlag="Enabled" TransmitFlag="Disabled" DatapointType="DPST-1-1" />
             </ComObjectRefs>
@@ -135,11 +140,23 @@
                     <ComObjectRefRef RefId="M-FFF0_A-1234-56-ABCD_O-1_R-2" />
                     <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_UP-10_R-10" />
                     <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_UP-20_R-20" />
+                    <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_P-6_R-7" />
+                    <ComObjectRefRef RefId="M-FFF0_A-1234-56-ABCD_O-0_R-4" />
+                    <choose ParamRefId="M-FFF0_A-1234-56-ABCD_P-2_R-3">
+                      <when test="0">
+                        <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_P-4_R-5" />
+                      </when>
+                      <when test="1">
+                        <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_P-4_R-13" />
+                      </when>
+                    </choose>
                   </when>
                   <when test="2">
                     <ComObjectRefRef RefId="M-FFF0_A-1234-56-ABCD_O-1_R-3" />
                     <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_UP-11_R-11" />
                     <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_UP-12_R-12" />
+                    <ParameterRefRef RefId="M-FFF0_A-1234-56-ABCD_P-6_R-7" />
+                    <ComObjectRefRef RefId="M-FFF0_A-1234-56-ABCD_O-0_R-4" />
                   </when>
                   <when default="true" />
                 </choose>

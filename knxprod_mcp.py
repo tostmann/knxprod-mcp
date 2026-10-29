@@ -77,8 +77,8 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.4.0"
-SCHEMA_VERSION = 3                 # distilled record format; another value rebuilds the index
+VERSION = "0.4.1"
+SCHEMA_VERSION = 4                 # distilled record format; another value rebuilds the index
 SERVER_NAME = "knxprod-mcp"
 
 DEFAULT_DATA = "/data"
@@ -104,12 +104,14 @@ ZIP_MAX_MEMBERS = 5000             # members, all nesting levels
 ZIP_MAX_DEPTH = 3
 CACHE_BYTES = 24 << 20             # app JSON kept in memory, counted by file size
 MAX_CONDS = 3                      # innermost ETS conditions kept per object/parameter
+MAX_ALTS = 8                       # distinct condition sets (UI places) kept per object/parameter
 MAX_REPEAT = 256                   # module instances expanded per <Repeat>
 
 SLOT_NOTE = ("Names label slots of the application program, not what an "
              "installation uses them for; the channel mode decides.")
 VARIANT_NOTE = ("Pick the variant whose size_bits matches the object size the "
-                "device reports; 'when' is the ETS condition for a variant.")
+                "device reports; 'when' is the ETS condition for a variant, and with "
+                "'when_any' one of those must hold as well.")
 
 # The skill an agent reads first: skill/SKILL.md next to this file (in the
 # image /app/skill/SKILL.md), served as an MCP resource.
@@ -555,19 +557,68 @@ class _RawApp:
 
 
 def _note_ref(table, refid, conds, block):
+    """Count one place the ETS UI shows a reference.  Kept: the block of the
+    first place and every distinct set of innermost conditions — a reference
+    shown under two channel modes needs both (one set over MAX_ALTS marks that
+    there are more)."""
     if not refid:
         return
+    c = conds[-MAX_CONDS:]
     r = table.get(refid)
     if r is None:
-        table[refid] = [1, conds[-MAX_CONDS:], block]
+        table[refid] = [1, [c], block]
     else:
         r[0] += 1
+        if c not in r[1] and len(r[1]) <= MAX_ALTS:
+            r[1].append(c)
+
+
+def _merge_entries(entries):
+    """One UI entry for all references of one parameter: their places add up,
+    and so do their condition sets.  None when the UI shows none of them."""
+    out = None
+    for e in entries:
+        if out is None:
+            out = [e[0], list(e[1]), e[2]]
+            continue
+        out[0] += e[0]
+        for c in e[1]:
+            if c not in out[1] and len(out[1]) <= MAX_ALTS:
+                out[1].append(c)
+    return out
+
+
+def _uniq(items):
+    out = []
+    for x in items:
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def _when_fields(alts):
+    """`when` and `when_any` from the condition lists of every place the ETS UI
+    shows an item.  What all places share (usually the channel mode) stays in
+    `when`; the rest goes to `when_any`, one of which must hold as well.  A
+    place without further conditions makes `when` alone enough."""
+    alts = _uniq(alts)
+    if len(alts) <= 1:
+        return {"when": alts[0]} if alts and alts[0] else {}
+    common = [c for c in alts[0] if all(c in a for a in alts[1:])]
+    o = {"when": common} if common else {}
+    rest = _uniq([c for c in a if c not in common] for a in alts)
+    if all(rest):
+        o["when_any"] = rest[:MAX_ALTS]
+        if len(rest) > MAX_ALTS:
+            o["when_any_more"] = True
+    return o
 
 
 def walk_dynamic(dyn, in_module=False):
-    """Record, per ComObjectRef/ParameterRef id, how often the ETS UI shows it
-    and the innermost conditions (choose/when) plus block of its first
-    occurrence; and every <Module> instance with its arguments, conditions
+    """Record, per ComObjectRef/ParameterRef id, how often the ETS UI shows it,
+    every distinct set of innermost conditions (choose/when) it is shown under
+    and the block of its first occurrence; and every <Module> instance with its
+    arguments, conditions
     and enclosing <Repeat>.  Iterative: the nesting can be deep.  Modules
     inside a module definition and repeats inside repeats are only counted."""
     co, pr, modules = {}, {}, []
@@ -1164,16 +1215,18 @@ def build_record(raw, langs, master, hw, source):
         return _norm(nm) or None
 
     def context(entry, inst=None):
-        """when / block / seen of a UI reference; for a module instance its
-        own conditions come first, then the innermost ones of the module."""
+        """when / when_any / block / seen of a UI reference; for a module
+        instance its own conditions come first, then the innermost ones of
+        the module.  Every place the UI shows it is one set of conditions
+        (_when_fields)."""
         names = inst["names"] if inst else None
         outer = inst["outer"] if inst else []
-        o = {}
-        inner = [render_cond(c, names) for c in entry[1]] if entry else []
         keep = MAX_CONDS - len(outer)
-        w = list(outer) + (inner[-keep:] if keep > 0 else [])
-        if w:
-            o["when"] = w
+        alts = []
+        for conds in (entry[1] if entry else [()]):
+            inner = [render_cond(c, names) for c in conds]
+            alts.append(list(outer) + (inner[-keep:] if keep > 0 else []))
+        o = _when_fields(alts)
         if entry is None:
             o["ui"] = False
             return o
@@ -1339,7 +1392,7 @@ def build_record(raw, langs, master, hw, source):
             o["union"] = p["union"]
             counts["parameters_union"] += 1
         variants = []
-        entry, seen = None, 0
+        shown = []
         dyn_pr = (inst["md"].dynamic if inst else raw.dynamic)["pr"]
         for r in refs_by_param.get(pid, []):
             counts["parameter_refs"] += 1
@@ -1357,17 +1410,15 @@ def build_record(raw, langs, master, hw, source):
                 variants.append(v)
             e = dyn_pr.get(r["id"])
             if e:
-                seen += e[0]
-                if entry is None:
-                    entry = e
+                shown.append(e)
         if variants:
             o["variants"] = variants[:8]
             if len(variants) > 8:
                 o["variants_total"] = len(variants)
-        ctx = context(entry, inst)
-        if seen > 1:
-            ctx["seen"] = seen
-        o.update(ctx)
+        # Every reference counts: a parameter the UI shows through one ref in
+        # blind mode and through another in roller-shutter mode applies in both,
+        # and taking the first ref's conditions alone said otherwise.
+        o.update(context(_merge_entries(shown), inst))
         # Self-check of the layout conventions against the manufacturer's
         # segment template, which usually (not always) carries the defaults.
         # Only cases where the alternatives give DIFFERENT values count as
@@ -2690,6 +2741,17 @@ def tool_application(store, args, budget):
     return _fit_single(build, len(caps), budget)
 
 
+def _put_when(dst, src, level):
+    """when / when_any into a reply: in full at detail level 0, from level 1 on
+    only the innermost condition of each (the reply is over its budget)."""
+    if src.get("when"):
+        dst["when"] = src["when"] if level == 0 else src["when"][-1:]
+    if src.get("when_any"):
+        dst["when_any"] = src["when_any"] if level == 0 else _uniq(a[-1:] for a in src["when_any"])
+        if src.get("when_any_more"):
+            dst["when_any_more"] = True
+
+
 def _render_comobject(c, level):
     o = {"number": c["number"], "text": c["text"]}
     if c.get("module"):
@@ -2751,8 +2813,7 @@ def _render_comobject(c, level):
             w["dpt"] = v["dpt"]
         if v.get("priority") and v.get("priority") != c.get("priority"):
             w["priority"] = v["priority"]
-        if v.get("when"):
-            w["when"] = v["when"] if level == 0 else v["when"][-1:]
+        _put_when(w, v, level)
         if level < 2 and v.get("block"):
             w["block"] = v["block"]
         if level == 0 and v.get("seen"):
@@ -2877,8 +2938,8 @@ def _render_param(p, types, level, order="big"):
         o["access"] = p["access"]
     if p.get("union"):
         o["union"] = p["union"]
-    if level < 3 and p.get("when"):
-        o["when"] = p["when"] if level == 0 else p["when"][-1:]
+    if level < 3:
+        _put_when(o, p, level)
     if level < 2 and p.get("block"):
         o["block"] = p["block"]
     if p.get("ui") is False:
@@ -2999,8 +3060,7 @@ def tool_decode(store, args, budget):
             o["kind"] = kind
         if p.get("union"):
             o["union"] = True
-        if p.get("when"):
-            o["when"] = p["when"]
+        _put_when(o, p, 0)
         values.append(o)
     header = {"app_id": rec["app_id"]}
     if segment is not None:
@@ -3010,7 +3070,8 @@ def tool_decode(store, args, budget):
         header.update({"address": base, "address_hex": "0x%04X" % base})
     header.update({"length": len(data), "byte_order": order,
                    "note": "Union members and alternative modules are all decoded: only the one "
-                           "whose 'when' matches the configured channel mode is meaningful. "
+                           "whose 'when' (and one of its 'when_any') matches the configured "
+                           "channel mode is meaningful. "
                            + SLOT_NOTE})
     if bo.get("warning"):
         header["byte_order_warning"] = bo["warning"]
@@ -3024,9 +3085,9 @@ def tool_decode(store, args, budget):
     def render(o, level):
         if level == 0:
             return o
-        r = {k: v for k, v in o.items() if k != "when"}
-        if level == 1 and o.get("when"):
-            r["when"] = o["when"][-1:]
+        r = {k: v for k, v in o.items() if k not in ("when", "when_any", "when_any_more")}
+        if level == 1:
+            _put_when(r, o, 1)
         return r
 
     return _page(values, offset, limit, render, header, "values", budget)
@@ -3070,7 +3131,8 @@ TOOLS = [
      "description": (
          "Com objects of an application program with ALL variants (ComObjectRef). Each "
          "variant: size_bits, flags (C R W T U I, '-' = off), 'when' = ETS condition "
-         "(channel mode) that shows it; text/function_text/dpt only where they differ. A "
+         "(channel mode) that shows it, 'when_any' = one of these must hold too; "
+         "text/function_text/dpt only where they differ. A "
          "name labels the SLOT, not the function: in another mode the same number may do "
          "something else (a 'slat position' slot can switch a pump). Pick the variant "
          "whose size_bits matches the size the device reports. Filter: numbers, query, "
@@ -3087,7 +3149,8 @@ TOOLS = [
          "Parameters of an application program with their storage: address (segment base "
          "+ offset), bit_offset (from the MSB), size_bits, extract (read `bytes` bytes at "
          "address in byte_order, >> shift, & mask), type (enum / min-max / text), "
-         "default, union, 'when' (channel mode that shows it). Union members share "
+         "default, union, 'when' (channel mode that shows it; 'when_any': one of these "
+         "must hold too). Union members share "
          "memory; only the one matching the mode is valid. Names label slots, not "
          "functions. Filter: query (words), module (instance of an ETS module), address "
          "(parameters occupying that byte; with segment: offset in it); include_virtual "
@@ -3105,8 +3168,8 @@ TOOLS = [
          "Decode bytes read from device memory (starting at address, or at an offset "
          "in segment) into parameter values: MSB-first bit offsets, the program's byte "
          "order. Only parameters fully inside the bytes; cut-off ones are listed in "
-         "'partial'. All union members and alternative modules are decoded: 'when' says "
-         "which applies. Pure computation, no device access. Paginated."),
+         "'partial'. All union members and alternative modules are decoded: 'when' and "
+         "'when_any' say which applies. Pure computation, no device access. Paginated."),
      "inputSchema": {"type": "object", "properties": dict({
          "app_id": _APP_ID_PROP,
          "address": _ADDR_PROP,

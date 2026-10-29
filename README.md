@@ -145,6 +145,10 @@ Some things to keep in mind:
   `size_bits` matches what the device reports. When several variants have the
   same size, the channel's configured mode decides: read that parameter from
   the device and decode it with `prod-decode`.
+- `when` lists the ETS conditions under which a variant or parameter applies,
+  usually the channel mode. When ETS shows an item in several places, `when`
+  keeps what all of them share and `when_any` lists the alternatives, one of
+  which must hold as well.
 - Multi-byte parameter values follow the byte order the program declares. The
   indexer compares that declaration with the defaults in the manufacturer's
   memory template and adds a `byte_order_warning` when they disagree.

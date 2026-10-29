@@ -433,6 +433,50 @@ class TestDistill(unittest.TestCase):
         self.assertEqual((v3["text"], v3["text_de"]), ("Switch pump", "Pumpe schalten"))
         self.assertEqual(v3["when"], ["Channel 1 operating mode = 2 (Switch)"])
 
+    def test_every_place_the_ui_shows_an_item_counts(self):
+        # Real programs show one status parameter through four refs, one per
+        # channel mode and status setting; the first ref alone named a single
+        # combination and contradicted the status object that depends on it.
+        ps = self.rec["parameters"]
+        p4 = by_id(ps, "P-4")                       # two refs, one per scene setting
+        self.assertEqual(p4["when"], ["Channel 1 operating mode = 1 (Blind)"])
+        self.assertEqual(p4["when_any"], [["Scene 1 active = 0 (disabled)"],
+                                          ["Scene 1 active = 1 (enabled)"]])
+        self.assertNotIn("ui", p4)
+        self.assertEqual(p4["seen"], 2)
+        p6 = by_id(ps, "P-6")                       # one ref, shown in both modes
+        self.assertNotIn("when", p6)
+        self.assertEqual(p6["when_any"], [["Channel 1 operating mode = 1 (Blind)"],
+                                          ["Channel 1 operating mode = 2 (Switch)"]])
+        self.assertEqual(p6["seen"], 2)
+        o0 = {v["ref"]: v for v in [c for c in self.rec["comobjects"]
+                                    if c["number"] == 0][0]["variants"]}
+        self.assertNotIn("when", o0["R-1"])
+        self.assertNotIn("when_any", o0["R-1"])
+        self.assertEqual(o0["R-4"]["when_any"], p6["when_any"])
+        self.assertEqual(o0["R-4"]["seen"], 2)
+        up10 = by_id(ps, "UP-10")                   # one place: unchanged
+        self.assertNotIn("when_any", up10)
+
+    def test_when_fields(self):
+        f = K._when_fields
+        self.assertEqual(f([]), {})
+        self.assertEqual(f([[]]), {})
+        self.assertEqual(f([["a"], ["a"]]), {"when": ["a"]})
+        self.assertEqual(f([["a", "b"], ["a"]]), {"when": ["a"]})       # "a" alone suffices
+        self.assertEqual(f([["a"], ["b"]]), {"when_any": [["a"], ["b"]]})
+        self.assertEqual(f([["m", "x"], ["m", "y", "z"]]),
+                         {"when": ["m"], "when_any": [["x"], ["y", "z"]]})
+        self.assertEqual(f([["a", "s"], ["b", "s"]]),                  # shared, not leading
+                         {"when": ["s"], "when_any": [["a"], ["b"]]})
+        self.assertEqual(f([["a", "s"], ["s", "a"]]), {"when": ["a", "s"]})
+        many = f([["m", "v%d" % i] for i in range(K.MAX_ALTS + 1)])
+        self.assertEqual((many["when"], len(many["when_any"]), many["when_any_more"]),
+                         (["m"], K.MAX_ALTS, True))
+        short = {}
+        K._put_when(short, {"when": ["m", "n"], "when_any": [["a", "x"], ["b", "x"], ["y"]]}, 1)
+        self.assertEqual(short, {"when": ["n"], "when_any": [["x"], ["y"]]})
+
     def test_second_program(self):
         r = self.rec2
         self.assertEqual(r["app_id"], APP2)
@@ -604,6 +648,10 @@ class TestMcpDispatch(unittest.TestCase):
         self.assertNotIn("text", c["variants"][0])
         res, o = self.tool("prod-comobjects", {"app_id": APP1, "query": "pump"})
         self.assertEqual([c["number"] for c in o["comobjects"]], [1])
+        res, o = self.tool("prod-comobjects", {"app_id": APP1, "numbers": [0]})
+        v = {x["ref"]: x for x in o["comobjects"][0]["variants"]}
+        self.assertEqual(v["R-4"]["when_any"], [["Channel 1 operating mode = 1 (Blind)"],
+                                                ["Channel 1 operating mode = 2 (Switch)"]])
 
     def test_parameters_tool(self):
         res, o = self.tool("prod-parameters", {"app_id": APP1, "address": "0x4A64"})
@@ -615,6 +663,11 @@ class TestMcpDispatch(unittest.TestCase):
         self.assertEqual([p["id"] for p in o["parameters"]], ["P-3"])
         res, o = self.tool("prod-parameters", {"app_id": APP1, "query": "staircase"})
         self.assertEqual([p["id"] for p in o["parameters"]], ["UP-11"])
+        res, o = self.tool("prod-parameters", {"app_id": APP1, "query": "channel name"})
+        p4 = o["parameters"][0]
+        self.assertEqual((p4["id"], p4["when"], p4["when_any"]),
+                         ("P-4", ["Channel 1 operating mode = 1 (Blind)"],
+                          [["Scene 1 active = 0 (disabled)"], ["Scene 1 active = 1 (enabled)"]]))
         res, o = self.tool("prod-parameters", {"app_id": APP1})
         self.assertEqual(o["total"], 10)
         res, o = self.tool("prod-parameters", {"app_id": APP1, "include_virtual": True})
@@ -637,6 +690,8 @@ class TestMcpDispatch(unittest.TestCase):
         self.assertEqual(vals["P-5"]["value"], -5)
         self.assertEqual(vals["UP-20"]["value"], 2)
         self.assertEqual(vals["P-4"]["raw_hex"], b"Kitchen\x00\x00\x00".hex().upper())
+        self.assertEqual((vals["P-4"]["when"], len(vals["P-4"]["when_any"])),
+                         (["Channel 1 operating mode = 1 (Blind)"], 2))
         self.assertTrue(vals["UP-11"]["union"])
         res, o = self.tool("prod-decode", {"app_id": APP1, "address": "0x4A0B", "data": "2C FB"})
         self.assertEqual([v["id"] for v in o["values"]], ["P-5"])
@@ -1023,7 +1078,8 @@ class TestSkill(unittest.TestCase):
                 "object 3, PID 13", "10 hex digits", "knx-prop-read", "prod-applications",
                 "several products", "prod-application ", "prod-comobjects", "prod-parameters",
                 "knx-mem-read", "prod-decode", "size_bits", "configured mode", "SLOT",
-                "MSB", "`union`", "`when`", "module", "byte_order_warning", "load session",
+                "MSB", "`union`", "`when`", "`when_any`", "module", "byte_order_warning",
+                "load session",
                 "dry run", "`offset`", "next_offset", "12 000 bytes", "unknown_app_id",
                 "upload", "terms"):
             self.assertIn(phrase, t, phrase)
