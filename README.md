@@ -115,10 +115,13 @@ needs no URL. Any DNS-SD browser shows it, for example
   a new file. If the name is already taken by a different file, the upload gets
   a numbered suffix. If identical content is already indexed, the upload is not
   stored a second time.
-- The index (distilled JSON, one sha256 per product file) lives in the data
-  folder (`/data` in the container). You can delete it at any time; it is
-  rebuilt from the product folder on the next start. An index written by a
-  version with another record format is rebuilt on start as well.
+- The index is one SQLite database, `index.sqlite`, in the data folder (`/data`
+  in the container). Keep that folder on a local disk: SQLite's locking does
+  not work over network file systems. You can delete the index at any time; it
+  is rebuilt from the product folder on the next start. An index of an older
+  format is rebuilt on start as well, including the JSON files of 0.5.
+- A question reads only the rows it needs, so a program with hundreds of
+  thousands of parameters is not loaded as a whole before it answers.
 - A product folder mounted read-only works. Uploads are then refused.
 - Unpacked product folders are not read. Keep the `.knxprod` (or zip) file.
 
@@ -135,6 +138,16 @@ needs no URL. Any DNS-SD browser shows it, for example
 A device identifies its application program with a 5-byte ApplicationId
 (manufacturer, application number, version), for example `FFF0123456`. Use the
 ApplicationId your device reports as `app_id`.
+
+Now and then two programs in the product files report the same ApplicationId
+(same number and version, different full ids). Both are indexed. Where their
+memory layouts and com objects match, for example a program converted from ETS3
+in one product file and the same program in ETS4 form in another, the
+ApplicationId answers from one of them and `prod-application` names the others
+in `equivalent_programs`. Where they differ, a call answers `ambiguous_app_id`
+and lists the programs with their products: the installed product decides, and
+its program's full id (for example `M-FFF0_A-1234-56-ABCD`) is accepted as
+`app_id`. `prod-applications` shows the `id` of such programs.
 
 Some things to keep in mind:
 

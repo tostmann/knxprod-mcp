@@ -22,11 +22,12 @@ The product directory is the source of truth.  On start the server syncs
 the index with it (new or changed files are ingested, the application
 programs of removed files are dropped), then serves, and re-scans it every
 KNXPROD_SCAN_INTERVAL seconds.  It never moves, renames or modifies a file
-there; uploads are added as new files.  The index lives in the data
-directory: DATA/apps/<APPID>.json, DATA/index.json, DATA/files.json (sha256
-per product file) and DATA/master.json.  APPID is manufacturer (4) +
-application number (4) + version (2) as upper-case hex, e.g. FFF0123456:
-the ApplicationId a device reports about itself.
+there; uploads are added as new files.  The index is one SQLite database in
+the data directory, DATA/index.sqlite (keep DATA on a local disk).  Tools
+take an APPID: manufacturer (4) + application number (4) + version (2) as
+upper-case hex, e.g. FFF0123456, the ApplicationId a device reports about
+itself; where two programs report the same one, their full ids
+(M-FFF0_A-1234-56-ABCD) tell them apart.
 
 No manufacturer data ships with this program.  Product files are licensed
 by their manufacturers; whoever runs this server uses them under those terms.
@@ -53,6 +54,7 @@ import argparse
 import array
 import base64
 import collections
+import contextlib
 import datetime
 import fcntl
 import hashlib
@@ -65,6 +67,7 @@ import shutil
 import signal
 import socket
 import socketserver
+import sqlite3
 import stat
 import struct
 import sys
@@ -74,11 +77,13 @@ import traceback
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
-VERSION = "0.5.1"
-SCHEMA_VERSION = 9                 # distilled record format; another value rebuilds the index
+VERSION = "0.6.0"
+SCHEMA_VERSION = 10                # index database format; another value rebuilds the index
+DB_NAME = "index.sqlite"
 SERVER_NAME = "knxprod-mcp"
 
 DEFAULT_DATA = "/data"
@@ -107,7 +112,6 @@ ZIP_MAX_TOTAL = 4096 << 20         # declared uncompressed bytes read, all nesti
 ZIP_MAX_RATIO = 200                # declared uncompressed : compressed, per member read
 ZIP_MAX_MEMBERS = 5000             # members, all nesting levels
 ZIP_MAX_DEPTH = 3
-CACHE_BYTES = 24 << 20             # app JSON kept in memory, counted by file size
 MAX_CONDS = 12                     # ETS conditions kept per place, outermost first (when_more beyond)
 MAX_ALTS = 8                       # distinct condition sets (UI places) kept per object/parameter
 BYTE_ORDER_MIN_EVIDENCE = 3        # template defaults needed before a byte-order warning
@@ -249,6 +253,19 @@ def normalize_app_id(value):
         s = s[2:]
     s = re.sub(r"[\s:._-]", "", s)
     return s if _HEX10_RE.match(s) else None
+
+
+_KNX_PROGRAM_RE = re.compile(
+    r"^M-[0-9A-F]{4}_A-[0-9A-F]{4}-[0-9A-F]{2}-[0-9A-F]{4}(?:-O[0-9A-F]{4})?$", re.I)
+
+
+def normalize_program_id(value):
+    """A program's full id ('M-FFF0_A-1234-56-ABCD', with the -Oxxxx of an OEM
+    program) in upper case; None for anything else."""
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    return s.upper() if _KNX_PROGRAM_RE.match(s) else None
 
 
 _FLAG_ATTRS = (("C", "CommunicationFlag"), ("R", "ReadFlag"), ("W", "WriteFlag"),
@@ -1036,7 +1053,7 @@ def fill_placeholders(text, lookup):
     return _norm(out), unresolved
 
 
-def build_record(raw, langs, master, hw, source):
+def build_record(raw, langs, master, hw, source, rows=None):
     a = raw.attrs
     full_id = raw.full_id
     prefix = full_id + "_"
@@ -1658,40 +1675,32 @@ def build_record(raw, langs, master, hw, source):
         counts["comobject_refs"] += len(variants)
         return o
 
-    params_out, cos_out = [], []
+    # Parameters and com objects go to `rows` as soon as they are made: the
+    # index keeps them as rows, and a program with half a million parameters
+    # does not fit into memory as dicts.  Without `rows` the record holds them.
+    sink = rows if rows is not None else _RowList()
+    made = collections.Counter()
 
-    def add(lst, o):
-        if o is not None:
-            o["_seq"] = len(lst)
-            lst.append(o)
-            return 1
-        return 0
+    def add(kind, o):
+        if o is None:
+            return 0
+        made[kind] += 1
+        made["placeholders"] += "{{" in (o.get("text") or "")
+        if kind == "comobject":
+            made["placeholders"] += sum(1 for v in o["variants"] if "{{" in (v.get("text") or ""))
+        sink.add(kind, o)
+        return 1
 
     for p in raw.params:
-        add(params_out, make_param(p, None))
+        add("parameter", make_param(p, None))
     for c in raw.comobjects:
-        add(cos_out, make_comobject(c, None))
+        add("comobject", make_comobject(c, None))
     mod_params = mod_cos = 0
     for inst in instances:
         for p in inst["md"].params:
-            mod_params += add(params_out, make_param(p, inst))
+            mod_params += add("parameter", make_param(p, inst))
         for c in inst["md"].comobjects:
-            mod_cos += add(cos_out, make_comobject(c, inst))
-
-    def param_order(o):
-        if o.get("address") is not None:
-            return (0, "", o["address"], o.get("bit_offset") or 0, o["_seq"])
-        if o.get("storage") == "memory":
-            return (1, o.get("segment") or "", o.get("offset") or 0, o.get("bit_offset") or 0,
-                    o["_seq"])
-        return (2 if o.get("storage") else 3, "", 0, 0, o["_seq"])
-
-    params_out.sort(key=param_order)
-    for o in params_out:
-        del o["_seq"]
-    cos_out.sort(key=lambda o: (o["number"] if o["number"] is not None else 1 << 30, o["id"]))
-    for o in cos_out:
-        del o["_seq"]
+            mod_cos += add("comobject", make_comobject(c, inst))
 
     # -- products
     prods = []
@@ -1717,11 +1726,9 @@ def build_record(raw, langs, master, hw, source):
             if mask.get(k):
                 mask_out[k] = mask[k]
 
-    left = sum(1 for o in params_out if "{{" in (o.get("text") or ""))
-    left += sum(1 for o in cos_out if "{{" in (o.get("text") or ""))
-    left += sum(1 for o in cos_out for v in o["variants"] if "{{" in (v.get("text") or ""))
-    counts = {"comobjects": len(cos_out), "comobject_refs": counts["comobject_refs"],
-              "parameters": len(params_out), "parameters_memory": counts["parameters_memory"],
+    left = made["placeholders"]
+    counts = {"comobjects": made["comobject"], "comobject_refs": counts["comobject_refs"],
+              "parameters": made["parameter"], "parameters_memory": counts["parameters_memory"],
               "parameters_union": counts["parameters_union"],
               "parameters_property": counts["parameters_property"],
               "parameters_virtual": counts["parameters_virtual"],
@@ -1774,7 +1781,7 @@ def build_record(raw, langs, master, hw, source):
         "tables": tables,
         "load_procedure": {"source": lp_source, "steps": [render_step(op, at) for op, at in steps]},
         "byte_order": byte_order,
-        "counts": counts, "types": types_out, "comobjects": cos_out, "parameters": params_out,
+        "counts": counts, "types": types_out,
         "source": source,
     }
     if defs:
@@ -1789,7 +1796,134 @@ def build_record(raw, langs, master, hw, source):
         rec["name_de"] = name_de
     if orig:
         rec["original_manufacturer"] = orig
+    if rows is None:
+        rec["parameters"], rec["comobjects"] = sink.ordered()
     return rec
+
+
+def _param_order(o, seq):
+    """Index order of parameters: by address, then by segment and offset, then
+    property and ETS-only parameters; `seq` keeps the program's own order."""
+    if o.get("address") is not None:
+        return (0, "", o["address"], o.get("bit_offset") or 0, seq)
+    if o.get("storage") == "memory":
+        return (1, o.get("segment") or "", o.get("offset") or 0, o.get("bit_offset") or 0, seq)
+    return (2 if o.get("storage") else 3, "", 0, 0, seq)
+
+
+def _comobject_order(o, seq):
+    return (o["number"] if o["number"] is not None else 1 << 30, o["id"], seq)
+
+
+def _pack(obj):
+    return zlib.compress(_dumps(obj).encode("utf-8"), 6)
+
+
+def _unpack(blob):
+    return json.loads(zlib.decompress(blob))
+
+
+def _haystack(fields):
+    """What a query searches: the fields as one string in lower case, each
+    text once (variants repeat their object's texts; a query word cannot
+    span two fields, so that changes no match)."""
+    return " ".join(dict.fromkeys(f.lower() for f in fields if f))
+
+
+def _module_cols(o):
+    m = o.get("module") or {}
+    return (m.get("id") or "").lower() or None, (m.get("label") or "").lower() or None
+
+
+def _param_row(o):
+    """A parameter as an index row: storage, segment, address, offset in the
+    segment, size_bits, bytes occupied, module id and label (lower case),
+    search text, and the body last."""
+    mem = o.get("storage") == "memory"
+    fields = [o.get("text"), o.get("text_de"), o.get("name"), o.get("block"), o.get("id"),
+              (o.get("module") or {}).get("label")]
+    fields += [v.get("text") for v in o.get("variants", [])]
+    return ((o.get("storage"), o.get("segment") if mem else None, o.get("address"),
+             o.get("offset") if mem else None, o.get("size_bits"),
+             _param_nbytes(o) if mem else None) + _module_cols(o)
+            + (_haystack(fields), _pack(o)))
+
+
+def _comobject_row(o):
+    """A com object as an index row: number, module id and label, search
+    text, body."""
+    fields = [o.get("text"), o.get("text_de"), o.get("function_text"),
+              o.get("function_text_de"), o.get("name"), (o.get("module") or {}).get("label")]
+    for v in o.get("variants", []):
+        fields += [v.get("text"), v.get("text_de"), v.get("function_text")]
+    return (o.get("number"),) + _module_cols(o) + (_haystack(fields), _pack(o))
+
+
+class _RowList:
+    """Where build_record puts parameters and com objects by default: kept as
+    dicts, handed out in index order."""
+
+    def __init__(self):
+        self.parameters, self.comobjects = [], []
+
+    def add(self, kind, o):
+        (self.parameters if kind == "parameter" else self.comobjects).append(o)
+
+    def ordered(self):
+        p = sorted(enumerate(self.parameters), key=lambda x: _param_order(x[1], x[0]))
+        c = sorted(enumerate(self.comobjects), key=lambda x: _comobject_order(x[1], x[0]))
+        return [o for _, o in p], [o for _, o in c]
+
+
+def _layout_term(t):
+    return int.from_bytes(hashlib.sha256(repr(t).encode("utf-8")).digest()[:16], "big")
+
+
+class _RowSink:
+    """Parameters and com objects of one program as index rows, made while
+    build_record produces them.  As dicts, a program with half a million
+    parameters took 2.3 GB; as rows with compressed bodies a fraction.
+
+    It also sums up the program's layout: where each parameter is stored and
+    how big it is, each com object's number with the sizes and flags of its
+    variants.  Two programs with the same ApplicationId and the same layout
+    read and decode a device alike (one product file may carry a program
+    converted from ETS3, another the same program in ETS4 form)."""
+
+    def __init__(self):
+        self.parameters, self.comobjects = [], []
+        self.max_nbytes = 1
+        self.layout = 0                     # a sum: the order of the rows does not count
+
+    def add(self, kind, o):
+        if kind == "parameter":
+            row = _param_row(o)
+            if row[5]:
+                self.max_nbytes = max(self.max_nbytes, row[5])
+            self.parameters.append((_param_order(o, len(self.parameters)), row))
+            if o.get("storage"):
+                pr = o.get("property") or {}
+                self.layout += _layout_term((
+                    "p", o["storage"], o.get("segment"), o.get("address"), o.get("offset"),
+                    o.get("bit_offset"), o.get("size_bits"), pr.get("object_index"),
+                    pr.get("object_type"), pr.get("pid"), pr.get("offset"), pr.get("bit_offset"),
+                    pr.get("occurrence") or 0))
+        else:
+            self.comobjects.append((_comobject_order(o, len(self.comobjects)),
+                                    _comobject_row(o)))
+            self.layout += _layout_term((
+                "c", o.get("number"), o.get("size_bits"),
+                tuple(sorted({(v.get("size_bits") or 0, v.get("flags") or "")
+                              for v in o.get("variants", [])}))))
+
+    def fingerprint(self, byte_order):
+        return hashlib.sha256(("%x|%s" % (self.layout % (1 << 128), byte_order)).encode(
+            "ascii")).hexdigest()[:32]
+
+    def ordered(self):
+        self.parameters.sort(key=lambda x: x[0])
+        self.comobjects.sort(key=lambda x: x[0])
+        return [r for _, r in self.parameters], [r for _, r in self.comobjects]
 
 
 # ---------------------------------------------------------------------------
@@ -1992,12 +2126,24 @@ class _HashingReader:
 
 
 # ---------------------------------------------------------------------------
-# index maintenance: product files -> application records
+# index database: product files -> application programs
 #
-# Every application record knows the product files ("sources") it was found
-# in.  A file that disappears or changes takes its applications with it unless
-# another file still provides them.  All writes go through _IngestLock and are
-# atomic, so a reader always sees a complete index.
+# One SQLite file in the data directory, index.sqlite, holds what was
+# distilled.  Per program: a header (the record without parameters, com
+# objects and types), a list entry, the product files it was found in
+# ("sources"), its types, and its parameters and com objects as rows.  A
+# program's rows are one contiguous id range in index order, so a question
+# reads only that program's rows and only the narrow columns it filters on;
+# bodies (compressed JSON) are read for the rows of one reply.  Up to 0.5 the
+# index was one JSON file per program, and a program with half a million
+# parameters took 8.7 s to load before its first answer.
+#
+# Programs are keyed by their full id: two programs may report the same
+# ApplicationId (manufacturer, number, version), and both are kept.  A file
+# that disappears or changes takes its programs with it unless another file
+# still provides them.  Writers hold _IngestLock; readers never wait for a
+# writer (write-ahead log).  The data directory belongs on a local disk:
+# SQLite's locking does not work over network file systems.
 # ---------------------------------------------------------------------------
 
 class _IngestLock:
@@ -2049,7 +2195,9 @@ def _index_entry(rec):
          "application_version": rec["application_version"], "mask": rec["mask"].get("id"),
          "order_numbers": [p["order_number"] for p in rec["products"] if p.get("order_number")],
          "product_texts": [p["text"] for p in rec["products"] if p.get("text")],
-         "comobjects": rec["counts"]["comobjects"], "parameters": rec["counts"]["parameters"]}
+         "comobjects": rec["counts"]["comobjects"], "parameters": rec["counts"]["parameters"],
+         "converted": bool(rec.get("converted_from_pre_ets4")),
+         "product_count": len(rec["products"])}
     om = rec.get("original_manufacturer")
     if om:
         e["original_manufacturer"] = om.get("name")
@@ -2057,116 +2205,240 @@ def _index_entry(rec):
     return e
 
 
-def _build_index(apps):
-    aliases = {}
-    for app_id, e in sorted(apps.items()):
-        for al in e.get("aliases", []):
-            if al not in apps:
-                aliases.setdefault(al, app_id)
-    return {"schema": SCHEMA_VERSION, "generated": _utc_now(), "apps": apps, "aliases": aliases}
+_DB_SCHEMA = (
+    "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "CREATE TABLE files(rel TEXT PRIMARY KEY, sha256 TEXT, size INTEGER, mtime_ns INTEGER, "
+    "status TEXT NOT NULL, info TEXT NOT NULL, reingest INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE programs(pk INTEGER PRIMARY KEY, full_id TEXT NOT NULL UNIQUE COLLATE NOCASE, "
+    "app_id TEXT NOT NULL, written_by TEXT NOT NULL, p_lo INTEGER, p_hi INTEGER, "
+    "c_lo INTEGER, c_hi INTEGER, max_nbytes INTEGER NOT NULL, layout TEXT NOT NULL, "
+    "header BLOB NOT NULL, entry TEXT NOT NULL)",
+    "CREATE INDEX programs_app ON programs(app_id)",
+    "CREATE TABLE sources(pk INTEGER NOT NULL, rel TEXT NOT NULL, PRIMARY KEY(pk, rel)) "
+    "WITHOUT ROWID",
+    "CREATE INDEX sources_rel ON sources(rel)",
+    "CREATE TABLE aliases(alias TEXT NOT NULL, pk INTEGER NOT NULL, PRIMARY KEY(alias, pk)) "
+    "WITHOUT ROWID",
+    "CREATE TABLE types(pk INTEGER NOT NULL, id TEXT NOT NULL, body BLOB NOT NULL, "
+    "PRIMARY KEY(pk, id))",
+    "CREATE TABLE params(id INTEGER PRIMARY KEY, pk INTEGER NOT NULL, storage TEXT, "
+    "segment TEXT, address INTEGER, seg_offset INTEGER, size_bits INTEGER, nbytes INTEGER, "
+    "module_id TEXT, module_label TEXT, search TEXT NOT NULL)",
+    "CREATE INDEX params_address ON params(pk, address) WHERE address IS NOT NULL",
+    "CREATE INDEX params_segment ON params(pk, segment, seg_offset) WHERE segment IS NOT NULL",
+    "CREATE TABLE param_bodies(id INTEGER PRIMARY KEY, body BLOB NOT NULL)",
+    "CREATE TABLE comobjects(id INTEGER PRIMARY KEY, pk INTEGER NOT NULL, number INTEGER, "
+    "module_id TEXT, module_label TEXT, search TEXT NOT NULL)",
+    "CREATE INDEX comobjects_number ON comobjects(pk, number)",
+    "CREATE TABLE comobject_bodies(id INTEGER PRIMARY KEY, body BLOB NOT NULL)",
+)
+_ROW_COLUMNS = {
+    "params": ("storage", "segment", "address", "seg_offset", "size_bits", "nbytes",
+               "module_id", "module_label", "search"),
+    "comobjects": ("number", "module_id", "module_label", "search"),
+}
+_BODIES = {"params": "param_bodies", "comobjects": "comobject_bodies"}
+LEGACY_INDEX = ("index.json", "files.json", "master.json", "apps")    # the JSON index of 0.5
 
 
-def _empty_index():
-    return {"schema": SCHEMA_VERSION, "apps": {}, "aliases": {}}
+def _db_path(data_dir):
+    return os.path.join(data_dir, DB_NAME)
 
 
-def _empty_files():
-    return {"schema": SCHEMA_VERSION, "files": {}}
-
-
-def _paths(data_dir):
-    return {"apps": os.path.join(data_dir, "apps"), "tmp": os.path.join(data_dir, "tmp"),
-            "index": os.path.join(data_dir, "index.json"),
-            "files": os.path.join(data_dir, "files.json"),
-            "master": os.path.join(data_dir, "master.json")}
-
-
-def _drop_source(apps, source, app_ids):
-    """Remove `source` from these index entries.  Returns the applications
-    left without any source (to delete) and the other sources whose files
-    must be read again because the dropped file had written the record."""
-    removed, stale = [], set()
-    for a in sorted(app_ids):
-        e = apps.get(a)
-        if e is None:
-            continue
-        rest = [s for s in e.get("sources", []) if s != source]
-        if not rest:
-            del apps[a]
-            removed.append(a)
-        else:
-            e["sources"] = rest
-            if e.get("written_by") == source:
-                stale.add(rest[0])
-    return removed, sorted(stale)
-
-
-def _write_index(data_dir, apps, removed=()):
-    p = _paths(data_dir)
-    atomic_write_json(p["index"], _build_index(apps))
-    for a in removed:                      # only after the index no longer points there
-        try:
-            os.remove(os.path.join(p["apps"], a + ".json"))
-        except FileNotFoundError:
-            pass
-
-
-def _reset_stale_index_locked(data_dir, log=None):
-    """An index written in another record format (SCHEMA_VERSION) is
-    discarded, so that the sync rebuilds it from the product files.  Returns
-    the old format, None when the index is current or does not exist yet."""
-    p = _paths(data_dir)
-    found = [d.get("schema") for d in (_load_json(p["index"]), _load_json(p["files"]))
-             if d is not None]
-    stale = [v for v in found if v != SCHEMA_VERSION]
-    if not stale:
-        return None
-    old = stale[0] if stale[0] is not None else "unknown"
-    atomic_write_json(p["index"], _build_index({}))     # nothing points at the records now
+def _open_writer(data_dir, log=None):
+    """The index database for writing, the caller holding _IngestLock.  It is
+    created when missing and emptied when it is in another format (the JSON
+    index of 0.5 is removed then), so that the sync rebuilds it from the
+    product files.  Returns (connection, the old format or None)."""
+    os.makedirs(data_dir, exist_ok=True)
+    con = sqlite3.connect(_db_path(data_dir), timeout=60, isolation_level=None)
     try:
-        names = os.listdir(p["apps"])
-    except FileNotFoundError:
-        names = []
-    for fn in names:
-        if fn.endswith(".json"):
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA journal_size_limit=%d" % (64 << 20))
+        old = _ensure_schema_locked(con, data_dir, log)
+    except BaseException:
+        con.close()
+        raise
+    return con, old
+
+
+def _ensure_schema_locked(con, data_dir, log=None):
+    version = con.execute("PRAGMA user_version").fetchone()[0]
+    legacy = [n for n in LEGACY_INDEX if os.path.exists(os.path.join(data_dir, n))]
+    if version == SCHEMA_VERSION and not legacy:
+        return None
+    tables = [r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite%'")]
+    old = None
+    if legacy:
+        old = (_load_json(os.path.join(data_dir, "index.json")) or {}).get("schema") or "unknown"
+    elif tables:
+        old = version or "unknown"
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        for t in tables:
+            con.execute('DROP TABLE "%s"' % t)
+        for stmt in _DB_SCHEMA:
+            con.execute(stmt)
+        con.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    if tables:
+        con.execute("VACUUM")               # give the old rows' space back
+    for n in legacy:
+        full = os.path.join(data_dir, n)
+        if os.path.isdir(full):
+            shutil.rmtree(full, ignore_errors=True)
+        else:
             try:
-                os.remove(os.path.join(p["apps"], fn))
+                os.remove(full)
             except FileNotFoundError:
                 pass
-    atomic_write_json(p["files"], _empty_files())
-    if log:
+    if old is not None and log:
         log("%s index format %s, this version writes %s: rebuilding the index from the "
             "product files" % (_utc_now(), old, SCHEMA_VERSION))
     return old
 
 
-def _remove_source_locked(data_dir, source):
-    p = _paths(data_dir)
-    index = _load_json(p["index"]) or _empty_index()
-    apps = index.get("apps", {})
-    affected = [a for a, e in apps.items() if source in e.get("sources", [])]
-    if not affected:
-        return [], []
-    removed, stale = _drop_source(apps, source, affected)
-    _write_index(data_dir, apps, removed)
+def _touch_generation(con):
+    """Readers cache the program list until this number changes."""
+    con.execute("INSERT INTO meta(key, value) VALUES ('generation', '1') ON CONFLICT(key) "
+                "DO UPDATE SET value = CAST(value AS INTEGER) + 1")
+
+
+def _delete_program_rows_locked(con, pk):
+    """A program's rows, types and aliases; the program itself stays."""
+    r = con.execute("SELECT p_lo, p_hi, c_lo, c_hi FROM programs WHERE pk = ?", (pk,)).fetchone()
+    if r is None:
+        return
+    for table, lo, hi in (("params", r[0], r[1]), ("comobjects", r[2], r[3])):
+        if lo is not None:
+            con.execute("DELETE FROM %s WHERE id BETWEEN ? AND ?" % table, (lo, hi))
+            con.execute("DELETE FROM %s WHERE id BETWEEN ? AND ?" % _BODIES[table], (lo, hi))
+    con.execute("DELETE FROM types WHERE pk = ?", (pk,))
+    con.execute("DELETE FROM aliases WHERE pk = ?", (pk,))
+
+
+def _insert_rows_locked(con, table, pk, rows):
+    """A program's rows get consecutive ids above every id in use."""
+    if not rows:
+        return None, None
+    lo = con.execute("SELECT IFNULL(MAX(id), 0) + 1 FROM %s" % table).fetchone()[0]
+    cols = _ROW_COLUMNS[table]
+    con.executemany("INSERT INTO %s(id, pk, %s) VALUES (?, ?%s)" % (
+        table, ", ".join(cols), ", ?" * len(cols)),
+        ((lo + i, pk) + r[:-1] for i, r in enumerate(rows)))
+    con.executemany("INSERT INTO %s(id, body) VALUES (?, ?)" % _BODIES[table],
+                    ((lo + i, r[-1]) for i, r in enumerate(rows)))
+    return lo, lo + len(rows) - 1
+
+
+def _store_program_locked(con, rec, sink, source):
+    """Write one distilled program; an earlier one with the same full id is
+    replaced and keeps its other sources.  Returns (pk, it existed before)."""
+    params, cos = sink.ordered()
+    header = {k: v for k, v in rec.items() if k not in ("parameters", "comobjects", "types")}
+    vals = (rec["id"], rec["app_id"], source, sink.max_nbytes,
+            sink.fingerprint(rec.get("byte_order", {}).get("used")), _pack(header),
+            _dumps(_index_entry(rec)))
+    old = con.execute("SELECT pk FROM programs WHERE full_id = ?", (rec["id"],)).fetchone()
+    if old:
+        pk = old[0]
+        _delete_program_rows_locked(con, pk)
+        con.execute("UPDATE programs SET full_id = ?, app_id = ?, written_by = ?, max_nbytes = ?, "
+                    "layout = ?, header = ?, entry = ? WHERE pk = ?", vals + (pk,))
+    else:
+        pk = con.execute("INSERT INTO programs(full_id, app_id, written_by, max_nbytes, layout, "
+                         "header, entry) VALUES (?, ?, ?, ?, ?, ?, ?)", vals).lastrowid
+    p_lo, p_hi = _insert_rows_locked(con, "params", pk, params)
+    c_lo, c_hi = _insert_rows_locked(con, "comobjects", pk, cos)
+    con.execute("UPDATE programs SET p_lo = ?, p_hi = ?, c_lo = ?, c_hi = ? WHERE pk = ?",
+                (p_lo, p_hi, c_lo, c_hi, pk))
+    con.executemany("INSERT INTO types(pk, id, body) VALUES (?, ?, ?)",
+                    ((pk, tid, _pack(t)) for tid, t in rec.get("types", {}).items()))
+    con.executemany("INSERT OR IGNORE INTO aliases(alias, pk) VALUES (?, ?)",
+                    ((a, pk) for a in rec.get("aliases", [])))
+    con.execute("INSERT OR IGNORE INTO sources(pk, rel) VALUES (?, ?)", (pk, source))
+    return pk, bool(old)
+
+
+def index_record(data_dir, rec, source="record"):
+    """Write one distilled record (a dict as build_record returns it without
+    `rows`) to the index: for tests and tools that build records themselves."""
+    sink = _RowSink()
+    for p in rec.get("parameters", []):
+        sink.add("parameter", p)
+    for c in rec.get("comobjects", []):
+        sink.add("comobject", c)
+    with _IngestLock(data_dir):
+        con, _ = _open_writer(data_dir)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                pk, _ = _store_program_locked(con, rec, sink, source)
+                _touch_generation(con)
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+        finally:
+            con.close()
+    return pk
+
+
+def _drop_source_locked(con, source, pks):
+    """Remove `source` from these programs.  Returns the app ids of the
+    programs left without any source (deleted) and the other sources whose
+    files must be read again because the dropped file had written them."""
+    removed, stale = set(), set()
+    for pk in sorted(pks):
+        row = con.execute("SELECT app_id, written_by FROM programs WHERE pk = ?", (pk,)).fetchone()
+        con.execute("DELETE FROM sources WHERE pk = ? AND rel = ?", (pk, source))
+        if row is None:
+            continue
+        rest = sorted(r[0] for r in con.execute("SELECT rel FROM sources WHERE pk = ?", (pk,)))
+        if not rest:
+            _delete_program_rows_locked(con, pk)
+            con.execute("DELETE FROM programs WHERE pk = ?", (pk,))
+            removed.add(row[0])
+        elif row[1] == source:
+            stale.add(rest[0])
+    return sorted(removed), sorted(stale)
+
+
+def _remove_source_locked(con, source):
+    """Product file `source` no longer provides anything."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        pks = [r[0] for r in con.execute("SELECT pk FROM sources WHERE rel = ?", (source,))]
+        removed, stale = _drop_source_locked(con, source, pks)
+        if pks:
+            _touch_generation(con)
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
     return removed, stale
 
 
-def _ingest_locked(path, data_dir, source, label=None, log=None):
+def _ingest_locked(con, path, data_dir, source, label=None, log=None):
     """Distill every application program in `path` and record it as coming
-    from product file `source`.  Applications `source` provided before but no
-    longer contains lose it; those left without any source are removed.
-    Raises IngestError when nothing usable is inside."""
+    from product file `source`.  Programs `source` provided before but no
+    longer contains lose it; those left without any source are removed.  Each
+    program is committed on its own, so a manufacturer's whole database never
+    sits in the write-ahead log at once.  Raises IngestError when nothing
+    usable is inside."""
     t0 = time.monotonic()
-    p = _paths(data_dir)
-    for d in (data_dir, p["apps"], p["tmp"]):
-        os.makedirs(d, exist_ok=True)
-    index = _load_json(p["index"]) or _empty_index()
-    apps = index.get("apps", {})
-    before = set(apps)
-    master = _load_json(p["master"]) or {"manufacturers": {}, "masks": {}}
+    tmp = os.path.join(data_dir, "tmp")
+    os.makedirs(tmp, exist_ok=True)
+    row = con.execute("SELECT value FROM meta WHERE key = 'master'").fetchone()
+    master = json.loads(row[0]) if row else {"manufacturers": {}, "masks": {}}
     warnings, written, per_app, product_ids = [], {}, [], set()
-    with SourceSet(path, p["tmp"], label=label or source) as src:
+    fresh, pairs = set(), set()
+    with SourceSet(path, tmp, label=label or source) as src:
         warnings.extend(src.warnings)
         kinds = collections.Counter(m.kind for m in src.members)
         if not kinds.get("app"):
@@ -2228,31 +2500,55 @@ def _ingest_locked(path, data_dir, source, label=None, log=None):
                 continue
             seen_xml.add(digest)
             for raw in raws:
+                sink = _RowSink()
                 try:
                     rec = build_record(raw, langs, master, hw,
                                        {"member": m.name, "sha256": digest,
-                                        "ingested": _utc_now()})
+                                        "ingested": _utc_now()}, rows=sink)
                 except Exception as e:      # one broken program must not stop the rest
                     warnings.append("skipped %s in %s: %s: %s" % (
                         raw.full_id, m.name, type(e).__name__, e))
                     continue
-                app_id = rec["app_id"]
-                if app_id in written:
-                    warnings.append("%s defined twice with different content (%s, %s); the "
-                                    "later one wins" % (app_id, written[app_id]["id"], rec["id"]))
-                old_entry = apps.get(app_id)
-                if not rec["products"] and not kinds.get("hardware") and old_entry:
-                    old = _load_json(os.path.join(p["apps"], app_id + ".json"))
-                    if old and old.get("products"):
-                        rec["products"] = old["products"]
-                atomic_write_json(os.path.join(p["apps"], app_id + ".json"), rec)
-                entry = _index_entry(rec)
-                entry["sources"] = sorted(set((old_entry or {}).get("sources", [])) | {source})
-                entry["written_by"] = source
-                written[app_id] = entry
+                app_id, full_id = rec["app_id"], rec["id"]
+                key = full_id.upper()
+                if key in written:
+                    warnings.append("%s defined twice with different content; the later one "
+                                    "wins" % full_id)
+                old = con.execute("SELECT header FROM programs WHERE full_id = ?",
+                                  (full_id,)).fetchone()
+                if not rec["products"] and not kinds.get("hardware") and old:
+                    prev = _unpack(old[0])
+                    if prev.get("products"):
+                        rec["products"] = prev["products"]
+                # Two programs may report the same ApplicationId.  Where their
+                # layouts differ, a device cannot tell them apart, only the
+                # product it was sold as can.
+                layout = sink.fingerprint(rec["byte_order"].get("used"))
+                twins = [r[0] for r in con.execute(
+                    "SELECT full_id FROM programs WHERE app_id = ? AND full_id != ? AND "
+                    "layout != ? ORDER BY full_id", (app_id, full_id, layout))
+                    if frozenset((r[0].upper(), key)) not in pairs]
+                if twins:
+                    pairs.update(frozenset((t.upper(), key)) for t in twins)
+                    warnings.append("%s and %s report the same ApplicationId %s with different "
+                                    "memory layouts or com objects: both are kept, the product "
+                                    "installed decides which one a device runs"
+                                    % (full_id, ", ".join(twins[:3]), app_id))
+                con.execute("BEGIN IMMEDIATE")
+                try:
+                    pk, existed = _store_program_locked(con, rec, sink, source)
+                    _touch_generation(con)
+                    con.execute("COMMIT")
+                except BaseException:
+                    con.execute("ROLLBACK")
+                    raise
+                del sink
+                if not existed:
+                    fresh.add(app_id)
+                written[key] = (pk, app_id)
                 product_ids.update(pr["order_number"] for pr in rec["products"])
                 c = rec["counts"]
-                pa = {"app_id": app_id, "name": rec["name"],
+                pa = {"app_id": app_id, "id": full_id, "name": rec["name"],
                       "products": len(rec["products"]),
                       "comobjects": c["comobjects"],
                       "comobject_refs": c["comobject_refs"],
@@ -2273,19 +2569,27 @@ def _ingest_locked(path, data_dir, source, label=None, log=None):
                         app_id, ", ".join("%s=%d" % kv for kv in c["module_unsupported"].items())))
     if not written:
         raise IngestError("no application program could be distilled from %s" % source)
-    previous = {a for a, e in apps.items() if source in e.get("sources", [])}
-    apps.update(written)
-    removed, stale = _drop_source(apps, source, previous - set(written))
-    atomic_write_json(p["master"], master)
-    _write_index(data_dir, apps, removed)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        previous = {r[0] for r in con.execute("SELECT pk FROM sources WHERE rel = ?", (source,))}
+        removed, stale = _drop_source_locked(con, source,
+                                             previous - {pk for pk, _ in written.values()})
+        con.execute("INSERT INTO meta(key, value) VALUES ('master', ?) ON CONFLICT(key) "
+                    "DO UPDATE SET value = excluded.value", (_dumps(master),))
+        _touch_generation(con)
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
     ev = collections.Counter()
     for pa in per_app:
         ev.update(pa["byte_order"]["template_evidence"])
         ev.update(pa["byte_order"]["bit_order_evidence"])
     summary = {
-        "source": source, "apps_added": sorted(written),
-        "apps_new": sorted(a for a in written if a not in before),
-        "apps_removed": removed, "stale_sources": stale, "apps_total": len(apps),
+        "source": source, "apps_added": sorted({a for _, a in written.values()}),
+        "apps_new": sorted(fresh),
+        "apps_removed": removed, "stale_sources": stale,
+        "apps_total": con.execute("SELECT count(*) FROM programs").fetchone()[0],
         "products": len(product_ids),
         "comobjects": sum(pa["comobjects"] for pa in per_app),
         "comobject_refs": sum(pa["comobject_refs"] for pa in per_app),
@@ -2305,10 +2609,14 @@ def _ingest_locked(path, data_dir, source, label=None, log=None):
 
 def ingest_file(path, data_dir, source=None, log=None):
     """Index one product file (or an extracted directory) as `source`."""
+    data_dir = os.path.abspath(data_dir)
     with _IngestLock(data_dir):
-        _reset_stale_index_locked(data_dir, log)
-        return _ingest_locked(path, data_dir, source or os.path.basename(path.rstrip("/")),
-                              log=log)
+        con, _ = _open_writer(data_dir, log)
+        try:
+            return _ingest_locked(con, path, data_dir,
+                                  source or os.path.basename(path.rstrip("/")), log=log)
+        finally:
+            con.close()
 
 
 def _sha256_file(path):
@@ -2346,10 +2654,26 @@ def product_files(products_dir):
     return out
 
 
-def _file_record(sha, st, summary):
-    return {"sha256": sha, "size": st.st_size, "mtime_ns": st.st_mtime_ns, "status": "ok",
-            "apps": summary["apps_added"], "ingested": _utc_now(),
+def _file_info(summary):
+    return {"apps": summary["apps_added"], "ingested": _utc_now(),
             "warnings": summary["warnings"][:20]}
+
+
+def _put_file_locked(con, rel, sha, st, status, info):
+    con.execute("INSERT INTO files(rel, sha256, size, mtime_ns, status, info, reingest) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0) ON CONFLICT(rel) DO UPDATE SET "
+                "sha256 = excluded.sha256, size = excluded.size, mtime_ns = excluded.mtime_ns, "
+                "status = excluded.status, info = excluded.info, reingest = 0",
+                (rel, sha, st.st_size, st.st_mtime_ns, status, _dumps(info)))
+
+
+def _stats(db):
+    """Programs, product files and files that could not be read, from a
+    _Reader."""
+    files = db.rows("SELECT count(*), IFNULL(SUM(status = 'error'), 0) FROM files")
+    return {"apps_total": db.one("SELECT count(*) FROM programs", default=0),
+            "files_total": files[0][0] if files else 0,
+            "file_errors": files[0][1] if files else 0}
 
 
 def sync_products(products_dir, data_dir, settle=SETTLE_SECONDS, log=None):
@@ -2357,7 +2681,8 @@ def sync_products(products_dir, data_dir, settle=SETTLE_SECONDS, log=None):
     changed files, drop the applications of files that are gone.  A file is
     read only once it has not changed for `settle` seconds; one whose size
     and mtime are unchanged is not even hashed.  A missing product directory
-    (not mounted yet?) changes nothing; an empty one empties the index."""
+    (not mounted yet?) changes nothing; an empty one empties the index.  A
+    scan that finds nothing to do writes nothing."""
     t0 = time.monotonic()
     products_dir = os.path.abspath(products_dir)
     data_dir = os.path.abspath(data_dir)
@@ -2365,98 +2690,104 @@ def sync_products(products_dir, data_dir, settle=SETTLE_SECONDS, log=None):
                "pending": [], "errors": {}, "apps_removed": [], "missing": False}
     if not os.path.isdir(products_dir):
         summary["missing"] = True
-        idx = _load_json(_paths(data_dir)["index"]) or _empty_index()
-        files = (_load_json(_paths(data_dir)["files"]) or _empty_files()).get("files", {})
-        summary.update(apps_total=len(idx.get("apps", {})), files_total=len(files),
-                       seconds=round(time.monotonic() - t0, 2))
+        con = _open_reader(_db_path(data_dir))
+        try:
+            summary.update(_stats(_Reader(con)))
+        finally:
+            if con is not None:
+                con.close()
+        summary["seconds"] = round(time.monotonic() - t0, 2)
         return summary
     with _IngestLock(data_dir):
-        p = _paths(data_dir)
-        for d in (data_dir, p["apps"], p["tmp"]):
-            os.makedirs(d, exist_ok=True)
-        old_schema = _reset_stale_index_locked(data_dir, log)
-        if old_schema is not None:
-            summary["rebuilt_from_schema"] = old_schema
-        state = _load_json(p["files"]) or _empty_files()
-        files = state.setdefault("files", {})
-        present = product_files(products_dir)
-        index = _load_json(p["index"]) or _empty_index()
-        known = set(files)
-        for e in index.get("apps", {}).values():
-            known.update(e.get("sources", []))
-        force = {rel for rel, r in files.items() if r.get("reingest")}
-
-        def queue(rels):
-            for rel in rels:
-                if rel in present and rel not in force:
-                    force.add(rel)
-                    todo.append(rel)
-
-        # files that are gone
-        for rel in sorted(known - set(present)):
-            removed, stale = _remove_source_locked(data_dir, rel)
-            files.pop(rel, None)
-            summary["removed"].append(rel)
-            summary["apps_removed"] += removed
-            force.update(s for s in stale if s in present)
-            if log:
-                log("%s removed %s: %d application program(s) dropped"
-                    % (_utc_now(), rel, len(removed)))
-        # new and changed files
-        now = time.time()
-        todo = []
-        for rel, (full, st) in sorted(present.items()):
-            r = files.get(rel)
-            if (r and rel not in force and r.get("size") == st.st_size
-                    and r.get("mtime_ns") == st.st_mtime_ns):
-                summary["unchanged"] += 1
-                continue
-            if settle and now - st.st_mtime < settle:
-                summary["pending"].append(rel)
-                continue
-            todo.append(rel)
-        while todo:
-            rel = todo.pop(0)
-            full, st = present[rel]
-            try:
-                st = os.stat(full)
-                sha = _sha256_file(full)
-            except OSError as e:
-                summary["errors"][rel] = str(e)[:300]
-                continue
-            r = files.get(rel)
-            if r and r.get("sha256") == sha and rel not in force:
-                r["size"], r["mtime_ns"] = st.st_size, st.st_mtime_ns    # touched, same bytes
-                summary["unchanged"] += 1
-                continue
-            force.discard(rel)
-            try:
-                res = _ingest_locked(full, data_dir, rel, log=log)
-            except (IngestError, zipfile.BadZipFile, ET.ParseError, OSError) as e:
-                removed, stale = _remove_source_locked(data_dir, rel)
-                files[rel] = {"sha256": sha, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
-                              "status": "error", "error": str(e)[:300], "apps": [],
-                              "checked": _utc_now()}
-                summary["errors"][rel] = str(e)[:300]
-                summary["apps_removed"] += removed
-                queue(stale)
-                if log:
-                    log("%s cannot index %s: %s" % (_utc_now(), rel, str(e)[:300]))
-                continue
-            kind = "added" if not r else ("refreshed" if r.get("sha256") == sha else "changed")
-            summary[kind].append(rel)
-            files[rel] = _file_record(sha, st, res)
-            summary["apps_removed"] += res["apps_removed"]
-            queue(res["stale_sources"])
-        for rel in force:                   # stale but not readable this round
-            if rel in files:
-                files[rel]["reingest"] = True
-        atomic_write_json(p["files"], state)
-        idx = _load_json(p["index"]) or _empty_index()
-        summary["apps_total"] = len(idx.get("apps", {}))
-        summary["files_total"] = len(files)
+        con, old_schema = _open_writer(data_dir, log)
+        try:
+            if old_schema is not None:
+                summary["rebuilt_from_schema"] = old_schema
+            _sync_locked(con, products_dir, data_dir, settle, log, summary)
+            summary.update(_stats(_Reader(con)))
+        finally:
+            con.close()
     summary["seconds"] = round(time.monotonic() - t0, 2)
     return summary
+
+
+def _sync_locked(con, products_dir, data_dir, settle, log, summary):
+    files = {r[0]: {"sha256": r[1], "size": r[2], "mtime_ns": r[3], "reingest": r[4]}
+             for r in con.execute("SELECT rel, sha256, size, mtime_ns, reingest FROM files")}
+    present = product_files(products_dir)
+    known = set(files) | {r[0] for r in con.execute("SELECT DISTINCT rel FROM sources")}
+    force = {rel for rel, r in files.items() if r["reingest"]}
+    todo = []
+
+    def queue(rels):
+        for rel in rels:
+            if rel in present and rel not in force:
+                force.add(rel)
+                todo.append(rel)
+
+    # files that are gone
+    for rel in sorted(known - set(present)):
+        removed, stale = _remove_source_locked(con, rel)
+        con.execute("DELETE FROM files WHERE rel = ?", (rel,))
+        files.pop(rel, None)
+        summary["removed"].append(rel)
+        summary["apps_removed"] += removed
+        force.update(s for s in stale if s in present)
+        if log:
+            log("%s removed %s: %d application program(s) dropped"
+                % (_utc_now(), rel, len(removed)))
+    # new and changed files
+    now = time.time()
+    for rel, (full, st) in sorted(present.items()):
+        r = files.get(rel)
+        if (r and rel not in force and r["size"] == st.st_size
+                and r["mtime_ns"] == st.st_mtime_ns):
+            summary["unchanged"] += 1
+            continue
+        if settle and now - st.st_mtime < settle:
+            summary["pending"].append(rel)
+            continue
+        todo.append(rel)
+    while todo:
+        rel = todo.pop(0)
+        full, st = present[rel]
+        try:
+            st = os.stat(full)
+            sha = _sha256_file(full)
+        except OSError as e:
+            summary["errors"][rel] = str(e)[:300]
+            continue
+        r = files.get(rel)
+        if r and r["sha256"] == sha and rel not in force:
+            con.execute("UPDATE files SET size = ?, mtime_ns = ? WHERE rel = ?",
+                        (st.st_size, st.st_mtime_ns, rel))           # touched, same bytes
+            summary["unchanged"] += 1
+            continue
+        force.discard(rel)
+        try:
+            res = _ingest_locked(con, full, data_dir, rel, log=log)
+        except (IngestError, zipfile.BadZipFile, ET.ParseError, OSError) as e:
+            removed, stale = _remove_source_locked(con, rel)
+            _put_file_locked(con, rel, sha, st, "error",
+                             {"error": str(e)[:300], "apps": [], "checked": _utc_now()})
+            files[rel] = {"sha256": sha, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+                          "reingest": 0}
+            summary["errors"][rel] = str(e)[:300]
+            summary["apps_removed"] += removed
+            queue(stale)
+            if log:
+                log("%s cannot index %s: %s" % (_utc_now(), rel, str(e)[:300]))
+            continue
+        kind = "added" if not r else ("refreshed" if r["sha256"] == sha else "changed")
+        summary[kind].append(rel)
+        _put_file_locked(con, rel, sha, st, "ok", _file_info(res))
+        files[rel] = {"sha256": sha, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+                      "reingest": 0}
+        summary["apps_removed"] += res["apps_removed"]
+        queue(res["stale_sources"])
+    for rel in force:                   # stale but not readable this round
+        if rel in files and not files[rel]["reingest"]:
+            con.execute("UPDATE files SET reingest = 1 WHERE rel = ?", (rel,))
 
 
 def _upload_name(raw):
@@ -2478,40 +2809,37 @@ def store_upload(products_dir, data_dir, tmp_path, name, sha):
     with the same name is never overwritten: the new one gets a suffix.  An
     identical file that is already indexed is not stored twice."""
     products_dir = os.path.abspath(products_dir)
+    data_dir = os.path.abspath(data_dir)
     with _IngestLock(data_dir):
-        p = _paths(data_dir)
-        _reset_stale_index_locked(data_dir)     # the next scan reads the other files again
-        state = _load_json(p["files"]) or _empty_files()
-        files = state.setdefault("files", {})
-        for rel, r in sorted(files.items()):
-            if (r.get("sha256") == sha and r.get("status") == "ok"
-                    and os.path.isfile(os.path.join(products_dir, rel))):
+        con, _ = _open_writer(data_dir)     # a new format: the next scan reads the rest again
+        try:
+            for rel, info in con.execute("SELECT rel, info FROM files WHERE sha256 = ? AND "
+                                         "status = 'ok' ORDER BY rel", (sha,)).fetchall():
+                if os.path.isfile(os.path.join(products_dir, rel)):
+                    os.remove(tmp_path)
+                    return {"stored": False, "duplicate_of": rel, "file": rel,
+                            "apps_added": json.loads(info).get("apps", []), "apps_new": [],
+                            "apps_removed": [], "warnings": []}
+            stem, ext = name[:-len(name.rsplit(".", 1)[-1]) - 1], "." + name.rsplit(".", 1)[-1]
+            candidate, n, existing = name, 1, False
+            while os.path.exists(os.path.join(products_dir, candidate)):
+                if _sha256_file(os.path.join(products_dir, candidate)) == sha:
+                    existing = True             # same bytes, not indexed yet: use that file
+                    break
+                n += 1
+                candidate = "%s-%d%s" % (stem, n, ext)
+            res = _ingest_locked(con, tmp_path, data_dir, candidate, label=candidate)
+            final = os.path.join(products_dir, candidate)
+            if existing:
                 os.remove(tmp_path)
-                return {"stored": False, "duplicate_of": rel, "file": rel,
-                        "apps_added": r.get("apps", []), "apps_new": [], "apps_removed": [],
-                        "warnings": []}
-        stem, ext = name[:-len(name.rsplit(".", 1)[-1]) - 1], "." + name.rsplit(".", 1)[-1]
-        candidate, n, existing = name, 1, False
-        while os.path.exists(os.path.join(products_dir, candidate)):
-            if _sha256_file(os.path.join(products_dir, candidate)) == sha:
-                existing = True             # same bytes, not indexed yet: use that file
-                break
-            n += 1
-            candidate = "%s-%d%s" % (stem, n, ext)
-        res = _ingest_locked(tmp_path, data_dir, candidate, label=candidate)
-        final = os.path.join(products_dir, candidate)
-        if existing:
-            os.remove(tmp_path)
-        else:
-            os.replace(tmp_path, final)
-            _fsync_dir(products_dir)
-        files[candidate] = _file_record(sha, os.stat(final), res)
-        atomic_write_json(p["files"], state)
-        if res["stale_sources"]:            # cannot happen for a new name; keep it consistent
-            for rel in res["stale_sources"]:
-                if rel in files:
-                    files[rel]["reingest"] = True
-            atomic_write_json(p["files"], state)
+            else:
+                os.replace(tmp_path, final)
+                _fsync_dir(products_dir)
+            _put_file_locked(con, candidate, sha, os.stat(final), "ok", _file_info(res))
+            for rel in res["stale_sources"]:    # cannot happen for a new name; keep it consistent
+                con.execute("UPDATE files SET reingest = 1 WHERE rel = ?", (rel,))
+        finally:
+            con.close()
     out = dict(res)
     out.update({"stored": not existing, "file": candidate})
     if candidate != name:
@@ -2522,9 +2850,9 @@ def store_upload(products_dir, data_dir, tmp_path, name, sha):
 def _prepare_dirs(products_dir, data_dir):
     """Create the directories; fail with a clear message if the index cannot
     be written.  A read-only product directory is fine (uploads then fail)."""
-    p = _paths(data_dir)
+    tmp = os.path.join(data_dir, "tmp")
     try:
-        for d in (data_dir, p["apps"], p["tmp"]):
+        for d in (data_dir, tmp):
             os.makedirs(d, exist_ok=True)
         probe = os.path.join(data_dir, ".write-test-%d" % os.getpid())
         with open(probe, "wb") as f:
@@ -2542,7 +2870,7 @@ def _prepare_dirs(products_dir, data_dir):
             raise ConfigError("product directory %s does not exist and cannot be created (%s)"
                               % (products_dir, e.strerror or e))
     old = time.time() - 600
-    for d, prefix in ((products_dir, ".upload-"), (p["tmp"], "nested-")):
+    for d, prefix in ((products_dir, ".upload-"), (tmp, "nested-")):
         try:
             for fn in os.listdir(d):
                 full = os.path.join(d, fn)
@@ -2556,85 +2884,239 @@ def _prepare_dirs(products_dir, data_dir):
 # data access for the server
 # ---------------------------------------------------------------------------
 
-def _load_record(path):
-    """json.load with repeated strings shared: module instances repeat the
-    same condition and label texts thousands of times."""
-    pool = {}
+def _open_reader(path):
+    """A connection for reading, None while the index does not exist."""
+    if not os.path.exists(path):
+        return None
+    try:
+        con = sqlite3.connect("file:%s?mode=rw" % quote(path), uri=True, timeout=30,
+                              isolation_level=None, check_same_thread=False)
+        con.execute("PRAGMA query_only = 1")
+    except sqlite3.Error:
+        return None
+    return con
 
-    def hook(pairs):
-        d = {}
-        for k, v in pairs:
-            t = v.__class__
-            if t is str:
-                v = pool.setdefault(v, v)
-            elif t is list and v and v[0].__class__ is str:
-                v = [pool.setdefault(x, x) if x.__class__ is str else x for x in v]
-            d[k] = v
-        return d
 
-    with open(path, "rb") as f:
-        return json.load(f, object_pairs_hook=hook)
+class _Reader:
+    """The queries of one request, on one connection and in one read
+    transaction: a sync committing meanwhile is not seen in halves."""
+
+    def __init__(self, con):
+        self.con = con
+
+    def rows(self, sql, args=()):
+        if self.con is None:
+            return []
+        try:
+            return self.con.execute(sql, args).fetchall()
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e):       # created, not set up yet
+                return []
+            raise
+
+    def one(self, sql, args=(), default=None):
+        r = self.rows(sql, args)
+        return r[0][0] if r and r[0][0] is not None else default
+
+    def bodies(self, table, ids):
+        """The bodies of these rows, in this order."""
+        got = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            got.update(self.rows("SELECT id, body FROM %s WHERE id IN (%s)" % (
+                _BODIES[table], ",".join("?" * len(chunk))), chunk))
+        return [_unpack(got[i]) for i in ids if i in got]
+
+    def page(self, table, where, args, offset, limit):
+        """(number of rows matching, bodies of the matching rows offset ..
+        offset + limit in index order)."""
+        total = self.one("SELECT count(*) FROM %s WHERE %s" % (table, where), args, 0)
+        if offset >= total:
+            return total, []
+        ids = [r[0] for r in self.rows("SELECT id FROM %s WHERE %s ORDER BY id LIMIT ? OFFSET ?"
+                                       % (table, where), list(args) + [limit, offset])]
+        return total, self.bodies(table, ids)
+
+    def types(self, pk, ids):
+        """The types of one program with these ids."""
+        ids = sorted({i for i in ids if i})
+        out = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for tid, body in self.rows("SELECT id, body FROM types WHERE pk = ? AND id IN (%s)"
+                                       % ",".join("?" * len(chunk)), [pk] + chunk):
+                out[tid] = _unpack(body)
+        return out
+
+    def programs(self, app_id, full_id=None):
+        """The program with this full id; without one, the programs reporting
+        this app id (or, if none does, having it as an OEM alias)."""
+        cols = "pk, full_id, app_id, p_lo, p_hi, c_lo, c_hi, max_nbytes, layout, header"
+        if full_id:
+            rows = self.rows("SELECT %s FROM programs WHERE full_id = ?" % cols, (full_id,))
+        else:
+            rows = self.rows("SELECT %s FROM programs WHERE app_id = ? ORDER BY full_id" % cols,
+                             (app_id,))
+            if not rows:
+                rows = self.rows("SELECT %s FROM programs WHERE pk IN (SELECT pk FROM aliases "
+                                 "WHERE alias = ?) ORDER BY full_id" % cols, (app_id,))
+        return [_Program(self, r) for r in rows]
+
+
+class _Program:
+    """An application program as the tools see it: its header (the record
+    without parameters, com objects and types), its product files, and where
+    its rows are."""
+
+    def __init__(self, db, row):
+        (self.pk, self.full_id, self.app_id, self.p_lo, self.p_hi, self.c_lo, self.c_hi,
+         self.max_nbytes, self.layout, header) = row
+        self.header = _unpack(header)
+        self.equivalent = []
+        self.sources = [r[0] for r in db.rows("SELECT rel FROM sources WHERE pk = ? ORDER BY rel",
+                                              (self.pk,))]
+
+
+def _preference(converted, products, full_id):
+    """Order among programs of one ApplicationId and one layout: native ETS4
+    data before data converted from ETS3, more products first, then by id."""
+    return (bool(converted), -(products or 0), full_id)
+
+
+def resolve_program(db, app_id, full_id=None):
+    """The program an app id (or full id) stands for: (program, []).  Several
+    programs of one layout are one answer, the preferred one, with the others
+    in program.equivalent.  (None, programs) when programs of different
+    layouts report the app id; (None, []) when none does."""
+    progs = db.programs(app_id, full_id)
+    if not progs:
+        return None, []
+    if len({p.layout for p in progs}) > 1:
+        return None, progs
+    prog = min(progs, key=lambda p: _preference(p.header.get("converted_from_pre_ets4"),
+                                                len(p.header.get("products") or []), p.full_id))
+    prog.equivalent = [r[0] for r in db.rows(
+        "SELECT full_id FROM programs WHERE app_id = ? AND layout = ? AND pk != ? "
+        "ORDER BY full_id", (prog.app_id, prog.layout, prog.pk))]
+    return prog, []
 
 
 class Store:
+    """Read access to the index for the server: pooled connections, and the
+    program list cached until the index changes."""
+
     def __init__(self, data_dir):
         self.data_dir = os.path.abspath(data_dir)
+        self.path = _db_path(self.data_dir)
         self._lock = threading.Lock()
-        self._index = _empty_index()
-        self._sig = None
-        self._cache = collections.OrderedDict()   # app_id -> (record, file size)
-        self._cache_bytes = 0
+        self._pool = []
+        self._entries = (None, [])
 
-    def _index_path(self):
-        return os.path.join(self.data_dir, "index.json")
-
-    def index(self):
-        try:
-            st = os.stat(self._index_path())
-            sig = (st.st_ino, st.st_mtime_ns, st.st_size)
-        except FileNotFoundError:
-            sig = None
+    @contextlib.contextmanager
+    def reader(self):
         with self._lock:
-            if sig != self._sig:
-                idx = _load_json(self._index_path()) if sig else None
-                self._index = idx or _empty_index()
-                self._sig = sig
-                self._cache.clear()
-                self._cache_bytes = 0
-            return self._index
+            con = self._pool.pop() if self._pool else None
+        if con is None:
+            con = _open_reader(self.path)
+        if con is not None:
+            con.execute("BEGIN")
+        try:
+            yield _Reader(con)
+        finally:
+            if con is not None:
+                try:
+                    con.execute("COMMIT")
+                except sqlite3.Error:
+                    con.close()
+                    con = None
+            if con is not None:
+                with self._lock:
+                    if len(self._pool) < 8:
+                        self._pool.append(con)
+                        con = None
+                if con is not None:
+                    con.close()
+
+    def close(self):
+        with self._lock:
+            pool, self._pool = self._pool, []
+        for con in pool:
+            con.close()
+
+    def entries(self):
+        """List entries in app_id order, each with its pk and product files
+        ("sources", "written_by" the one read last): one per app id whose
+        programs share a layout ("equivalent" counts the others), every
+        program with "shared_app_id" where layouts differ.  Read again only
+        after the index changed."""
+        with self.reader() as db:
+            gen = db.one("SELECT value FROM meta WHERE key = 'generation'", default="0")
+            with self._lock:
+                if self._entries[0] == gen:
+                    return self._entries[1]
+            out = []
+            for pk, written_by, layout, entry in db.rows(
+                    "SELECT pk, written_by, layout, entry FROM programs ORDER BY app_id, full_id"):
+                e = json.loads(entry)
+                e["pk"], e["written_by"], e["layout"] = pk, written_by, layout
+                out.append(e)
+            srcs = collections.defaultdict(list)
+            for pk, rel in db.rows("SELECT pk, rel FROM sources ORDER BY rel"):
+                srcs[pk].append(rel)
+        # One entry per app id where its programs share a layout (the one the
+        # tools answer from); where layouts differ, every program with its id.
+        groups = collections.OrderedDict()
+        for e in out:
+            e["sources"] = srcs.get(e["pk"], [])
+            groups.setdefault(e["app_id"], []).append(e)
+        listed = []
+        for es in groups.values():
+            if len({e["layout"] for e in es}) == 1:
+                best = min(es, key=lambda e: _preference(e.get("converted"),
+                                                         e.get("product_count"), e["id"]))
+                best["equivalent"] = len(es) - 1
+                listed.append(best)
+            else:
+                for e in es:
+                    e["shared_app_id"] = True
+                    listed.append(e)
+        with self._lock:
+            self._entries = (gen, listed)
+        return listed
+
+    def stats(self):
+        with self.reader() as db:
+            return _stats(db)
 
     def files(self):
-        return (_load_json(os.path.join(self.data_dir, "files.json")) or _empty_files()).get(
-            "files", {})
+        """The product files known to the index: rel -> record."""
+        out = {}
+        with self.reader() as db:
+            for rel, sha, size, mtime, status, info, reingest in db.rows(
+                    "SELECT rel, sha256, size, mtime_ns, status, info, reingest FROM files"):
+                r = dict(json.loads(info), sha256=sha, size=size, mtime_ns=mtime, status=status)
+                if reingest:
+                    r["reingest"] = True
+                out[rel] = r
+        return out
 
-    def resolve(self, app_id):
-        idx = self.index()
-        if app_id in idx.get("apps", {}):
-            return app_id
-        return idx.get("aliases", {}).get(app_id)
+    def app_ids(self):
+        return sorted({e["app_id"] for e in self.entries()})
 
     def app(self, app_id):
-        real = self.resolve(app_id)
-        if real is None:
-            return None
-        with self._lock:
-            hit = self._cache.get(real)
-            if hit is not None:
-                self._cache.move_to_end(real)
-                return hit[0]
-        path = os.path.join(self.data_dir, "apps", real + ".json")
-        try:
-            size = os.path.getsize(path)
-            rec = _load_record(path)
-        except FileNotFoundError:
-            return None
-        with self._lock:
-            if real not in self._cache:
-                self._cache[real] = (rec, size)
-                self._cache_bytes += size
-            while self._cache_bytes > CACHE_BYTES and len(self._cache) > 1:
-                _, (_, sz) = self._cache.popitem(last=False)
-                self._cache_bytes -= sz
+        """The whole record of one program as one dict (tests, export), by app
+        id or full id, resolved as the tools resolve it; None when it is
+        unknown or ambiguous."""
+        with self.reader() as db:
+            prog, _ = resolve_program(db, normalize_app_id(app_id), normalize_program_id(app_id))
+            if prog is None:
+                return None
+            rec = dict(prog.header)
+            rec["types"] = {tid: _unpack(body) for tid, body in db.rows(
+                "SELECT id, body FROM types WHERE pk = ? ORDER BY rowid", (prog.pk,))}
+            for key, table, lo, hi in (("comobjects", "comobjects", prog.c_lo, prog.c_hi),
+                                       ("parameters", "params", prog.p_lo, prog.p_hi)):
+                rec[key] = db.bodies(table, list(range(lo, hi + 1))) if lo is not None else []
         return rec
 
 
@@ -2713,21 +3195,6 @@ def _words_match(query, fields):
     return all(w in hay for w in query.lower().split())
 
 
-def _module_match(e, wanted):
-    """Module instance by label ('Channel B') or id: 'MD-1_M-2' is that
-    instance (with its repetitions), 'MD-1' every instance of definition MD-1."""
-    m = e.get("module")
-    if not m:
-        return False
-    w = wanted.strip().lower()
-    iid = (m.get("id") or "").lower()
-    return w == (m.get("label") or "").lower() or iid == w or iid.startswith(w + "_")
-
-
-def _module_label(e):
-    return (e.get("module") or {}).get("label")
-
-
 def _segment_arg(rec, args):
     """The 'segment' argument as the program's segment id, None if absent."""
     seg = _arg_str(args, "segment")
@@ -2749,39 +3216,49 @@ def _relative_hint(rec):
             "offset within it as address" % " / ".join(rel[:4]))
 
 
-def _place(p, segment):
-    """Address of a memory parameter, or its offset when `segment` is given."""
-    if segment is None:
-        return p.get("address")
-    if p.get("storage") == "memory" and p.get("segment") == segment:
-        return p.get("offset")
-    return None
-
-
-def need_app(store, args):
+def need_app(db, args):
+    """The program `app_id` names: the ApplicationId a device reports, or a
+    program's full id where several programs report the same ApplicationId."""
     raw = args.get("app_id")
     app_id = normalize_app_id(raw)
     if app_id is None:
         raise ToolError("invalid_argument",
                         "app_id must be 10 hex digits: manufacturer (4), application number (4), "
                         "version (2), e.g. FFF0123456", app_id=raw)
-    rec = store.app(app_id)
-    if rec is not None:
-        return rec
-    idx = store.index()
+    full_id = normalize_program_id(raw)
+    prog, progs = resolve_program(db, app_id, full_id)
+    if prog is not None:
+        return prog
+    if progs:
+        # A device reports the same ApplicationId for each of them, and their
+        # layouts differ: picking one would answer with the memory layout of a
+        # program the device may not run.
+        raise ToolError(
+            "ambiguous_app_id",
+            "%d application programs with different layouts report %s: a device cannot tell "
+            "them apart, the product it was sold as can" % (len(progs), app_id), app_id=app_id,
+            programs=[{"id": p.full_id, "name": p.header.get("name"),
+                       "order_numbers": [x.get("order_number")
+                                         for x in p.header.get("products", [])][:6],
+                       "product_files": p.sources[:2]} for p in progs[:10]],
+            hint="ask which product is installed and pass its program's id as app_id; where "
+                 "one product is listed under several programs, the installation's ETS project "
+                 "names the program loaded")
     cands = []
-    for k, e in sorted(idx.get("apps", {}).items()):
+    for k, full, entry in db.rows("SELECT app_id, full_id, entry FROM programs "
+                                  "ORDER BY app_id, full_id"):
+        e = json.loads(entry)
         ids = [k] + list(e.get("aliases", []))
         if any(i[4:8] == app_id[4:8] and (i[:4] == app_id[:4] or i[8:] == app_id[8:]) for i in ids):
-            cands.append({"app_id": k, "name": e.get("name"),
+            cands.append({"app_id": k, "id": full, "name": e.get("name"),
                           "version_hex": "%02X" % e.get("application_version", 0)})
     extra = {}
     if cands:
         extra["note"] = ("candidates are other versions of this program: objects, variants and "
                          "memory layout can differ, do not answer from them in place of the "
                          "device's own version")
-    raise ToolError("unknown_app_id", "application program %s is not ingested" % app_id,
-                    app_id=app_id, candidates=cands[:10],
+    raise ToolError("unknown_app_id", "application program %s is not ingested"
+                    % (full_id or app_id), app_id=full_id or app_id, candidates=cands[:10],
                     hint="prod-applications lists what is ingested", **extra)
 
 
@@ -2801,13 +3278,12 @@ def _mfr_match(e, wanted):
     return any(wl in n.lower() for n in names if n)
 
 
-def _page(items, offset, limit, render, header, key, budget, notes=None, max_level=3):
-    """Serialise items[offset:offset+limit]; return fewer when the reply would
-    exceed the byte budget.  Detail levels drop optional fields only when even
-    a single item does not fit, and a reply that used one says so in `detail`
-    (notes[level]) — it used to drop conditions without a word."""
-    total = len(items)
-    window = items[offset:offset + limit]
+def _page(window, total, offset, render, header, key, budget, notes=None, max_level=3):
+    """Serialise `window`, the items from `offset` on (at most one page of the
+    `total` that match); return fewer when the reply would exceed the byte
+    budget.  Detail levels drop optional fields only when even a single item
+    does not fit, and a reply that used one says so in `detail` (notes[level])
+    — it used to drop conditions without a word."""
     level_now = [0]
 
     def build(rendered, n):
@@ -2851,10 +3327,13 @@ def _fit_single(build, levels, budget):
 
 
 def _render_app_entry(e, level):
-    o = {"app_id": e["app_id"], "name": e.get("name"), "manufacturer": e.get("manufacturer"),
-         "version": e.get("application_version"),
-         "version_hex": "%02X" % (e.get("application_version") or 0), "mask": e.get("mask"),
-         "products": len(e.get("order_numbers", []))}
+    o = {"app_id": e["app_id"]}
+    if e.get("shared_app_id"):
+        o["id"] = e["id"]
+    o.update({"name": e.get("name"), "manufacturer": e.get("manufacturer"),
+              "version": e.get("application_version"),
+              "version_hex": "%02X" % (e.get("application_version") or 0), "mask": e.get("mask"),
+              "products": len(e.get("order_numbers", []))})
     if level < 2:
         o["order_numbers"] = e.get("order_numbers", [])[:6 if level == 0 else 3]
     if e.get("aliases"):
@@ -2865,30 +3344,34 @@ def _render_app_entry(e, level):
 
 
 def tool_applications(store, args, budget):
-    idx = store.index()
+    entries = store.entries()
     mfr = _arg_str(args, "manufacturer")
     query = _arg_str(args, "query")
     offset = _arg_int(args, "offset", 0, 0, 1 << 30)
     limit = _arg_int(args, "limit", 40, 1, 200)
     items = []
-    for app_id in sorted(idx.get("apps", {})):
-        e = idx["apps"][app_id]
+    for e in entries:
         if mfr and not _mfr_match(e, mfr):
             continue
-        if query and not _words_match(query, [e.get("name"), e.get("id"), app_id]
+        if query and not _words_match(query, [e.get("name"), e.get("id"), e["app_id"]]
                                       + e.get("aliases", []) + e.get("order_numbers", [])
                                       + e.get("product_texts", [])):
             continue
         items.append(e)
-    header = {"ingested": len(idx.get("apps", {}))}
-    if not idx.get("apps"):
+    window = items[offset:offset + limit]
+    header = {"ingested": store.stats()["apps_total"]}
+    if not entries:
         header["note"] = "nothing ingested yet"
-    return _page(items, offset, limit, _render_app_entry, header, "applications", budget)
+    elif any(e.get("shared_app_id") for e in window):
+        header["note"] = ("an entry with an id shares its app_id with another program: a device "
+                          "reports the same ApplicationId for both; pass the id as app_id")
+    return _page(window, len(items), offset, _render_app_entry, header, "applications", budget)
 
 
 def tool_application(store, args, budget):
-    rec = need_app(store, args)
-    entry = store.index().get("apps", {}).get(rec["app_id"], {})
+    with store.reader() as db:
+        prog = need_app(db, args)
+    rec = prog.header
     caps = [(None, None, None), (20, 40, 32), (8, 20, 16), (3, 0, 8)]
 
     def build(level):
@@ -2931,8 +3414,10 @@ def tool_application(store, args, budget):
                                "steps": steps if cap_s is None else steps[:cap_s]}
         if cap_s is not None and len(steps) > cap_s:
             o["load_procedure"]["steps_total"] = len(steps)
-        if entry.get("sources"):
-            o["product_files"] = entry["sources"][:8 if cap_p is None else 3]
+        if prog.sources:
+            o["product_files"] = prog.sources[:8 if cap_p is None else 3]
+        if prog.equivalent:
+            o["equivalent_programs"] = prog.equivalent[:8 if cap_p is None else 3]
         o["note"] = SLOT_NOTE
         return o
 
@@ -3030,17 +3515,16 @@ def _render_comobject(c, level, variants=None):
 _CO_NOTES = {1: "reduced: no text_de/name/block"}
 
 
-def _page_variants(items, offset, voff, header, budget):
+def _page_variants(c, total, offset, voff, header, budget):
     """One object whose variants do not fit into one reply, in parts: as many
-    variants as fit, each with its full conditions, and where to go on.  The
-    first part adds an overview by size/flags/text.  It replaced an emergency
-    level that cut every variant's conditions to the innermost one, after which
-    variants of the same size could no longer be told apart."""
-    total = len(items)
-    if offset >= total:
+    variants as fit, each with its full conditions, and where to go on.  `c` is
+    the object at `offset`, None past the end.  The first part adds an overview
+    by size/flags/text.  It replaced an emergency level that cut every
+    variant's conditions to the innermost one, after which variants of the
+    same size could no longer be told apart."""
+    if c is None:
         o = dict(header, total=total, offset=offset, returned=0, next_offset=None, comobjects=[])
         return _dumps(o)
-    c = items[offset]
     vs = c.get("variants", [])
     if voff >= len(vs) and vs:
         raise ToolError("invalid_argument", "variant_offset %d: object %s has %d variants"
@@ -3078,51 +3562,68 @@ def _page_variants(items, offset, voff, header, budget):
     raise ToolError("result_too_large", "a single variant does not fit into %d bytes" % budget)
 
 
+def _module_where(w, a, wanted):
+    """Module instance by label ('Channel B') or id: 'MD-1_M-2' is that
+    instance (with its repetitions), 'MD-1' every instance of definition MD-1."""
+    m = wanted.strip().lower()
+    w.append("(module_label = ? OR module_id = ? OR substr(module_id, 1, ?) = ?)")
+    a += [m, m, len(m) + 1, m + "_"]
+
+
+def _query_where(w, a, query):
+    """Every word somewhere in the row's texts, case-insensitive."""
+    for word in query.lower().split():
+        w.append("instr(search, ?) > 0")
+        a.append(word)
+
+
 def tool_comobjects(store, args, budget):
-    rec = need_app(store, args)
-    numbers = args.get("numbers")
-    if numbers is not None:
-        if isinstance(numbers, int) and not isinstance(numbers, bool):
-            numbers = [numbers]
-        if not isinstance(numbers, list) or len(numbers) > 512 or not all(
-                isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= 0xFFFF
-                for n in numbers):
-            raise ToolError("invalid_argument",
-                            "numbers must be a list of up to 512 integers 0..65535")
-    query = _arg_str(args, "query")
-    module = _arg_str(args, "module")
-    offset = _arg_int(args, "offset", 0, 0, 1 << 30)
-    limit = _arg_int(args, "limit", 40, 1, 200)
-    voff = _arg_int(args, "variant_offset", 0, 0, 1 << 30)
-    wanted = set(numbers) if numbers is not None else None
-    items = []
-    for c in rec.get("comobjects", []):
-        if wanted is not None and c["number"] not in wanted:
-            continue
-        if module and not _module_match(c, module):
-            continue
+    with store.reader() as db:
+        prog = need_app(db, args)
+        rec = prog.header
+        numbers = args.get("numbers")
+        if numbers is not None:
+            if isinstance(numbers, int) and not isinstance(numbers, bool):
+                numbers = [numbers]
+            if not isinstance(numbers, list) or len(numbers) > 512 or not all(
+                    isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= 0xFFFF
+                    for n in numbers):
+                raise ToolError("invalid_argument",
+                                "numbers must be a list of up to 512 integers 0..65535")
+        query = _arg_str(args, "query")
+        module = _arg_str(args, "module")
+        offset = _arg_int(args, "offset", 0, 0, 1 << 30)
+        limit = _arg_int(args, "limit", 40, 1, 200)
+        voff = _arg_int(args, "variant_offset", 0, 0, 1 << 30)
+        if numbers is not None:
+            wanted = sorted(set(numbers))
+            w = ["pk = ?", "number IN (%s)" % ",".join("?" * len(wanted)) if wanted else "0"]
+            a = [prog.pk] + wanted
+        else:
+            wanted = None
+            w, a = ["id BETWEEN ? AND ?"], [prog.c_lo, prog.c_hi]
+        if module:
+            _module_where(w, a, module)
         if query:
-            fields = [c.get("text"), c.get("text_de"), c.get("function_text"),
-                      c.get("function_text_de"), c.get("name"), _module_label(c)]
-            for v in c.get("variants", []):
-                fields += [v.get("text"), v.get("text_de"), v.get("function_text")]
-            if not _words_match(query, fields):
-                continue
-        items.append(c)
-    header = {"app_id": rec["app_id"], "name": rec["name"], "note": SLOT_NOTE + " " + VARIANT_NOTE}
-    if wanted is not None:
-        found = {c["number"] for c in items}
-        missing = sorted(n for n in wanted if n not in found)
-        if missing:
-            header["missing_numbers"] = missing[:64]
+            _query_where(w, a, query)
+        where = " AND ".join(w)
+        header = {"app_id": rec["app_id"], "name": rec["name"],
+                  "note": SLOT_NOTE + " " + VARIANT_NOTE}
+        if wanted is not None:
+            found = {r[0] for r in db.rows("SELECT DISTINCT number FROM comobjects WHERE "
+                                           + where, a)}
+            missing = [n for n in wanted if n not in found]
+            if missing:
+                header["missing_numbers"] = missing[:64]
+        total, window = db.page("comobjects", where, a, offset, 1 if voff else limit)
     if voff == 0:
         try:
-            return _page(items, offset, limit, _render_comobject, header, "comobjects", budget,
+            return _page(window, total, offset, _render_comobject, header, "comobjects", budget,
                          notes=_CO_NOTES, max_level=1)
         except ToolError as e:
             if e.payload.get("error") != "result_too_large":
                 raise
-    return _page_variants(items, offset, voff, header, budget)
+    return _page_variants(window[0] if window else None, total, offset, voff, header, budget)
 
 
 def _param_nbytes(p):
@@ -3247,35 +3748,48 @@ def _render_param(p, types, level, order="big"):
     return o
 
 
+def _param_where(prog, segment=None, address=None, module=None, query=None,
+                 include_virtual=False):
+    """WHERE clause and arguments for the parameters of `prog` that pass the
+    filters of prod-parameters.  An address is looked up in the address
+    index; everything else reads the program's id range."""
+    if address is not None:
+        lo = address - prog.max_nbytes + 1
+        if segment is None:
+            w = ["pk = ?", "address BETWEEN ? AND ?", "address + nbytes > ?"]
+            a = [prog.pk, lo, address, address]
+        else:
+            w = ["pk = ?", "segment = ?", "seg_offset BETWEEN ? AND ?",
+                 "seg_offset + nbytes > ?"]
+            a = [prog.pk, segment, lo, address, address]
+    else:
+        w, a = ["id BETWEEN ? AND ?"], [prog.p_lo, prog.p_hi]
+        if segment is not None:
+            w.append("segment = ?")
+            a.append(segment)
+    if not include_virtual:
+        w.append("storage IS NOT NULL")
+    if module:
+        _module_where(w, a, module)
+    if query:
+        _query_where(w, a, query)
+    return " AND ".join(w), a
+
+
 def tool_parameters(store, args, budget):
-    rec = need_app(store, args)
-    query = _arg_str(args, "query")
-    module = _arg_str(args, "module")
-    segment = _segment_arg(rec, args)
-    address = parse_address(args["address"]) if args.get("address") is not None else None
-    include_virtual = _arg_bool(args, "include_virtual", False)
-    offset = _arg_int(args, "offset", 0, 0, 1 << 30)
-    limit = _arg_int(args, "limit", 25, 1, 200)
-    items = []
-    for p in rec.get("parameters", []):
-        if not include_virtual and not p.get("storage"):
-            continue
-        if segment is not None and _place(p, segment) is None:
-            continue
-        if address is not None:
-            a = _place(p, segment)
-            if a is None or not a <= address < a + _param_nbytes(p):
-                continue
-        if module and not _module_match(p, module):
-            continue
-        if query:
-            fields = [p.get("text"), p.get("text_de"), p.get("name"), p.get("block"), p.get("id"),
-                      _module_label(p)]
-            fields += [v.get("text") for v in p.get("variants", [])]
-            if not _words_match(query, fields):
-                continue
-        items.append(p)
-    types = rec.get("types", {})
+    with store.reader() as db:
+        prog = need_app(db, args)
+        rec = prog.header
+        query = _arg_str(args, "query")
+        module = _arg_str(args, "module")
+        segment = _segment_arg(rec, args)
+        address = parse_address(args["address"]) if args.get("address") is not None else None
+        include_virtual = _arg_bool(args, "include_virtual", False)
+        offset = _arg_int(args, "offset", 0, 0, 1 << 30)
+        limit = _arg_int(args, "limit", 25, 1, 200)
+        where, a = _param_where(prog, segment, address, module, query, include_virtual)
+        total, window = db.page("params", where, a, offset, limit)
+        types = db.types(prog.pk, [p.get("type") for p in window])
     bo = rec.get("byte_order", {})
     order = bo.get("used", "big")
     header = {"app_id": rec["app_id"], "name": rec["name"],
@@ -3291,39 +3805,50 @@ def tool_parameters(store, args, budget):
         key = "segment_offset" if segment is not None else "address"   # "offset" pages
         header[key] = address
         header[key + "_hex"] = "0x%04X" % address
-        if segment is None and not items and _relative_hint(rec):
+        if segment is None and not total and _relative_hint(rec):
             header["hint"] = _relative_hint(rec)
-    return _page(items, offset, limit, lambda p, lv: _render_param(p, types, lv, order),
+    return _page(window, total, offset, lambda p, lv: _render_param(p, types, lv, order),
                  header, "parameters", budget, notes=_PARAM_NOTES)
 
 
 def tool_decode(store, args, budget):
-    rec = need_app(store, args)
-    if args.get("address") is None:
-        raise ToolError("invalid_argument", "address is required")
-    segment = _segment_arg(rec, args)
-    base = parse_address(args["address"])
-    hexdata = args.get("data")
-    if not isinstance(hexdata, str):
-        raise ToolError("invalid_argument", "data must be a hex string, e.g. '0A1B2C'")
-    clean = re.sub(r"[\s:,_-]", "", hexdata)
-    if clean.lower().startswith("0x"):
-        clean = clean[2:]
-    if not clean or len(clean) % 2 or not re.match(r"^[0-9A-Fa-f]+$", clean) or len(clean) > 2048:
-        raise ToolError("invalid_argument", "data must be an even number of hex digits "
-                                            "(1..1024 bytes)")
-    data = bytes.fromhex(clean)
-    end = base + len(data)
-    offset = _arg_int(args, "offset", 0, 0, 1 << 30)
-    limit = _arg_int(args, "limit", 40, 1, 200)
-    types = rec.get("types", {})
+    with store.reader() as db:
+        prog = need_app(db, args)
+        rec = prog.header
+        if args.get("address") is None:
+            raise ToolError("invalid_argument", "address is required")
+        segment = _segment_arg(rec, args)
+        base = parse_address(args["address"])
+        hexdata = args.get("data")
+        if not isinstance(hexdata, str):
+            raise ToolError("invalid_argument", "data must be a hex string, e.g. '0A1B2C'")
+        clean = re.sub(r"[\s:,_-]", "", hexdata)
+        if clean.lower().startswith("0x"):
+            clean = clean[2:]
+        if (not clean or len(clean) % 2 or not re.match(r"^[0-9A-Fa-f]+$", clean)
+                or len(clean) > 2048):
+            raise ToolError("invalid_argument", "data must be an even number of hex digits "
+                                                "(1..1024 bytes)")
+        data = bytes.fromhex(clean)
+        end = base + len(data)
+        offset = _arg_int(args, "offset", 0, 0, 1 << 30)
+        limit = _arg_int(args, "limit", 40, 1, 200)
+        # every parameter that can overlap the bytes, in index order
+        lo = base - prog.max_nbytes + 1
+        if segment is None:
+            where, a = "pk = ? AND address BETWEEN ? AND ?", [prog.pk, lo, end - 1]
+        else:
+            where, a = ("pk = ? AND segment = ? AND seg_offset BETWEEN ? AND ?",
+                        [prog.pk, segment, lo, end - 1])
+        params = db.bodies("params", [r[0] for r in db.rows(
+            "SELECT id FROM params WHERE %s ORDER BY id" % where, a)])
+        types = db.types(prog.pk, [p.get("type") for p in params])
     bo = rec.get("byte_order", {})
     order = bo.get("used", "big")
     values, partial, skipped = [], [], []
-    for p in rec.get("parameters", []):
-        a, size = _place(p, segment), p.get("size_bits")
-        if a is None:
-            continue
+    for p in params:
+        a = p.get("address") if segment is None else p.get("offset")
+        size = p.get("size_bits")
         ty = types.get(p.get("type")) if p.get("type") else None
         if not size:
             # Its size is not known, so it cannot be cut out of the bytes —
@@ -3417,8 +3942,8 @@ def tool_decode(store, args, budget):
         return r
 
     notes = {1: "reduced: conditions cut to the innermost one", 2: "reduced: no conditions"}
-    return _page(values, offset, limit, render, header, "values", budget, notes=notes,
-                 max_level=2)
+    return _page(values[offset:offset + limit], len(values), offset, render, header, "values",
+                 budget, notes=notes, max_level=2)
 
 
 # Kept short on purpose: gateways that federate these tools merge them into
@@ -4344,6 +4869,11 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "knxprod-mcp/" + VERSION
     sys_version = ""
     timeout = 120
+    # Headers and body leave in two writes.  With Nagle's algorithm a small
+    # body waited for the ACK of the headers, and a client that delays its
+    # ACKs (lwIP on a microcontroller: up to 250 ms) got every small reply
+    # that much later.
+    disable_nagle_algorithm = True
 
     def log_message(self, fmt, *args):      # one line per request is printed by _log
         pass
@@ -4449,12 +4979,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(405, {"error": "method_not_allowed"},
                                extra={"Allow": "POST, OPTIONS"})
             elif path == "/healthz" and method == "GET":
-                apps = self.server.store.index().get("apps", {})
-                files = self.server.store.files()
-                self._json(200, {"ok": True, "version": VERSION, "apps": len(apps),
-                                 "files": len(files),
-                                 "file_errors": sum(1 for r in files.values()
-                                                    if r.get("status") == "error"),
+                st = self.server.store.stats()
+                self._json(200, {"ok": True, "version": VERSION, "apps": st["apps_total"],
+                                 "files": st["files_total"], "file_errors": st["file_errors"],
                                  "skill": os.path.isfile(SKILL_FILE),
                                  "mdns": self.server.mdns_info()})
             else:
@@ -4582,14 +5109,14 @@ class Handler(BaseHTTPRequestHandler):
         if failure is not None:
             self._json(422, {"ok": False, "error": failure}, extra=self._cors)
             return
-        idx = self.server.store.index().get("apps", {})
-        entries = [idx[a] for a in res["apps_added"] if a in idx]
+        added = set(res["apps_added"])
+        entries = [e for e in self.server.store.entries() if e["app_id"] in added]
         reply = {"ok": True, "file": res["file"], "saved_as": res["file"],
                  "stored": res["stored"], "apps_added": res["apps_added"],
                  "apps_new": res.get("apps_new", []), "apps_removed": res.get("apps_removed", []),
                  "products": res.get("products",
                                      len({o for e in entries for o in e.get("order_numbers", [])})),
-                 "apps_total": len(idx),
+                 "apps_total": self.server.store.stats()["apps_total"],
                  "comobjects": res.get("comobjects", sum(e.get("comobjects", 0) for e in entries)),
                  "parameters": res.get("parameters", sum(e.get("parameters", 0) for e in entries)),
                  "warnings": res.get("warnings", [])[:20], "seconds": res.get("seconds", 0)}
@@ -4726,7 +5253,7 @@ class Service:
         self.log("%s product directory %s: %d file(s), %d application program(s), "
                  "%d error(s), %d pending, %.1f s" % (
                      _utc_now(), self.products, s["files_total"], s["apps_total"],
-                     len(s["errors"]), len(s["pending"]), s["seconds"]))
+                     s["file_errors"], len(s["pending"]), s["seconds"]))
         return s
 
     def activate(self):
@@ -4763,6 +5290,7 @@ class Service:
         if self.scanner:
             self.scanner.stop_event.set()
         self.httpd.server_close()
+        self.httpd.store.close()
 
 
 def serve(cfg):

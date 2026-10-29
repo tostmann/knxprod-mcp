@@ -22,9 +22,11 @@ Optional check of ETS module instances in a real product file you own:
     KNXPROD_TEST_MODULE_APPS=<app id>[,<app id>...] python3 tests/test_knxprod_mcp.py TestRealModules
 """
 
+import atexit
 import base64
 import collections
 import contextlib
+import hashlib
 import http.client
 import json
 import os
@@ -81,6 +83,22 @@ def _read(path):
 def load_json(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def record(data, app_id):
+    """The whole distilled record of one program in the index under `data`."""
+    store = K.Store(data)
+    try:
+        return store.app(app_id)
+    finally:
+        store.close()
+
+
+def index_db(data):
+    """A connection of its own to the index database under `data`, for tests
+    that change it behind the server's back."""
+    import sqlite3
+    return sqlite3.connect(os.path.join(data, K.DB_NAME), isolation_level=None)
 
 
 def members(*parts, app2_name=None):
@@ -311,10 +329,8 @@ class TestDistill(unittest.TestCase):
         cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
         cls.data = os.path.join(cls.tmp, "data")
         cls.summary = K.ingest_file(make_knxprod(cls.tmp), cls.data)
-        with open(os.path.join(cls.data, "apps", APP1 + ".json")) as f:
-            cls.rec = json.load(f)
-        with open(os.path.join(cls.data, "apps", APP2 + ".json")) as f:
-            cls.rec2 = json.load(f)
+        cls.rec = record(cls.data, APP1)
+        cls.rec2 = record(cls.data, APP2)
 
     def test_summary(self):
         s = self.summary
@@ -330,8 +346,7 @@ class TestDistill(unittest.TestCase):
             src = make_knxprod(self.tmp, outer=False) if kind == "knxprod" else FIXTURE
             K.ingest_file(src, data)
             for app in (APP1, APP2):
-                with open(os.path.join(data, "apps", app + ".json")) as f:
-                    other = json.load(f)
+                other = record(data, app)
                 mine = self.rec if app == APP1 else self.rec2
                 for key in ("parameters", "comobjects", "segments", "products", "load_procedure",
                             "tables", "types", "counts", "byte_order"):
@@ -514,8 +529,9 @@ class TestDistill(unittest.TestCase):
                              capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("added 1", out.stdout)
-        with open(os.path.join(data, "index.json")) as f:
-            self.assertEqual(sorted(json.load(f)["apps"]), [APP2, APP1])
+        store = K.Store(data)
+        self.assertEqual(store.app_ids(), [APP2, APP1])
+        store.close()
         write_file(os.path.join(products, "broken.zip"), b"PK\x03\x04 not really a zip")
         out = subprocess.run([sys.executable, "-I", os.path.join(REPO, "knxprod_mcp.py"), "sync",
                               "--products", products, "--data", data],
@@ -909,7 +925,7 @@ class TestModules(unittest.TestCase):
     def test_records_are_stable(self):
         data = os.path.join(self.tmp, "again")
         K.ingest_file(FIXTURE, data)                     # other input form, other order
-        other = load_json(os.path.join(data, "apps", APP3 + ".json"))
+        other = record(data, APP3)
         for key in ("parameters", "comobjects", "counts", "modules", "segments"):
             self.assertEqual(other[key], self.rec[key], key)
 
@@ -1143,19 +1159,20 @@ class TestReviewConditions(unittest.TestCase):
                                                         "Channel Left mode = 1 (switch)"])
 
 
-class OneApp:
-    """A store holding one distilled record, for the tool functions."""
+_ONE_APP = {}
 
-    def __init__(self, rec):
-        self.rec = rec
 
-    def app(self, app_id):
-        return self.rec if app_id == self.rec["app_id"] else None
-
-    def index(self):
-        return {"apps": {self.rec["app_id"]: {"name": self.rec["name"],
-                                              "application_version":
-                                                  self.rec["application_version"]}}}
+def OneApp(rec):
+    """An index holding one distilled record, for the tool functions; built
+    once per record content."""
+    key = hashlib.sha256(K._dumps(rec).encode("utf-8")).hexdigest()
+    store = _ONE_APP.get(key)
+    if store is None:
+        tmp = _tmpdir()
+        atexit.register(shutil.rmtree, tmp, True)
+        K.index_record(tmp, rec)
+        store = _ONE_APP[key] = K.Store(tmp)
+    return store
 
 
 def tool_json(fn, rec, args, budget=K.RESPONSE_BUDGET):
@@ -1401,8 +1418,8 @@ class TestReviewCatalogTemplate(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(zip_bytes(items))
         K.ingest_file(path, os.path.join(tmp, "data"))
-        return {a: [p["order_number"] for p in load_json(os.path.join(
-                    tmp, "data", "apps", a + ".json"))["products"]] for a in (APP1, APP3)}
+        return {a: [p["order_number"] for p in record(os.path.join(tmp, "data"), a)["products"]]
+                for a in (APP1, APP3)}
 
     def test_a_repeated_program_is_read_once_and_silently(self):
         # Bundles repeat the same program XML in several nested archives; that
@@ -1446,18 +1463,132 @@ class TestReviewCatalogTemplate(unittest.TestCase):
 
     def test_candidates_come_with_a_warning(self):
         rec = distill_xml(_read(APP_XML).decode("utf-8"))
-        with self.assertRaises(K.ToolError) as cm:
-            K.need_app(OneApp(rec), {"app_id": "FFF0123457"})
-        e = cm.exception.payload
-        self.assertEqual([c["app_id"] for c in e["candidates"]], [APP1])
-        self.assertIn("do not answer from them", e["note"])
-        with self.assertRaises(K.ToolError) as cm:
-            K.need_app(OneApp(rec), {"app_id": "FFF0999901"})
-        self.assertNotIn("note", cm.exception.payload)
+        with OneApp(rec).reader() as db:
+            with self.assertRaises(K.ToolError) as cm:
+                K.need_app(db, {"app_id": "FFF0123457"})
+            e = cm.exception.payload
+            self.assertEqual([c["app_id"] for c in e["candidates"]], [APP1])
+            self.assertIn("do not answer from them", e["note"])
+            with self.assertRaises(K.ToolError) as cm:
+                K.need_app(db, {"app_id": "FFF0999901"})
+            self.assertNotIn("note", cm.exception.payload)
 
 
 # ---------------------------------------------------------------------------
-# 4c. the skill: skill/SKILL.md served as an MCP resource
+# 4c. the index database: rows, full program ids, search
+# ---------------------------------------------------------------------------
+
+TWIN = "M-FFF0_A-1234-56-BCDE"      # reports the same ApplicationId as APP1
+
+
+class TestIndexDatabase(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = _tmpdir()
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+        # Another program with APP1's number and version: other full id (hash),
+        # other name; in one product file it also keeps P-1 elsewhere.  0.5
+        # kept whichever came last and lost the other.
+        twin = _read(APP_XML).replace(b"M-FFF0_A-1234-56-ABCD", TWIN.encode()).replace(
+            b"Test Blind/Switch 1234/5.6", b"Test Blind/Switch 1234/5.6 twin")
+        for name, xml in (("same", twin), ("differ", twin.replace(b'Offset="66"', b'Offset="67"'))):
+            path = os.path.join(cls.tmp, name + ".knxprod")
+            with open(path, "wb") as f:
+                f.write(zip_bytes(members("master", "hardware", "app1", "app2")
+                                  + [("M-FFF0/%s.xml" % TWIN, xml)]))
+            summary = K.ingest_file(path, os.path.join(cls.tmp, name))
+            store = K.Store(os.path.join(cls.tmp, name))
+            cls.addClassCleanup(store.close)
+            if name == "same":
+                cls.same_summary, cls.same_store = summary, store
+            else:
+                cls.summary, cls.store = summary, store
+
+    def tool(self, name, args, store=None):
+        r = K.handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": name, "arguments": args}}, store or self.store)
+        return r["result"]["isError"], json.loads(r["result"]["content"][0]["text"])
+
+    def test_programs_of_one_layout_are_one_answer(self):
+        # Same ApplicationId and layout (one product file carries a program
+        # converted from ETS3, another the same in ETS4 form): the app id
+        # answers, from the program with products, and names the other.
+        st = self.same_store
+        self.assertFalse([x for x in self.same_summary["warnings"] if "ApplicationId" in x])
+        err, o = self.tool("prod-application", {"app_id": APP1}, st)
+        self.assertFalse(err, o)
+        self.assertEqual((o["id"], o["equivalent_programs"]), ("M-FFF0_A-1234-56-ABCD", [TWIN]))
+        err, o = self.tool("prod-application", {"app_id": TWIN}, st)
+        self.assertEqual((o["id"], o["equivalent_programs"]), (TWIN, ["M-FFF0_A-1234-56-ABCD"]))
+        err, o = self.tool("prod-applications", {"query": "blind"}, st)
+        self.assertEqual([(a["app_id"], a.get("id")) for a in o["applications"]], [(APP1, None)])
+        self.assertEqual(o["ingested"], 3)
+        self.assertEqual(st.app(APP1)["id"], "M-FFF0_A-1234-56-ABCD")
+
+    def test_both_programs_are_kept_and_listed_with_their_ids(self):
+        w = [x for x in self.summary["warnings"] if "same ApplicationId" in x]
+        self.assertEqual(len(w), 1, self.summary["warnings"])
+        self.assertTrue("M-FFF0_A-1234-56-ABCD" in w[0] and TWIN in w[0], w[0])
+        err, o = self.tool("prod-applications", {"query": "blind"})
+        self.assertEqual([(a["app_id"], a["id"]) for a in o["applications"]],
+                         [(APP1, "M-FFF0_A-1234-56-ABCD"), (APP1, TWIN)])
+        self.assertIn("pass the id as app_id", o["note"])
+        err, o = self.tool("prod-applications", {"query": "TEST-0003"})
+        self.assertNotIn("id", o["applications"][0])          # only where it is needed
+        self.assertNotIn("note", o)
+
+    def test_the_application_id_alone_is_ambiguous(self):
+        for name in ("prod-application", "prod-comobjects", "prod-parameters"):
+            err, o = self.tool(name, {"app_id": APP1})
+            self.assertTrue(err)
+            self.assertEqual(o["error"], "ambiguous_app_id")
+            self.assertEqual([(p["id"], p["order_numbers"]) for p in o["programs"]],
+                             [("M-FFF0_A-1234-56-ABCD", ["TEST-0001", "TEST-0002"]),
+                              (TWIN, [])])
+            self.assertIn("ask which product is installed", o["hint"])
+        self.assertIsNone(self.store.app(APP1))
+
+    def test_the_full_id_picks_one(self):
+        err, o = self.tool("prod-application", {"app_id": TWIN.lower()})
+        self.assertFalse(err, o)
+        self.assertEqual((o["app_id"], o["id"]), (APP1, TWIN))
+        self.assertIn("twin", o["name"])
+        err, o = self.tool("prod-parameters", {"app_id": "M-FFF0_A-1234-56-ABCD",
+                                               "address": "0x4A64"})
+        self.assertEqual(sorted(x["id"] for x in o["parameters"]), ["UP-10", "UP-11"])
+        err, o = self.tool("prod-decode", {"app_id": TWIN, "address": "0x4A64", "data": "00"})
+        self.assertFalse(err, o)
+        self.assertEqual(self.store.app(TWIN)["id"], TWIN)
+
+    def test_an_unknown_full_id_names_the_programs_there_are(self):
+        err, o = self.tool("prod-application", {"app_id": "M-FFF0_A-1234-56-0000"})
+        self.assertEqual((o["error"], o["app_id"]), ("unknown_app_id", "M-FFF0_A-1234-56-0000"))
+        self.assertEqual(sorted(c["id"] for c in o["candidates"]),
+                         ["M-FFF0_A-1234-56-ABCD", TWIN])
+
+    def test_a_query_folds_case_beyond_ascii(self):
+        rec = distill_xml(app1_with(replace=[(
+            'Name="Kanal 1" Text="Channel 1"', 'Name="Kanal 1" Text="Ändern der Verzögerung"')]))
+        o = tool_json(K.tool_parameters, rec, {"query": "ÄNDERN verzögerung", "limit": 200})
+        want = [p["id"] for p in rec["parameters"]
+                if p.get("storage") and "Verzögerung" in (p.get("block") or "")]
+        self.assertTrue(want)
+        self.assertEqual([p["id"] for p in o["parameters"]], want)
+
+    def test_rows_and_dicts_agree(self):
+        # The index writes rows while build_record makes them; without a sink
+        # the record keeps dicts.  Both must describe the same program.
+        rec = distill_xml(_read(APP3_XML).decode("utf-8"))
+        data = os.path.join(self.tmp, "modules")
+        K.ingest_file(FIXTURE, data)
+        stored = record(data, APP3)
+        for key in ("parameters", "comobjects", "types", "counts"):
+            self.assertEqual(json.loads(K._dumps(rec[key])), stored[key], key)
+
+
+# ---------------------------------------------------------------------------
+# 4d. the skill: skill/SKILL.md served as an MCP resource
 # ---------------------------------------------------------------------------
 
 SKILL_PATH = os.path.join(REPO, "skill", "SKILL.md")
@@ -1528,6 +1659,7 @@ class TestSkill(unittest.TestCase):
                 "MSB", "`union`", "`when`", "`when_any`", "module", "byte_order_warning",
                 "load session",
                 "dry run", "`offset`", "next_offset", "12 000 bytes", "unknown_app_id",
+                "ambiguous_app_id", "full id",
                 "upload", "terms"):
             self.assertIn(phrase, t, phrase)
         self.assertEqual(t.count("\nWhat "), 2)                         # two examples
@@ -1723,12 +1855,25 @@ class TestProductDirectory(unittest.TestCase):
         return K.sync_products(self.products, self.data, **kw)
 
     def index(self):
-        with open(os.path.join(self.data, "index.json")) as f:
-            return json.load(f)["apps"]
+        store = K.Store(self.data)
+        try:
+            return {e["app_id"]: e for e in store.entries()}
+        finally:
+            store.close()
 
     def files_state(self):
-        with open(os.path.join(self.data, "files.json")) as f:
-            return json.load(f)["files"]
+        store = K.Store(self.data)
+        try:
+            return store.files()
+        finally:
+            store.close()
+
+    def generation(self):
+        con = index_db(self.data)
+        try:
+            return con.execute("SELECT value FROM meta WHERE key = 'generation'").fetchone()[0]
+        finally:
+            con.close()
 
     def put(self, rel, data, age=60):
         write_file(os.path.join(self.products, rel), data, age)
@@ -1740,15 +1885,20 @@ class TestProductDirectory(unittest.TestCase):
         self.assertEqual(self.index()[APP1]["sources"], ["a.knxprod"])
         self.assertEqual(self.files_state()["a.knxprod"]["sha256"],
                          K._sha256_file(os.path.join(self.products, "a.knxprod")))
-        generated = load_json(os.path.join(self.data, "index.json"))["generated"]
+        generation = self.generation()
+        db = os.path.join(self.data, K.DB_NAME)
+        before = os.stat(db).st_mtime_ns, os.stat(db).st_size
         s = self.sync()
         self.assertEqual((s["added"], s["changed"], s["unchanged"]), ([], [], 1))
+        # a scan with nothing to do writes nothing (0.5 rewrote its file list each time)
+        self.assertEqual((os.stat(db).st_mtime_ns, os.stat(db).st_size), before)
         t = time.time() - 30
         os.utime(os.path.join(self.products, "a.knxprod"), (t, t))       # touched, same bytes
         s = self.sync()
         self.assertEqual((s["changed"], s["unchanged"]), ([], 1))
-        self.assertEqual(load_json(os.path.join(self.data, "index.json"))["generated"],
-                         generated)
+        self.assertEqual(self.generation(), generation)
+        self.assertEqual(self.files_state()["a.knxprod"]["mtime_ns"],
+                         os.stat(os.path.join(self.products, "a.knxprod")).st_mtime_ns)
 
     def test_files_are_never_modified(self):
         self.put("a.knxprod", full_knxprod())
@@ -1785,8 +1935,20 @@ class TestProductDirectory(unittest.TestCase):
         self.assertEqual((s["removed"], s["apps_removed"]), (["a.knxprod"], [APP1]))
         self.assertEqual(sorted(self.index()), [APP2])
         self.assertEqual(self.index()[APP2]["sources"], ["b.knxprod"])
-        self.assertFalse(os.path.exists(os.path.join(self.data, "apps", APP1 + ".json")))
-        self.assertTrue(os.path.exists(os.path.join(self.data, "apps", APP2 + ".json")))
+        self.assertIsNone(record(self.data, APP1))
+        self.assertIsNotNone(record(self.data, APP2))
+        con = index_db(self.data)                       # no rows left behind
+        try:
+            for table in ("params", "comobjects", "types", "aliases", "sources"):
+                self.assertEqual(con.execute("SELECT count(*) FROM %s WHERE pk NOT IN "
+                                             "(SELECT pk FROM programs)" % table).fetchone()[0],
+                                 0, table)
+            for table, body in (("params", "param_bodies"), ("comobjects", "comobject_bodies")):
+                self.assertEqual(con.execute("SELECT count(*) FROM %s WHERE id NOT IN "
+                                             "(SELECT id FROM %s)" % (body, table)).fetchone()[0],
+                                 0, body)
+        finally:
+            con.close()
         self.assertEqual(sorted(self.files_state()), ["b.knxprod"])
 
     def test_change_replaces_content(self):
@@ -1803,7 +1965,7 @@ class TestProductDirectory(unittest.TestCase):
         self.put("b.knxprod", zip_bytes(members("master", "hardware", "app2",
                                                 app2_name="Test actuator 00AB (b)")))
         self.sync()
-        name = lambda: load_json(os.path.join(self.data, "apps", APP2 + ".json"))["name"]
+        name = lambda: record(self.data, APP2)["name"]
         self.assertEqual(name(), "Test actuator 00AB (b)")             # b was read last
         os.remove(os.path.join(self.products, "b.knxprod"))
         s = self.sync()
@@ -1848,7 +2010,9 @@ class TestProductDirectory(unittest.TestCase):
         self.put("a.knxprod", full_knxprod())
         self.put("b.knxprod", zip_bytes(members("master", "hardware", "app2")))
         self.sync()
-        os.remove(os.path.join(self.data, "files.json"))
+        con = index_db(self.data)
+        con.execute("DELETE FROM files")
+        con.close()
         os.remove(os.path.join(self.products, "a.knxprod"))
         s = self.sync()
         self.assertEqual(s["removed"], ["a.knxprod"])
@@ -1857,42 +2021,52 @@ class TestProductDirectory(unittest.TestCase):
     def test_index_of_an_older_format_is_rebuilt(self):
         self.put("a.knxprod", full_knxprod())
         self.sync()
-        p = K._paths(self.data)
-        for key in ("index", "files"):
-            d = load_json(p[key])
-            d["schema"] = K.SCHEMA_VERSION - 1
-            K.atomic_write_json(p[key], d)
-        old = load_json(os.path.join(p["apps"], APP1 + ".json"))
-        old.update(schema=K.SCHEMA_VERSION - 1, parameters=[])
-        K.atomic_write_json(os.path.join(p["apps"], APP1 + ".json"), old)
+        con = index_db(self.data)
+        con.execute("PRAGMA user_version = %d" % (K.SCHEMA_VERSION - 1))
+        con.execute("DELETE FROM params")                 # what an older format lacked
+        con.close()
         lines = []
         s = self.sync(log=lines.append)
         self.assertEqual(s["rebuilt_from_schema"], K.SCHEMA_VERSION - 1)
         self.assertEqual((s["added"], s["unchanged"], s["apps_total"]), (["a.knxprod"], 0, 2))
         self.assertTrue(any("rebuilding the index" in line for line in lines), lines)
-        self.assertEqual(load_json(p["index"])["schema"], K.SCHEMA_VERSION)
-        self.assertEqual(load_json(p["files"])["schema"], K.SCHEMA_VERSION)
-        rec = load_json(os.path.join(p["apps"], APP1 + ".json"))
-        self.assertEqual((rec["schema"], len(rec["parameters"])), (K.SCHEMA_VERSION, 11))
+        con = index_db(self.data)
+        self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], K.SCHEMA_VERSION)
+        con.close()
+        self.assertEqual(len(record(self.data, APP1)["parameters"]), 11)
         s = self.sync()
         self.assertNotIn("rebuilt_from_schema", s)
         self.assertEqual(s["unchanged"], 1)
 
+    def test_the_json_index_of_0_5_is_replaced(self):
+        self.put("a.knxprod", full_knxprod())
+        os.makedirs(os.path.join(self.data, "apps"))
+        for name, obj in (("index.json", {"schema": 9, "apps": {}}),
+                          ("files.json", {"schema": 9, "files": {}}),
+                          ("master.json", {"manufacturers": {}, "masks": {}}),
+                          (os.path.join("apps", APP1 + ".json"), {"schema": 9})):
+            K.atomic_write_json(os.path.join(self.data, name), obj)
+        lines = []
+        s = self.sync(log=lines.append)
+        self.assertEqual((s["rebuilt_from_schema"], s["added"], s["apps_total"]),
+                         (9, ["a.knxprod"], 2))
+        self.assertTrue(any("rebuilding the index" in line for line in lines), lines)
+        for name in ("apps", "index.json", "files.json", "master.json"):
+            self.assertFalse(os.path.exists(os.path.join(self.data, name)), name)
+        self.assertNotIn("rebuilt_from_schema", self.sync())
+
     def test_server_start_rebuilds_an_older_index(self):
         self.put("a.knxprod", full_knxprod())
-        self.sync()
-        p = K._paths(self.data)
-        for key in ("index", "files"):                     # as an older version left it
-            d = load_json(p[key])
-            d.pop("schema")
-            K.atomic_write_json(p[key], d)
+        os.makedirs(os.path.join(self.data, "apps"))       # as an older version left it
+        K.atomic_write_json(os.path.join(self.data, "index.json"), {"apps": {}})
+        K.atomic_write_json(os.path.join(self.data, "files.json"), {"files": {}})
         srv = Server(self.products, self.data)
         self.addCleanup(srv.stop)
         self.assertTrue(any("rebuilding the index" in line for line in srv.lines), srv.lines)
         self.assertEqual(srv.health()["apps"], 2)
         res, o, _ = srv.tool("prod-parameters", {"app_id": APP1, "address": "0x4A64"})
         self.assertEqual(sorted(x["id"] for x in o["parameters"]), ["UP-10", "UP-11"])
-        self.assertEqual(load_json(p["files"])["schema"], K.SCHEMA_VERSION)
+        self.assertFalse(os.path.exists(os.path.join(self.data, "index.json")))
 
     def test_upload_naming(self):
         os.makedirs(self.data, exist_ok=True)
@@ -1934,6 +2108,11 @@ class TestHttp(unittest.TestCase):
                    zip_bytes(members("master", "hardware", "app1")))
         cls.srv = Server(cls.products, cls.data, scan_interval=0.2)
         cls.addClassCleanup(cls.srv.stop)
+
+    def test_small_replies_do_not_wait_for_an_ack(self):
+        # A small body waited for the ACK of its headers: about 240 ms per
+        # reply to a client on lwIP, which acknowledges on a 250 ms tick.
+        self.assertTrue(K.Handler.disable_nagle_algorithm)
 
     def test_a_initial_sync_before_serving(self):
         h = self.srv.health()
@@ -2623,12 +2802,12 @@ class TestRealData(unittest.TestCase):
     def test_d_every_result_within_budget(self):
         store = K.Store(self.srv.svc.data)
         worst = 0
-        for app_id in sorted(store.index()["apps"]):
-            rec = store.app(app_id)
+        for e in store.entries():
+            app_id = e["id"] if e.get("shared_app_id") else e["app_id"]
             for name, key, extra, total in (
-                    ("prod-comobjects", "comobjects", {}, len(rec["comobjects"])),
+                    ("prod-comobjects", "comobjects", {}, e["comobjects"]),
                     ("prod-parameters", "parameters", {"include_virtual": True},
-                     len(rec["parameters"]))):
+                     e["parameters"])):
                 off, seen = 0, 0
                 while True:
                     r = K.handle_rpc({"jsonrpc": "2.0", "id": 123456, "method": "tools/call",

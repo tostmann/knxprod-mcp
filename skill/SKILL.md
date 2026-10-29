@@ -25,6 +25,10 @@ every tool.
   the product name. One program often serves several products (2-, 4-, 8-fold
   variants), so the program does not tell which hardware variant is installed,
   and only the device tells which version runs on it.
+- Programs that report the same ApplicationId with the same memory layout are
+  one answer; `prod-application` names the others in `equivalent_programs`.
+  Where layouts differ (rare), `app_id` also takes a program's full id, e.g.
+  `M-FFF0_A-1234-56-ABCD`; see `ambiguous_app_id` below.
 
 ## Workflow: one tool call per step
 
@@ -114,6 +118,12 @@ that had to leave detail out says what in `detail`.
   to add the manufacturer's `.knxprod` (copy it into the product folder or
   upload it). `candidates` are other versions of the program: their layout can
   differ, so do not answer from them in place of the device's own version.
+- `ambiguous_app_id`: programs with different memory layouts report this
+  ApplicationId, and the device cannot tell them apart. `programs` lists them
+  with their order numbers: ask the user which product is installed and pass
+  that program's `id` as `app_id`. Where one product is listed under several
+  programs, the installation's ETS project names the program loaded. Do not
+  pick one yourself.
 - `invalid_argument`: the message says what to fix.
 - When the device's own answer disagrees with the file, the device wins.
 
