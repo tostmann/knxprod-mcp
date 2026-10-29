@@ -77,8 +77,8 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.5.0"
-SCHEMA_VERSION = 7                 # distilled record format; another value rebuilds the index
+VERSION = "0.5.1"
+SCHEMA_VERSION = 8                 # distilled record format; another value rebuilds the index
 SERVER_NAME = "knxprod-mcp"
 
 DEFAULT_DATA = "/data"
@@ -98,8 +98,13 @@ DEFAULT_PROTOCOL = "2025-06-18"
 RESPONSE_BUDGET = 12000
 
 MAX_MCP_BODY = 1 << 20
-MAX_UPLOAD = 64 << 20
-ZIP_MAX_TOTAL = 512 << 20          # declared uncompressed bytes, all nesting levels
+MAX_UPLOAD = 512 << 20
+# Zip-bomb guards.  Only members the service reads count: a manufacturer
+# database also carries plugins and pictures nobody unpacks.  Real product
+# XML expands < 40:1 (largest seen 38:1); a bomb expands ~1000:1.  The
+# largest real database seen reads 1 GB, so 512 MB refused it.
+ZIP_MAX_TOTAL = 4096 << 20         # declared uncompressed bytes read, all nesting levels
+ZIP_MAX_RATIO = 200                # declared uncompressed : compressed, per member read
 ZIP_MAX_MEMBERS = 5000             # members, all nesting levels
 ZIP_MAX_DEPTH = 3
 CACHE_BYTES = 24 << 20             # app JSON kept in memory, counted by file size
@@ -1405,6 +1410,8 @@ def build_record(raw, langs, master, hw, source):
         return x[len(p):] if x.startswith(p) else short(x)
 
     # -- parameters
+    blank_tpl = {sid: not d or max(collections.Counter(d).values()) >= 0.95 * len(d)
+                 for sid, d in raw.seg_data.items()}
     counts = collections.Counter()
     tcheck = collections.Counter()
     declared_order = raw.options.get("ParameterByteOrder")
@@ -1542,9 +1549,10 @@ def build_record(raw, langs, master, hw, source):
                 and size and size <= 64 and (p.get("union") is None or p["union"]["default"])):
             dv = _intval(p.get("default"))
             data = raw.seg_data.get(loc["segment"])
-            if data is not None and data.count(0) >= 0.95 * len(data):
-                # A template of (nearly) only zeros carries no defaults: checking
-                # against it reported a layout problem that does not exist.
+            if data is not None and blank_tpl.get(loc["segment"]):
+                # A template of (nearly) one byte value — zeros, or 0xFF of erased
+                # flash — carries no defaults: checking against it reported a
+                # layout problem that does not exist.
                 tcheck["skipped_empty_template"] += 1
                 data = None
             if dv is not None and data is not None:
@@ -1825,12 +1833,13 @@ class SourceSet:
     capped, nesting depth is capped.  zipfile itself never returns more than
     a member's declared size and verifies the CRC."""
 
-    def __init__(self, path, tmp_dir, max_total=ZIP_MAX_TOTAL, max_members=ZIP_MAX_MEMBERS,
+    def __init__(self, path, tmp_dir, max_total=None, max_members=ZIP_MAX_MEMBERS,
                  max_depth=ZIP_MAX_DEPTH, label=None):
         self.path = path
         self.label = label
         self.tmp_dir = tmp_dir
-        self.max_total, self.max_members, self.max_depth = max_total, max_members, max_depth
+        self.max_total = ZIP_MAX_TOTAL if max_total is None else max_total   # set by --zip-max-mb
+        self.max_members, self.max_depth = max_members, max_depth
         self.members = []
         self.warnings = []
         self._zips = []
@@ -1902,9 +1911,16 @@ class SourceSet:
         for info in infos:
             if not safe_member_name(info.filename):
                 raise IngestError("unsafe member name in %s: %r" % (label, info.filename))
-        self._total += sum(i.file_size for i in infos)
+        read = [i for i in infos if not i.is_dir() and classify_member(i.filename)]
+        for i in read:
+            if i.file_size and (not i.compress_size or
+                                i.file_size > ZIP_MAX_RATIO * i.compress_size):
+                raise IngestError("member %s of %s expands more than %d:1: not product data"
+                                  % (i.filename, label, ZIP_MAX_RATIO))
+        self._total += sum(i.file_size for i in read)
         if self._total > self.max_total:
-            raise IngestError("uncompressed size exceeds %d MB" % (self.max_total >> 20))
+            raise IngestError("uncompressed size of the product data exceeds %d MB "
+                              "(KNXPROD_ZIP_MAX_MB)" % (self.max_total >> 20))
         for info in infos:
             if info.is_dir():
                 continue
@@ -4810,6 +4826,9 @@ def build_parser():
                                           ".knxprod/.zip (KNXPROD_DIR, default %s)"
                                           % DEFAULT_PRODUCTS)
         p.add_argument("--data", help="index directory (KNXPROD_DATA, default %s)" % DEFAULT_DATA)
+        p.add_argument("--zip-max-mb", type=int,
+                       help="largest uncompressed product data one file may hold, in MB "
+                            "(KNXPROD_ZIP_MAX_MB, default %d)" % (ZIP_MAX_TOTAL >> 20))
     ps.add_argument("--bind", help="listen address, or 'auto' for this host's LAN address "
                                    "(KNXPROD_BIND, default %s)" % DEFAULT_BIND)
     ps.add_argument("--port", type=int, help="port (KNXPROD_PORT, default %d)" % DEFAULT_PORT)
@@ -4842,6 +4861,15 @@ def resolve_config(args):
     cfg = {"cmd": args.cmd,
            "products": getattr(args, "products", None) or _env("KNXPROD_DIR") or DEFAULT_PRODUCTS,
            "data": args.data or _env("KNXPROD_DATA") or DEFAULT_DATA}
+    zmax = getattr(args, "zip_max_mb", None)
+    if zmax is None:
+        zmax = _env("KNXPROD_ZIP_MAX_MB") or (ZIP_MAX_TOTAL >> 20)
+    try:
+        cfg["zip_max_mb"] = int(zmax)
+    except ValueError:
+        raise ConfigError("zip-max-mb must be a number of megabytes: %r" % zmax)
+    if cfg["zip_max_mb"] < 1:
+        raise ConfigError("zip-max-mb must be at least 1")
     if args.cmd != "serve":
         return cfg
     cfg["bind"] = args.bind or _env("KNXPROD_BIND") or DEFAULT_BIND
@@ -4895,9 +4923,11 @@ def resolve_config(args):
 
 
 def main(argv=None):
+    global ZIP_MAX_TOTAL
     args = build_parser().parse_args(argv)
     try:
         cfg = resolve_config(args)
+        ZIP_MAX_TOTAL = cfg["zip_max_mb"] << 20
         if cfg["cmd"] == "serve":
             return serve(cfg)
         if cfg["cmd"] == "health":

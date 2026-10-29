@@ -28,6 +28,7 @@ import contextlib
 import http.client
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -65,7 +66,7 @@ APP3 = "FFF00C0D21"           # built from ETS modules
 ENV_KEYS = ("KNXPROD_DIR", "KNXPROD_DATA", "KNXPROD_BIND", "KNXPROD_PORT",
             "KNXPROD_ALLOWED_HOSTS", "KNXPROD_UPLOAD_ORIGINS", "KNXPROD_SCAN_INTERVAL",
             "KNXPROD_ALLOW_ANY_BIND", "KNXPROD_MDNS", "KNXPROD_MDNS_NAME", "KNXPROD_MDNS_HOSTNAME",
-            "KNXPROD_MDNS_ADDRESS")
+            "KNXPROD_MDNS_ADDRESS", "KNXPROD_ZIP_MAX_MB")
 
 
 def _tmpdir():
@@ -554,10 +555,27 @@ class TestZipSafety(unittest.TestCase):
                 self._open(path)
 
     def test_uncompressed_size_cap(self):
-        path = self._zip("big.zip", [("knx_master.xml", b" " * 5000)])
+        noise = random.Random(1).randbytes(5000)            # does not compress
+        path = self._zip("big.zip", [("knx_master.xml", noise)])
         with self.assertRaises(K.IngestError):
             self._open(path, max_total=4000)
         self.assertEqual(len(self._open(path, max_total=6000)), 1)
+
+    def test_only_what_is_read_counts(self):
+        # A manufacturer database carries plugins and pictures nobody unpacks;
+        # counting them refused a real 1 GB database.
+        noise = random.Random(2).randbytes(5000)
+        path = self._zip("plugins.zip", [("knx_master.xml", b"<KNX/>"),
+                                         ("Plugin.msi", noise), ("blank.png", bytes(50000))])
+        self.assertEqual(self._open(path, max_total=4000), ["plugins.zip!knx_master.xml"])
+
+    def test_a_member_that_expands_like_a_bomb_is_refused(self):
+        path = self._zip("bomb.zip", [("M-FFF0/M-FFF0_A-1234-56-ABCD.xml",
+                                       b"<KNX>" + b" " * 400000 + b"</KNX>")])
+        with self.assertRaises(K.IngestError) as cm:
+            self._open(path)
+        self.assertIn("expands more than %d:1" % K.ZIP_MAX_RATIO, str(cm.exception))
+        self.assertEqual(len(self._open(make_knxprod(self.tmp))), 4)   # real XML passes
 
     def test_member_count_cap(self):
         path = self._zip("many.zip", [("f%d.txt" % i, b"x") for i in range(10)])
@@ -1338,14 +1356,15 @@ class TestReviewCatalogTemplate(unittest.TestCase):
                                               APP3: ["TEST-0001", "TEST-0002"]})
 
     def test_an_empty_template_checks_nothing(self):
-        # A template of zeros carries no defaults; checking against it made a
-        # correct layout look half wrong.
-        xml = re.sub(r'(<AbsoluteSegment Id="%sAS-4A00"[^>]*>\s*<Data>)[^<]*(</Data>)' % PRE1,
-                     lambda m: m.group(1) + base64.b64encode(bytes(128)).decode() + m.group(2),
-                     _read(APP_XML).decode("utf-8"))
-        tc = distill_xml(xml)["counts"]["template_check"]
-        self.assertEqual((tc["checked"], tc["match"]), (0, 0))
-        self.assertGreater(tc["skipped_empty_template"], 0)
+        # A template of zeros, or of 0xFF (erased flash), carries no defaults;
+        # checking against it made a correct layout look half (or all) wrong.
+        for fill in (0x00, 0xFF):
+            blank = base64.b64encode(bytes([fill]) * 128).decode()
+            xml = re.sub(r'(<AbsoluteSegment Id="%sAS-4A00"[^>]*>\s*<Data>)[^<]*(</Data>)' % PRE1,
+                         lambda m: m.group(1) + blank + m.group(2), _read(APP_XML).decode("utf-8"))
+            tc = distill_xml(xml)["counts"]["template_check"]
+            self.assertEqual((tc["checked"], tc["match"]), (0, 0), fill)
+            self.assertGreater(tc["skipped_empty_template"], 0)
 
     def test_candidates_come_with_a_warning(self):
         rec = distill_xml(_read(APP_XML).decode("utf-8"))
@@ -1479,6 +1498,17 @@ class TestConfig(unittest.TestCase):
 
     def cfg(self, *argv):
         return K.resolve_config(K.build_parser().parse_args(list(argv)))
+
+    def test_zip_size_limit(self):
+        with env():
+            self.assertEqual(self.cfg("serve")["zip_max_mb"], 4096)
+            self.assertEqual(self.cfg("sync", "--zip-max-mb", "50")["zip_max_mb"], 50)
+        with env(KNXPROD_ZIP_MAX_MB="100"):
+            self.assertEqual(self.cfg("serve")["zip_max_mb"], 100)
+            self.assertEqual(self.cfg("serve", "--zip-max-mb", "8000")["zip_max_mb"], 8000)
+        with env(KNXPROD_ZIP_MAX_MB="lots"):
+            with self.assertRaises(K.ConfigError):
+                self.cfg("serve")
 
     def test_defaults(self):
         with env():

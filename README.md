@@ -190,6 +190,7 @@ wins over the environment.
 | `--allowed-host` | `KNXPROD_ALLOWED_HOSTS` | – | extra host names clients may use (comma separated) |
 | `--upload-origin` | `KNXPROD_UPLOAD_ORIGINS` | private-network rule | browser origins allowed to upload; `none` turns browser uploads off |
 | `--scan-interval` | `KNXPROD_SCAN_INTERVAL` | `10` | seconds between folder scans; `0` scans only at start |
+| `--zip-max-mb` | `KNXPROD_ZIP_MAX_MB` | `4096` | largest uncompressed product data one file may hold (a full manufacturer database can exceed 1 GB) |
 | `--allow-any-bind` | `KNXPROD_ALLOW_ANY_BIND=1` | off | allow listening on `0.0.0.0` / `::` |
 | `--no-mdns` | `KNXPROD_MDNS=0` | on | do not announce the service via mDNS/DNS-SD |
 | `--mdns-name` | `KNXPROD_MDNS_NAME` | `knxprod-mcp on <hostname>` | DNS-SD instance name |
@@ -210,9 +211,11 @@ python3 knxprod_mcp.py health --data ./knxprod-index                       # 0 i
   answers with JSON only (no SSE). Protocol versions 2025-06-18, 2025-03-26 and
   2024-11-05 are supported. Besides the tools it serves one resource, the skill
   `skill://knxprod-mcp/SKILL.md`.
-- `POST /upload?name=<file>`: the raw file as request body, at most 64 MB. Zip
-  archives are checked for path traversal, member count, nesting depth and
-  uncompressed size.
+- `POST /upload?name=<file>`: the raw file as request body, at most 512 MB.
+  Zip archives are checked for path traversal, member count, nesting depth,
+  how far each member expands (more than 200:1 is refused) and how much product
+  data they hold uncompressed (`KNXPROD_ZIP_MAX_MB`). Plugins and pictures in a
+  product file are never unpacked and do not count.
 - `GET /healthz`: liveness, index counts and the mDNS state. The container's
   health check (`knxprod_mcp.py health`) uses it.
 
