@@ -149,7 +149,15 @@ Some things to keep in mind:
   usually the channel mode. When ETS shows an item in several places, `when`
   keeps what all of them share and `when_any` lists the alternatives, one of
   which must hold as well. Places where it is hidden (`Access="None"`) do not
-  count; an item ETS never shows gets `ui: false`.
+  count; an item ETS never shows gets `ui: false`. Conditions are complete,
+  outermost first; `when_more` marks a chain longer than twelve.
+- A parameter's `default`, `access` and `text` are those of the refs ETS shows.
+  When channel modes give it different defaults, `variants` lists each ref with
+  its default and conditions, and the parameter has no single `default`.
+- Floats (DPT 9 and IEEE-754) and colours are sized from their encoding and
+  decoded; `prod-decode` lists what it cannot decode in `skipped`.
+- Products are linked through the catalog (`Catalog.xml`) where the product
+  file has one, otherwise through the hardware.
 - Multi-byte parameter values follow the byte order the program declares. The
   indexer compares that declaration with the defaults in the manufacturer's
   memory template and adds a `byte_order_warning` when they disagree.
@@ -164,7 +172,9 @@ Some things to keep in mind:
 
 Every `tools/call` response stays at or below 12 000 bytes, so small clients
 that forward replies can handle it. Long lists are paginated (`offset`/`limit`
-in, `total`/`next_offset` out).
+in, `total`/`next_offset` out). A reply that had to leave detail out says so in
+`detail`, and an object with more variants than one reply holds comes in parts
+(`variants_next_offset` out, `variant_offset` in).
 
 ## Configuration
 

@@ -77,8 +77,8 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.4.2"
-SCHEMA_VERSION = 6                 # distilled record format; another value rebuilds the index
+VERSION = "0.5.0"
+SCHEMA_VERSION = 7                 # distilled record format; another value rebuilds the index
 SERVER_NAME = "knxprod-mcp"
 
 DEFAULT_DATA = "/data"
@@ -103,7 +103,7 @@ ZIP_MAX_TOTAL = 512 << 20          # declared uncompressed bytes, all nesting le
 ZIP_MAX_MEMBERS = 5000             # members, all nesting levels
 ZIP_MAX_DEPTH = 3
 CACHE_BYTES = 24 << 20             # app JSON kept in memory, counted by file size
-MAX_CONDS = 3                      # innermost ETS conditions kept per object/parameter
+MAX_CONDS = 12                     # ETS conditions kept per place, outermost first (when_more beyond)
 MAX_ALTS = 8                       # distinct condition sets (UI places) kept per object/parameter
 MAX_REPEAT = 256                   # module instances expanded per <Repeat>
 
@@ -311,6 +311,39 @@ def extract_rule(bit_offset, size, byte_order="big"):
             "mask": "0x%X" % ((1 << size) - 1)}
 
 
+# Sizes ETS leaves to the encoding: a TypeFloat or TypeColor carries no
+# SizeInBit, and without a size such a parameter had no extract rule, was
+# missing from prod-decode and from the address filter (review 2026-10-29).
+_COLOR_BITS = {"RGB": 24, "HSV": 24}
+
+
+def float_bits(encoding):
+    """'DPT 9' -> 16 (2-byte KNX float), 'IEEE-754 Single' -> 32, '... Double' -> 64."""
+    e = (encoding or "").lower()
+    if "single" in e or re.search(r"dpt\s*14\b", e):
+        return 32
+    if "double" in e:
+        return 64
+    if re.search(r"dpt\s*9\b", e):
+        return 16
+    return None
+
+
+def decode_float(chunk, byte_order="big"):
+    """2 bytes: DPT 9 (0.01 * M * 2^E, M 12-bit two's complement), None for its
+    invalid value 0x7FFF; 4/8 bytes: IEEE-754 single/double."""
+    if len(chunk) == 2:
+        raw = int.from_bytes(chunk, byte_order)
+        if raw == 0x7FFF:
+            return None
+        m = (raw & 0x07FF) - (0x0800 if raw & 0x8000 else 0)
+        return round(0.01 * m * (1 << ((raw >> 11) & 0x0F)), 2)
+    fmt = {4: "f", 8: "d"}.get(len(chunk))
+    if fmt is None:
+        return None
+    return struct.unpack(("<" if byte_order == "little" else ">") + fmt, chunk)[0]
+
+
 def byte_order_of(declared):
     """'BigEndian' / 'LittleEndian' / None (not stated -> big, the KNX default)."""
     return "little" if (declared or "").lower().startswith("little") else "big"
@@ -443,16 +476,27 @@ class _RawApp:
                 for e in c:
                     if _local(e.tag) == "Enumeration":
                         v = e.get("Value")
-                        vals.append({"id": e.get("Id"), "value": v if v is not None else e.get("BinaryValue"),
-                                     "text": e.get("Text")})
+                        b = None
+                        if e.get("BinaryValue"):        # Base="BinaryValue": these bytes are stored
+                            try:
+                                b = base64.b64decode(e.get("BinaryValue")).hex().upper()
+                            except ValueError:
+                                b = None
+                        vals.append({"id": e.get("Id"), "value": v if v is not None else b,
+                                     "text": e.get("Text"), "binary": b})
                 t = {"kind": "enum", "size_bits": _int(c.get("SizeInBit")), "base": c.get("Base"),
                      "values": vals}
             elif k == "TypeText":
                 t = {"kind": "text", "size_bits": _int(c.get("SizeInBit"))}
             elif k == "TypeFloat":
-                t = {"kind": "float", "size_bits": _int(c.get("SizeInBit")),
+                t = {"kind": "float",
+                     "size_bits": _int(c.get("SizeInBit")) or float_bits(c.get("Encoding")),
                      "encoding": c.get("Encoding"),
                      "min": _num(c.get("minInclusive")), "max": _num(c.get("maxInclusive"))}
+            elif k == "TypeColor":
+                space = c.get("Space")
+                t = {"kind": "color", "space": space,
+                     "size_bits": _int(c.get("SizeInBit")) or _COLOR_BITS.get((space or "").upper())}
             elif k in ("TypeNone", "TypePicture"):
                 t = {"kind": k[4:].lower(), "size_bits": 0}
             elif k == "TypeIPAddress":
@@ -558,12 +602,13 @@ class _RawApp:
 
 def _note_ref(table, refid, conds, block):
     """Count one place the ETS UI shows a reference.  Kept: the block of the
-    first place and every distinct set of innermost conditions — a reference
-    shown under two channel modes needs both (one set over MAX_ALTS marks that
-    there are more)."""
+    first place and every distinct chain of conditions — a reference shown
+    under two channel modes needs both (one chain over MAX_ALTS marks that
+    there are more).  The whole chain: keeping only the innermost conditions
+    dropped the outer ones, and those are usually the channel mode."""
     if not refid:
         return
-    c = conds[-MAX_CONDS:]
+    c = tuple(conds)
     r = table.get(refid)
     if r is None:
         table[refid] = [1, [c], block]
@@ -797,9 +842,11 @@ def parse_application_xml(stream):
 
 
 def parse_hardware_xml(stream):
-    """Hardware.xml -> products and Hardware2Program -> application links."""
+    """Hardware.xml -> products, the programs of each hardware, and which
+    program each Hardware2Program loads (for Catalog.xml)."""
     programs = {}
     products = {}
+    h2p = {}
     langs = {}
     tags = []
     lang = None
@@ -825,6 +872,9 @@ def parse_hardware_xml(stream):
                     products[p["id"]] = p
                 elif k == "ApplicationProgramRef":
                     apps.append(c.get("RefId"))
+                elif k == "Hardware2Program":
+                    h2p[c.get("Id")] = [x.get("RefId") for x in c.iter()
+                                        if _local(x.tag) == "ApplicationProgramRef"]
             for a in apps:
                 lst = programs.setdefault(a, [])
                 for pid in prods:
@@ -836,7 +886,22 @@ def parse_hardware_xml(stream):
             el.clear()
         elif tag in ("TranslationUnit", "Language", "Languages"):
             el.clear()
-    return {"programs": programs, "products": products, "langs": langs}
+    return {"programs": programs, "products": products, "langs": langs, "h2p": h2p}
+
+
+def parse_catalog_xml(stream):
+    """Catalog.xml -> (product, Hardware2Program) of every catalog item: the
+    program a product is sold with.  A hardware can carry several programs
+    (versions), and only the catalog says which product goes with which."""
+    items = []
+    for _event, el in ET.iterparse(stream, events=("end",)):
+        if _local(el.tag) == "CatalogItem":
+            if el.get("ProductRefId") and el.get("Hardware2ProgramRefId"):
+                items.append((el.get("ProductRefId"), el.get("Hardware2ProgramRefId")))
+            el.clear()
+        elif _local(el.tag) in ("TranslationUnit", "Languages"):
+            el.clear()
+    return items
 
 
 def parse_master_xml(stream):
@@ -1017,6 +1082,9 @@ def build_record(raw, langs, master, hw, source):
         if t.get("kind") == "enum":
             o["values"] = [[v["value"], T.get(v["id"], "Text", v["text"])[0]]
                            for v in t.get("values", [])]
+            binary = [[v["binary"], v["value"]] for v in t.get("values", []) if v.get("binary")]
+            if binary:
+                o["binary"] = binary            # stored bytes (hex) -> value
         types_out[short(tid)] = o
 
     # -- load procedure according to LoadProcedureStyle
@@ -1194,9 +1262,11 @@ def build_record(raw, langs, master, hw, source):
         if test is not None:
             vals = test.split()
             if vals and all(_is_intlike(v) for v in vals):
+                # Every value counts — a list cut at six made a device with
+                # the seventh look out of scope.  Texts for the first six only.
                 shown = []
-                for v in vals[:6]:
-                    vt = value_text(p, v)
+                for i, v in enumerate(vals):
+                    vt = value_text(p, v) if i < 6 else None
                     shown.append("%s (%s)" % (v, vt) if vt else v)
                 if len(vals) == 1:
                     return "%s = %s" % (text, shown[0])
@@ -1221,12 +1291,15 @@ def build_record(raw, langs, master, hw, source):
         (_when_fields)."""
         names = inst["names"] if inst else None
         outer = inst["outer"] if inst else []
-        keep = MAX_CONDS - len(outer)
-        alts = []
+        alts, cut = [], False
         for conds in (entry[1] if entry else [()]):
-            inner = [render_cond(c, names) for c in conds]
-            alts.append(list(outer) + (inner[-keep:] if keep > 0 else []))
+            alt = list(outer) + [render_cond(c, names) for c in conds]
+            if len(alt) > MAX_CONDS:            # outermost kept: they name the mode
+                alt, cut = alt[:MAX_CONDS], True
+            alts.append(alt)
         o = _when_fields(alts)
+        if cut:
+            o["when_more"] = True
         if entry is None:
             o["ui"] = False
             return o
@@ -1264,7 +1337,7 @@ def build_record(raw, langs, master, hw, source):
         if md is None:
             unsupported["module_def_missing"] += 1
             continue
-        outer = [render_cond(c) for c in mod["conds"][-1:]]
+        outer = [render_cond(c) for c in mod["conds"]]     # every condition placing it
         rep = mod.get("repeat")
         count, count_pref = 1, None
         if rep is not None:
@@ -1360,8 +1433,6 @@ def build_record(raw, langs, master, hw, source):
         if nm and nm != text and nm != text_de:
             o["name"] = nm
         access = p.get("access") or "ReadWrite"
-        if access != "ReadWrite":
-            o["access"] = access
         tshort = short(p.get("type")) if p.get("type") else None
         ty = types_out.get(tshort) if tshort else None
         if tshort:
@@ -1369,8 +1440,6 @@ def build_record(raw, langs, master, hw, source):
         size = ty.get("size_bits") if ty else None
         if size is not None:
             o["size_bits"] = size
-        if p.get("default") is not None:
-            o["default"] = p["default"]
         if loc and loc["kind"] == "memory":
             o["storage"] = "memory"
             seg = raw.segments.get(loc["segment"])
@@ -1391,31 +1460,67 @@ def build_record(raw, langs, master, hw, source):
         if "union" in p:
             o["union"] = p["union"]
             counts["parameters_union"] += 1
-        variants = []
-        shown, hidden = [], []
+        # What ETS shows comes from the refs: each can bring its own text,
+        # default and access, and a ref with Access None sits in the tree but
+        # is never shown.  The parameter takes what its VISIBLE refs agree on;
+        # a ref that differs is listed with the conditions that show it.  The
+        # <Parameter>'s own attributes served "access None" for parameters
+        # every visible ref makes writable, and one default where each channel
+        # mode has its own (review 2026-10-29).
         dyn_pr = (inst["md"].dynamic if inst else raw.dynamic)["pr"]
+        refs = []
         for r in refs_by_param.get(pid, []):
             counts["parameter_refs"] += 1
-            v = {}
-            if r.get("text"):
-                t2 = text2(r["id"], "Text", r["text"], names, r.get("text_param"))[0]
-                if t2 and t2 != text:
-                    v["text"] = t2
-            if r.get("default") is not None and r["default"] != p.get("default"):
-                v["default"] = r["default"]
-            if r.get("access") and r["access"] != access:
-                v["access"] = r["access"]
-            if v:
-                v["ref"] = short_ref(r["id"], pid)
-                variants.append(v)
             e = dyn_pr.get(r["id"])
-            if e:
-                # A ref with Access None sits in the ETS tree but is never shown.
-                (hidden if (r.get("access") or access) == "None" else shown).append(e)
+            acc = r.get("access") or access
+            rt, rt_de = (text2(r["id"], "Text", r["text"], names, r.get("text_param"))
+                         if r.get("text") else (None, None))
+            refs.append({"id": r["id"], "entry": e, "access": acc, "text": rt, "text_de": rt_de,
+                         "default": r["default"] if r.get("default") is not None
+                         else p.get("default"),
+                         "visible": e is not None and acc != "None"})
+        vis = [x for x in refs if x["visible"]]
+        if vis and all(x["text"] for x in vis):     # ETS never shows the parameter's own text
+            o["text"] = collections.Counter(x["text"] for x in vis).most_common(1)[0][0]
+            de = next((x["text_de"] for x in vis if x["text"] == o["text"] and x["text_de"]), None)
+            if de:
+                o["text_de"] = de
+            else:
+                o.pop("text_de", None)
+        top_access, top_default = access, p.get("default")
+        if vis:
+            top_access = collections.Counter(x["access"] for x in vis).most_common(1)[0][0]
+            defaults = {x["default"] for x in vis}
+            top_default = defaults.pop() if len(defaults) == 1 else None
+        if top_access != "ReadWrite":
+            o["access"] = top_access
+        if top_default is not None:
+            o["default"] = top_default
+        variants = []
+        for x in refs:
+            v = {}
+            if x["text"] and x["text"] != o["text"]:
+                v["text"] = x["text"]
+            if x["default"] is not None and x["default"] != top_default:
+                v["default"] = x["default"]
+            if x["access"] != top_access:
+                v["access"] = x["access"]
+            if not v:
+                continue
+            v["ref"] = short_ref(x["id"], pid)
+            ctx = context(x["entry"], inst)
+            for k in ("when", "when_any", "when_any_more", "when_more"):
+                if k in ctx:
+                    v[k] = ctx[k]
+            if not x["visible"]:
+                v["ui"] = False
+            variants.append(v)
         if variants:
             o["variants"] = variants[:8]
             if len(variants) > 8:
                 o["variants_total"] = len(variants)
+        shown = [x["entry"] for x in vis]
+        hidden = [x["entry"] for x in refs if x["entry"] is not None and not x["visible"]]
         # Every visible reference counts: a parameter the UI shows through one
         # ref in blind mode and through another in roller-shutter mode applies
         # in both, and taking the first ref's conditions alone said otherwise.
@@ -1437,6 +1542,11 @@ def build_record(raw, langs, master, hw, source):
                 and size and size <= 64 and (p.get("union") is None or p["union"]["default"])):
             dv = _intval(p.get("default"))
             data = raw.seg_data.get(loc["segment"])
+            if data is not None and data.count(0) >= 0.95 * len(data):
+                # A template of (nearly) only zeros carries no defaults: checking
+                # against it reported a layout problem that does not exist.
+                tcheck["skipped_empty_template"] += 1
+                data = None
             if dv is not None and data is not None:
                 dv &= (1 << size) - 1
                 off, bit = loc["offset"], loc["bit_offset"]
@@ -1608,6 +1718,8 @@ def build_record(raw, langs, master, hw, source):
               "parameters_virtual": counts["parameters_virtual"],
               "parameter_refs": counts["parameter_refs"],
               "template_check": {"checked": tcheck["checked"], "match": tcheck["match"]}}
+    if tcheck["skipped_empty_template"]:
+        counts["template_check"]["skipped_empty_template"] = tcheck["skipped_empty_template"]
     if defs or instances:
         counts.update({"module_defs": len(defs), "module_instances": len(instances),
                        "module_parameters": mod_params, "module_comobjects": mod_cos,
@@ -1678,6 +1790,8 @@ def classify_member(name):
         return "master"
     if base == "hardware.xml":
         return "hardware"
+    if base == "catalog.xml":
+        return "catalog"
     if _APP_FILE_RE.match(base):
         return "app"
     if base.endswith(".knxprod") or base.endswith(".zip"):
@@ -1752,7 +1866,7 @@ class SourceSet:
             self._add_dir(path, depth)
         elif zipfile.is_zipfile(path):
             self._add_zip(path, depth, label)
-        elif os.path.isfile(path) and classify_member(path) in ("app", "master", "hardware"):
+        elif os.path.isfile(path) and classify_member(path) in ("app", "master", "hardware", "catalog"):
             self.members.append(_Member(label, classify_member(path),
                                         lambda p=path: open(p, "rb"), os.path.getsize(path)))
         else:
@@ -2035,7 +2149,8 @@ def _ingest_locked(path, data_dir, source, label=None, log=None):
                 master["manufacturers"].update(new["manufacturers"])
                 master["masks"].update(new["masks"])
                 master["version"] = new.get("version") or master.get("version")
-        hw = {"programs": {}, "products": {}, "langs": {}}
+        hw = {"programs": {}, "products": {}, "langs": {}, "h2p": {}}
+        catalog = []
         for m in src.members:
             if m.kind == "hardware":
                 with m.open() as f:
@@ -2044,8 +2159,24 @@ def _ingest_locked(path, data_dir, source, label=None, log=None):
                     dst = hw["programs"].setdefault(k, [])
                     dst.extend(x for x in lst if x not in dst)
                 hw["products"].update(new["products"])
+                hw["h2p"].update(new["h2p"])
                 for lang, d in new["langs"].items():
                     hw["langs"].setdefault(lang, {}).update(d)
+            elif m.kind == "catalog":
+                try:
+                    with m.open() as f:
+                        catalog.extend(parse_catalog_xml(f))
+                except ET.ParseError as e:
+                    warnings.append("XML error, skipped %s: %s" % (m.name, e))
+        # The catalog names the program each product is sold with; linking per
+        # hardware gave every version of a program all products of its hardware.
+        by_app = {}
+        for prod, h2p in catalog:
+            for app in hw["h2p"].get(h2p, []):
+                lst = by_app.setdefault(app, [])
+                if prod not in lst:
+                    lst.append(prod)
+        hw["programs"].update(by_app)
         for m in src.members:
             if m.kind != "app":
                 continue
@@ -2605,9 +2736,14 @@ def need_app(store, args):
         if any(i[4:8] == app_id[4:8] and (i[:4] == app_id[:4] or i[8:] == app_id[8:]) for i in ids):
             cands.append({"app_id": k, "name": e.get("name"),
                           "version_hex": "%02X" % e.get("application_version", 0)})
+    extra = {}
+    if cands:
+        extra["note"] = ("candidates are other versions of this program: objects, variants and "
+                         "memory layout can differ, do not answer from them in place of the "
+                         "device's own version")
     raise ToolError("unknown_app_id", "application program %s is not ingested" % app_id,
                     app_id=app_id, candidates=cands[:10],
-                    hint="prod-applications lists what is ingested")
+                    hint="prod-applications lists what is ingested", **extra)
 
 
 def _mfr_match(e, wanted):
@@ -2626,15 +2762,19 @@ def _mfr_match(e, wanted):
     return any(wl in n.lower() for n in names if n)
 
 
-def _page(items, offset, limit, render, header, key, budget):
+def _page(items, offset, limit, render, header, key, budget, notes=None, max_level=3):
     """Serialise items[offset:offset+limit]; return fewer when the reply would
     exceed the byte budget.  Detail levels drop optional fields only when even
-    a single item does not fit."""
+    a single item does not fit, and a reply that used one says so in `detail`
+    (notes[level]) — it used to drop conditions without a word."""
     total = len(items)
     window = items[offset:offset + limit]
+    level_now = [0]
 
     def build(rendered, n):
         o = dict(header)
+        if level_now[0] and notes:
+            o["detail"] = notes.get(level_now[0])
         o["total"] = total
         o["offset"] = offset
         o["returned"] = n
@@ -2644,7 +2784,8 @@ def _page(items, offset, limit, render, header, key, budget):
 
     if not window:
         return build([], 0)
-    for level in (0, 1, 2, 3):
+    for level in range(max_level + 1):
+        level_now[0] = level
         rendered = [render(x, level) for x in window]
         acc = _esc_len(build([], 0)) + 24
         n = 0
@@ -2768,9 +2909,62 @@ def _put_when(dst, src, level):
         dst["when_any"] = src["when_any"] if level == 0 else _uniq(a[-1:] for a in src["when_any"])
         if src.get("when_any_more"):
             dst["when_any_more"] = True
+    if src.get("when_more"):
+        dst["when_more"] = True
 
 
-def _render_comobject(c, level):
+def _variant_groups(c):
+    """One entry per distinct size/flags/text of an object's variants, with
+    their refs: an overview for objects with very many variants."""
+    groups = collections.OrderedDict()
+    for v in c.get("variants", []):
+        key = (v.get("size_bits"), v.get("flags"), v.get("text"), v.get("function_text"),
+               v.get("dpt"))
+        g = groups.get(key)
+        if g is None:
+            g = {"size_bits": v.get("size_bits"), "flags": v.get("flags")}
+            if v.get("text") != c["text"]:
+                g["text"] = v.get("text")
+            if v.get("function_text") and v.get("function_text") != c.get("function_text"):
+                g["function_text"] = v["function_text"]
+            if v.get("dpt") and v.get("dpt") != c.get("dpt"):
+                g["dpt"] = v["dpt"]
+            g["count"] = 0
+            g["refs"] = []
+            groups[key] = g
+        g["count"] += 1
+        if len(g["refs"]) < 24:
+            g["refs"].append(v["ref"])
+    return list(groups.values())
+
+
+def _render_co_variant(v, c, level):
+    """A variant always keeps its full conditions: they are what tells two
+    variants of the same size apart."""
+    w = {"ref": v["ref"], "size_bits": v.get("size_bits"), "flags": v.get("flags")}
+    if v.get("size") != c.get("size"):
+        w["size"] = v.get("size")
+    if v.get("text") != c["text"]:
+        w["text"] = v.get("text")
+        if level == 0 and v.get("text_de"):
+            w["text_de"] = v["text_de"]
+    if v.get("function_text") and v.get("function_text") != c.get("function_text"):
+        w["function_text"] = v["function_text"]
+    if v.get("dpt") and v.get("dpt") != c.get("dpt"):
+        w["dpt"] = v["dpt"]
+    if v.get("priority") and v.get("priority") != c.get("priority"):
+        w["priority"] = v["priority"]
+    _put_when(w, v, 0)
+    if level == 0 and v.get("block"):
+        w["block"] = v["block"]
+    if level == 0 and v.get("seen"):
+        w["seen"] = v["seen"]
+    if v.get("ui") is False:
+        w["ui"] = False
+    return w
+
+
+def _render_comobject(c, level, variants=None):
     o = {"number": c["number"], "text": c["text"]}
     if c.get("module"):
         o["module"] = c["module"]["label"]
@@ -2789,58 +2983,60 @@ def _render_comobject(c, level):
         o["priority"] = c["priority"]
     if c.get("dpt"):
         o["dpt"] = c["dpt"]
-    if level >= 3:
-        # Last resort for objects with very many variants (multi-function
-        # push-buttons have >100): one entry per distinct size/flags/text.
-        groups = collections.OrderedDict()
-        for v in c.get("variants", []):
-            key = (v.get("size_bits"), v.get("flags"), v.get("text"), v.get("function_text"),
-                   v.get("dpt"))
-            g = groups.get(key)
-            if g is None:
-                g = {"size_bits": v.get("size_bits"), "flags": v.get("flags")}
-                if v.get("text") != c["text"]:
-                    g["text"] = v.get("text")
-                if v.get("function_text") and v.get("function_text") != c.get("function_text"):
-                    g["function_text"] = v["function_text"]
-                if v.get("dpt") and v.get("dpt") != c.get("dpt"):
-                    g["dpt"] = v["dpt"]
-                g["count"] = 0
-                g["refs"] = []
-                groups[key] = g
-            g["count"] += 1
-            if len(g["refs"]) < 24:
-                g["refs"].append(v["ref"])
-        o["variants_total"] = len(c.get("variants", []))
-        o["variant_groups"] = list(groups.values())
-        o["variants_note"] = ("too many variants for one reply: grouped by size/flags/text, "
-                              "ETS conditions omitted")
-        return o
-    vs = []
-    for v in c.get("variants", []):
-        w = {"ref": v["ref"], "size_bits": v.get("size_bits"), "flags": v.get("flags")}
-        if v.get("size") != c.get("size"):
-            w["size"] = v.get("size")
-        if v.get("text") != c["text"]:
-            w["text"] = v.get("text")
-            if level == 0 and v.get("text_de"):
-                w["text_de"] = v["text_de"]
-        if v.get("function_text") and v.get("function_text") != c.get("function_text"):
-            w["function_text"] = v["function_text"]
-        if v.get("dpt") and v.get("dpt") != c.get("dpt"):
-            w["dpt"] = v["dpt"]
-        if v.get("priority") and v.get("priority") != c.get("priority"):
-            w["priority"] = v["priority"]
-        _put_when(w, v, level)
-        if level < 2 and v.get("block"):
-            w["block"] = v["block"]
-        if level == 0 and v.get("seen"):
-            w["seen"] = v["seen"]
-        if v.get("ui") is False:
-            w["ui"] = False
-        vs.append(w)
-    o["variants"] = vs
+    o["variants"] = [_render_co_variant(v, c, level)
+                     for v in (c.get("variants", []) if variants is None else variants)]
     return o
+
+
+_CO_NOTES = {1: "reduced: no text_de/name/block"}
+
+
+def _page_variants(items, offset, voff, header, budget):
+    """One object whose variants do not fit into one reply, in parts: as many
+    variants as fit, each with its full conditions, and where to go on.  The
+    first part adds an overview by size/flags/text.  It replaced an emergency
+    level that cut every variant's conditions to the innermost one, after which
+    variants of the same size could no longer be told apart."""
+    total = len(items)
+    if offset >= total:
+        o = dict(header, total=total, offset=offset, returned=0, next_offset=None, comobjects=[])
+        return _dumps(o)
+    c = items[offset]
+    vs = c.get("variants", [])
+    if voff >= len(vs) and vs:
+        raise ToolError("invalid_argument", "variant_offset %d: object %s has %d variants"
+                        % (voff, c["number"], len(vs)))
+
+    def build(k, groups):
+        o = _render_comobject(c, 1, vs[voff:voff + k])
+        nxt = voff + k if voff + k < len(vs) else None
+        o.update(variants_total=len(vs), variants_offset=voff, variants_next_offset=nxt)
+        if groups:
+            o["variant_groups"] = _variant_groups(c)
+        # next_offset always moves on: a client that only follows it must not
+        # be sent back to the same object for ever (it was, until a real-data
+        # run paging every program never finished).
+        h = dict(header, total=total, offset=offset, returned=1,
+                 next_offset=offset + 1 if offset + 1 < total else None)
+        if nxt is not None:
+            h["detail"] = ("object %s has more variants than one reply holds: ask again with "
+                           "offset %d and variant_offset %d for the next ones"
+                           % (c["number"], offset, nxt))
+        else:
+            h["detail"] = "the last variants of object %s" % c["number"]
+        h["comobjects"] = [o]
+        return _dumps(h)
+
+    # The overview only where it condenses: one group per variant says nothing.
+    condenses = voff == 0 and len(_variant_groups(c)) * 2 <= len(vs)
+    for groups in ((True, False) if condenses else (False,)):
+        k = len(vs) - voff
+        while k > 0:
+            text = build(k, groups)
+            if _esc_len(text) <= budget:
+                return text
+            k -= max(1, k // 8)
+    raise ToolError("result_too_large", "a single variant does not fit into %d bytes" % budget)
 
 
 def tool_comobjects(store, args, budget):
@@ -2858,6 +3054,7 @@ def tool_comobjects(store, args, budget):
     module = _arg_str(args, "module")
     offset = _arg_int(args, "offset", 0, 0, 1 << 30)
     limit = _arg_int(args, "limit", 40, 1, 200)
+    voff = _arg_int(args, "variant_offset", 0, 0, 1 << 30)
     wanted = set(numbers) if numbers is not None else None
     items = []
     for c in rec.get("comobjects", []):
@@ -2879,7 +3076,14 @@ def tool_comobjects(store, args, budget):
         missing = sorted(n for n in wanted if n not in found)
         if missing:
             header["missing_numbers"] = missing[:64]
-    return _page(items, offset, limit, _render_comobject, header, "comobjects", budget)
+    if voff == 0:
+        try:
+            return _page(items, offset, limit, _render_comobject, header, "comobjects", budget,
+                         notes=_CO_NOTES, max_level=1)
+        except ToolError as e:
+            if e.payload.get("error") != "result_too_large":
+                raise
+    return _page_variants(items, offset, voff, header, budget)
 
 
 def _param_nbytes(p):
@@ -2899,13 +3103,26 @@ def _render_type(ty, level):
             o["signed"] = True
         if ty.get("encoding"):
             o["encoding"] = ty["encoding"]
+    elif ty.get("kind") == "color" and ty.get("space"):
+        o["space"] = ty["space"]
     elif ty.get("kind") == "enum":
         vals = ty.get("values", [])
         cap = (64, 24, 8, 4)[level]
         o["values"] = vals[:cap]
         if len(vals) > cap:
             o["values_total"] = len(vals)
+        if ty.get("binary"):
+            o["binary"] = ty["binary"][:cap]
     return o
+
+
+def _binary_enum(ty, v, size):
+    """(value, hex) of an enum stored as BinaryValue bytes; value None if no match."""
+    h = "%0*X" % ((size + 3) // 4, v)
+    for b, value in ty.get("binary", []):
+        if b == h:
+            return value, h
+    return None, h
 
 
 def _enum_text(ty, value):
@@ -2914,6 +3131,22 @@ def _enum_text(ty, value):
             if v == value:
                 return t
     return None
+
+
+_PARAM_NOTES = {1: "reduced: no text_de/name/block, enum values <= 24",
+                2: "reduced: conditions cut to the innermost one, enum values <= 8",
+                3: "reduced: no conditions, enum values <= 4"}
+
+
+def _render_param_variant(v, level):
+    """A ref that differs from the parameter, with the conditions that show
+    it — kept at every level, it is the per-mode default or access."""
+    w = {k: v[k] for k in ("ref", "default", "access", "ui") if k in v}
+    if v.get("text") and level < 2:
+        w["text"] = v["text"]
+    if level < 3:
+        _put_when(w, v, 0 if level < 2 else 1)
+    return w
 
 
 def _render_param(p, types, level, order="big"):
@@ -2941,9 +3174,13 @@ def _render_param(p, types, level, order="big"):
         o["storage"] = None
     if size is not None:
         o["size_bits"] = size
+    ty = types.get(p.get("type")) if p.get("type") else None
     if p.get("storage") == "memory" and size:
         o["extract"] = extract_rule(p.get("bit_offset", 0), size, order)
-    ty = types.get(p.get("type")) if p.get("type") else None
+        if ty and ty.get("kind") == "float":
+            o["extract"]["decode"] = ty.get("encoding") or "float"
+        elif ty and ty.get("kind") == "color":
+            o["extract"]["decode"] = ty.get("space") or "color"
     rt = _render_type(ty, level)
     if rt:
         o["type"] = rt
@@ -2957,13 +3194,17 @@ def _render_param(p, types, level, order="big"):
     if p.get("union"):
         o["union"] = p["union"]
     if level < 3:
-        _put_when(o, p, level)
-    if level < 2 and p.get("block"):
+        _put_when(o, p, 0 if level < 2 else 1)
+    elif p.get("when_more"):
+        o["when_more"] = True
+    if level == 0 and p.get("block"):
         o["block"] = p["block"]
     if p.get("ui") is False:
         o["ui"] = False
-    if level == 0 and p.get("variants"):
-        o["variants"] = p["variants"]
+    if p.get("variants"):
+        o["variants"] = [_render_param_variant(v, level) for v in p["variants"]]
+        if p.get("variants_total"):
+            o["variants_total"] = p["variants_total"]
     return o
 
 
@@ -3014,7 +3255,7 @@ def tool_parameters(store, args, budget):
         if segment is None and not items and _relative_hint(rec):
             header["hint"] = _relative_hint(rec)
     return _page(items, offset, limit, lambda p, lv: _render_param(p, types, lv, order),
-                 header, "parameters", budget)
+                 header, "parameters", budget, notes=_PARAM_NOTES)
 
 
 def tool_decode(store, args, budget):
@@ -3039,10 +3280,18 @@ def tool_decode(store, args, budget):
     types = rec.get("types", {})
     bo = rec.get("byte_order", {})
     order = bo.get("used", "big")
-    values, partial = [], []
+    values, partial, skipped = [], [], []
     for p in rec.get("parameters", []):
         a, size = _place(p, segment), p.get("size_bits")
-        if a is None or not size:
+        if a is None:
+            continue
+        ty = types.get(p.get("type")) if p.get("type") else None
+        if not size:
+            # Its size is not known, so it cannot be cut out of the bytes —
+            # but it lives here, and silence would say nothing does.
+            if base <= a < end:
+                skipped.append({"id": p["id"], "kind": ty.get("kind") if ty else None,
+                                "why": "size unknown"})
             continue
         nb = _param_nbytes(p)
         if a + nb <= base or a >= end:
@@ -3050,7 +3299,6 @@ def tool_decode(store, args, budget):
         if a < base or a + nb > end:
             partial.append(p["id"])
             continue
-        ty = types.get(p.get("type")) if p.get("type") else None
         o = {"id": p["id"], "text": p["text"]}
         if p.get("module"):
             o["module"] = p["module"]["label"]
@@ -3061,20 +3309,37 @@ def tool_decode(store, args, budget):
         o["bit_offset"] = p.get("bit_offset")
         o["size_bits"] = size
         kind = ty.get("kind") if ty else None
+        bit = p.get("bit_offset", 0) or 0
+        chunk = data[a - base:a - base + nb]
         v = None
         if kind in ("number", "enum") and size <= 64:
-            v = extract_bits(data, a - base, p.get("bit_offset", 0), size, order)
+            v = extract_bits(data, a - base, bit, size, order)
         if v is not None:
             if kind == "number" and ty.get("signed") and v >= 1 << (size - 1):
                 v -= 1 << size
             o["value"] = v
-            if kind == "enum":
+            if kind == "enum" and ty.get("binary"):
+                value, h = _binary_enum(ty, v, size)
+                o["value"], o["raw_hex"] = (value if value is not None else v), h
+                vt = _enum_text(ty, value) if value is not None else None
+                o["value_text"] = vt if vt is not None else "(not an enumerated value)"
+            elif kind == "enum":
                 vt = _enum_text(ty, str(v))
                 o["value_text"] = vt if vt is not None else "(not an enumerated value)"
             if p.get("default") is not None:
                 o["default"] = p["default"]
+        elif kind == "float" and not bit and size in (16, 32, 64):
+            o["value"] = decode_float(chunk, order)
+            o["encoding"] = ty.get("encoding")
+            if o["value"] is None:
+                o["note"] = "0x7FFF: DPT 9 says invalid value"
+            if p.get("default") is not None:
+                o["default"] = p["default"]
+        elif kind == "color" and not bit and size == 24:
+            o["value"] = list(chunk)
+            o["space"] = ty.get("space")
         else:
-            o["raw_hex"] = data[a - base:a - base + nb].hex().upper()
+            o["raw_hex"] = chunk.hex().upper()
             o["kind"] = kind
         if p.get("union"):
             o["union"] = True
@@ -3099,6 +3364,10 @@ def tool_decode(store, args, budget):
         header["partial"] = partial[:20]
         if len(partial) > 20:
             header["partial_total"] = len(partial)
+    if skipped:
+        header["skipped"] = skipped[:20]
+        if len(skipped) > 20:
+            header["skipped_total"] = len(skipped)
 
     def render(o, level):
         if level == 0:
@@ -3108,7 +3377,9 @@ def tool_decode(store, args, budget):
             _put_when(r, o, 1)
         return r
 
-    return _page(values, offset, limit, render, header, "values", budget)
+    notes = {1: "reduced: conditions cut to the innermost one", 2: "reduced: no conditions"}
+    return _page(values, offset, limit, render, header, "values", budget, notes=notes,
+                 max_level=2)
 
 
 # Kept short on purpose: gateways that federate these tools merge them into
@@ -3154,13 +3425,17 @@ TOOLS = [
          "name labels the SLOT, not the function: in another mode the same number may do "
          "something else (a 'slat position' slot can switch a pump). Pick the variant "
          "whose size_bits matches the size the device reports. Filter: numbers, query, "
-         "module (instance of an ETS module). Paginated."),
+         "module (instance of an ETS module). Paginated; very many variants come in "
+         "parts (variant_offset)."),
      "inputSchema": {"type": "object", "properties": dict({
          "app_id": _APP_ID_PROP,
          "numbers": {"type": "array", "items": {"type": "integer", "minimum": 0,
                                                 "maximum": 65535}},
          "query": {"type": "string"},
-         "module": _MODULE_PROP}, **_PAGE_PROPS), "required": ["app_id"]},
+         "module": _MODULE_PROP,
+         "variant_offset": {"type": "integer", "minimum": 0,
+                            "description": "Next part of an object's variants"}},
+         **_PAGE_PROPS), "required": ["app_id"]},
      "annotations": {"readOnlyHint": True}},
     {"name": "prod-parameters",
      "description": (

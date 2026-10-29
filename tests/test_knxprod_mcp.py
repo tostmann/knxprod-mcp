@@ -381,13 +381,14 @@ class TestDistill(unittest.TestCase):
         self.assertEqual(p1["text_de"], "Betriebsart Kanal 1")
         self.assertNotIn("name", p1)
         self.assertEqual(p1["variants"], [{"text": "Operating mode of channel 1 (expert)",
-                                           "ref": "R-2"}])
+                                           "ref": "R-2", "ui": False}])     # never placed
         self.assertEqual(p1["block"], "Channel 1")
         p2 = by_id(ps, "P-2")
         self.assertEqual((p2["address"], p2["bit_offset"], p2["size_bits"]), (19011, 0, 1))
         p3 = by_id(ps, "P-3")
-        self.assertEqual((p3["address"], p3["size_bits"], p3["default"]), (18954, 16, "300"))
-        self.assertEqual(p3["variants"], [{"default": "120", "ref": "R-4"}])
+        # its only ref, the one ETS shows, overrides the default: 120, not 300
+        self.assertEqual((p3["address"], p3["size_bits"], p3["default"]), (18954, 16, "120"))
+        self.assertNotIn("variants", p3)
         p5 = by_id(ps, "P-5")
         self.assertEqual(p5["text"], "Frost protection temperature")
         self.assertEqual(self.rec["types"][p5["type"]],
@@ -939,19 +940,36 @@ class TestModules(unittest.TestCase):
         self.assertIn("RS-04-00000", o["hint"])
 
     def test_budget_paging(self):
+        # 1000 bytes: tiny on purpose (the real budget is 12 000).  It was 900
+        # until a reduced reply had to say what it left out (`detail`).
+        budget = 1000
         for tool, key in ((K.tool_parameters, "parameters"), (K.tool_comobjects, "comobjects")):
-            seen, off = [], 0
+            seen, off, voff, nvar = [], 0, 0, 0
             while True:
-                text = tool(self.store, {"app_id": APP3, "offset": off, "include_virtual": True},
-                            900)
-                self.assertLessEqual(K._esc_len(text), 900)
+                args = {"app_id": APP3, "offset": off, "include_virtual": True}
+                if voff:
+                    args["variant_offset"] = voff
+                text = tool(self.store, args, budget)
+                self.assertLessEqual(K._esc_len(text), budget)
                 o = json.loads(text)
-                seen += [x["id"] if key == "parameters" else x["number"] for x in o[key]]
+                for i, x in enumerate(o[key]):
+                    nvar += len(x.get("variants", [])) if key == "comobjects" else 0
+                    if i == 0 and voff:             # the rest of an object already counted
+                        continue
+                    seen.append(x["id"] if key == "parameters" else x["number"])
+                nxt = o[key][-1].get("variants_next_offset") if o[key] else None
+                if nxt:
+                    # the rest of this object: same offset, next part of its variants
+                    off, voff = off + len(o[key]) - 1, nxt
+                    continue
+                voff = 0
                 if o["next_offset"] is None:
                     break
                 off = o["next_offset"]
             self.assertEqual(seen, [x["id"] if key == "parameters" else x["number"]
                                     for x in self.rec[key]])
+            if key == "comobjects":
+                self.assertEqual(nvar, sum(len(c["variants"]) for c in self.rec[key]))
 
     def test_unsupported_features_are_counted(self):
         xml = _read(APP3_XML).decode("utf-8")
@@ -1014,6 +1032,331 @@ class TestModules(unittest.TestCase):
         self.assertEqual(f("{{Unknown:fallback}}", names), ("fallback", 0))
         self.assertEqual(f("no placeholder", names), ("no placeholder", 0))
         self.assertEqual(f("broken {{ChNo", names), ("broken {{ChNo", 0))
+
+
+# ---------------------------------------------------------------------------
+# 4b2. review findings 2026-10-29: each test fails on the code before the fix
+# ---------------------------------------------------------------------------
+
+PRE1 = "M-FFF0_A-1234-56-ABCD_"
+PRE3 = "M-FFF0_A-0C0D-21-5A5A_"
+
+
+def app1_with(after=None, insert="", refs="", corefs="", replace=None):
+    """APP1 as XML text with extra Dynamic content after the element `after`,
+    extra ParameterRefs / ComObjectRefs, and plain replacements."""
+    xml = _read(APP_XML).decode("utf-8")
+    if after:
+        assert xml.count(after) == 1, after
+        xml = xml.replace(after, after + insert)
+    if refs:
+        xml = xml.replace("</ParameterRefs>", refs + "</ParameterRefs>")
+    if corefs:
+        xml = xml.replace("</ComObjectRefs>", corefs + "</ComObjectRefs>")
+    for a, b in (replace or []):
+        assert xml.count(a) == 1, a
+        xml = xml.replace(a, b)
+    return xml
+
+
+class TestReviewConditions(unittest.TestCase):
+
+    def test_the_whole_chain_counts_the_mode_first(self):
+        # A parameter four chooses deep lost its outermost condition, the
+        # channel mode, to a cap of three.
+        deep = ('<choose ParamRefId="{p}P-2_R-3"><when test="1">'
+                '<choose ParamRefId="{p}UP-20_R-20"><when test="2">'
+                '<choose ParamRefId="{p}P-6_R-7"><when test="1">'
+                '<ParameterRefRef RefId="{p}P-5_R-6" />'
+                '</when></choose></when></choose></when></choose>').format(p=PRE1)
+        rec = distill_xml(app1_with('<ParameterRefRef RefId="%sUP-20_R-20" />' % PRE1, deep))
+        p5 = by_id(rec["parameters"], "P-5")
+        self.assertEqual(p5["when"], ["Channel 1 operating mode = 1 (Blind)",
+                                      "Scene 1 active = 1 (enabled)",
+                                      "Time base = 2 (Switch)",
+                                      "Property-stored option = 1 (enabled)"])
+        self.assertNotIn("when_more", p5)
+        self.assertNotIn("ui", p5)
+
+    def test_a_chain_over_the_cap_keeps_the_outermost_and_says_so(self):
+        n = K.MAX_CONDS + 1
+        deep = ('<choose ParamRefId="%sP-2_R-3"><when test="1">' % PRE1) * n \
+            + '<ParameterRefRef RefId="%sP-5_R-6" />' % PRE1 + "</when></choose>" * n
+        rec = distill_xml(app1_with('<ParameterRefRef RefId="%sUP-20_R-20" />' % PRE1, deep))
+        p5 = by_id(rec["parameters"], "P-5")
+        self.assertEqual(len(p5["when"]), K.MAX_CONDS)
+        self.assertEqual(p5["when"][0], "Channel 1 operating mode = 1 (Blind)")
+        self.assertIs(p5["when_more"], True)
+        s = {}
+        K._put_when(s, p5, 2)
+        self.assertIs(s["when_more"], True)                # survives a reduced reply
+
+    def test_every_test_value_counts(self):
+        # A test list was cut after six values: a device set to the seventh
+        # looked out of scope.
+        rec = distill_xml(app1_with(
+            '<ParameterRefRef RefId="%sP-3_R-4" />' % PRE1,
+            '<choose ParamRefId="{p}P-5_R-6"><when test="1 2 3 4 5 6 7 8">'
+            '<ComObjectRefRef RefId="{p}O-1_R-18" /></when></choose>'.format(p=PRE1),
+            corefs='<ComObjectRef Id="{p}O-1_R-18" RefId="{p}O-1" />'.format(p=PRE1)))
+        o1 = [c for c in rec["comobjects"] if c["number"] == 1][0]
+        v = [x for x in o1["variants"] if x["ref"] == "R-18"][0]
+        self.assertEqual(v["when"], ["Frost protection temperature in {1, 2, 3, 4, 5, 6, 7, 8}"])
+
+    def test_a_module_keeps_every_condition_that_places_it(self):
+        # A module placed under two chooses kept only the inner one.
+        xml = _read(APP3_XML).decode("utf-8")
+        start = xml.index('<choose ParamRefId="%sP-2_R-2">' % PRE3)
+        end = xml.index("</choose>", start) + len("</choose>")
+        xml = (xml[:start] + '<choose ParamRefId="%sP-3_R-3"><when test="2">' % PRE3
+               + xml[start:end] + "</when></choose>" + xml[end:])
+        p = {x["id"]: x for x in distill_xml(xml)["parameters"]}
+        self.assertEqual(p["MD-1_M-1_P-3"]["when"][:2], ["Channel Right mode = 2 (dimmer)",
+                                                        "Channel Left mode = 1 (switch)"])
+
+
+class OneApp:
+    """A store holding one distilled record, for the tool functions."""
+
+    def __init__(self, rec):
+        self.rec = rec
+
+    def app(self, app_id):
+        return self.rec if app_id == self.rec["app_id"] else None
+
+    def index(self):
+        return {"apps": {self.rec["app_id"]: {"name": self.rec["name"],
+                                              "application_version":
+                                                  self.rec["application_version"]}}}
+
+
+def tool_json(fn, rec, args, budget=K.RESPONSE_BUDGET):
+    return json.loads(fn(OneApp(rec), dict(args, app_id=rec["app_id"]), budget))
+
+
+class TestReviewRefs(unittest.TestCase):
+
+    def test_access_and_default_come_from_the_refs_ets_shows(self):
+        # The <Parameter> says Access None, Value 0; the two refs ETS shows
+        # make it writable, one with its own default.  Served were the
+        # parameter's "None" and "0", and the overrides without a condition.
+        rec = distill_xml(app1_with(
+            '<ParameterRefRef RefId="%sUP-12_R-12" />' % PRE1,
+            '<ParameterRefRef RefId="%sP-2_R-19" />' % PRE1,
+            refs='<ParameterRef Id="{p}P-2_R-19" RefId="{p}P-2" Access="ReadWrite" />'.format(
+                p=PRE1),
+            replace=[('Text="Scene 1 active" ParameterType="%sPT-OnOff" Access="ReadWrite" '
+                      'Value="1"' % PRE1,
+                      'Text="Scene 1 active" ParameterType="%sPT-OnOff" Access="None" '
+                      'Value="0"' % PRE1),
+                     ('<ParameterRef Id="{p}P-2_R-3" RefId="{p}P-2" />'.format(p=PRE1),
+                      '<ParameterRef Id="{p}P-2_R-3" RefId="{p}P-2" Access="ReadWrite" '
+                      'Value="1" />'.format(p=PRE1))]))
+        p2 = by_id(rec["parameters"], "P-2")
+        self.assertNotIn("access", p2)                      # every ref ETS shows: ReadWrite
+        self.assertNotIn("default", p2)                     # the modes disagree
+        v = {x["ref"]: x for x in p2["variants"]}
+        self.assertEqual(v["R-3"], {"ref": "R-3", "default": "1"})
+        self.assertEqual(v["R-19"], {"ref": "R-19", "default": "0",
+                                     "when": ["Channel 1 operating mode = 2 (Switch)"]})
+        d = tool_json(K.tool_decode, rec, {"address": 19011, "data": "80"})
+        val = [x for x in d["values"] if x["id"] == "P-2"][0]
+        self.assertEqual(val["value"], 1)
+        self.assertNotIn("default", val)                    # no single default to compare with
+        o = tool_json(K.tool_parameters, rec, {"query": "scene 1 active"})
+        self.assertEqual(len(o["parameters"][0]["variants"]), 2)
+
+    def test_text_comes_from_the_refs_ets_shows(self):
+        rec = distill_xml(app1_with(replace=[(
+            '<ParameterRef Id="{p}P-1_R-1" RefId="{p}P-1" />'.format(p=PRE1),
+            '<ParameterRef Id="{p}P-1_R-1" RefId="{p}P-1" Text="Mode of channel 1" />'.format(
+                p=PRE1))]))
+        p1 = by_id(rec["parameters"], "P-1")
+        self.assertEqual(p1["text"], "Mode of channel 1")
+        self.assertEqual([v["ref"] for v in p1["variants"]], ["R-2"])   # the hidden expert one
+
+
+def app1_with_types():
+    """APP1 plus a DPT 9 float, an RGB colour, a colour of unknown size and a
+    BinaryValue enum, at segment offsets 30, 32, 40 and 50."""
+    types = ('<ParameterType Id="{p}PT-Temp9" Name="Temp9"><TypeFloat Encoding="DPT 9" '
+             'minInclusive="-100" maxInclusive="200" /></ParameterType>'
+             '<ParameterType Id="{p}PT-RGB" Name="RGB"><TypeColor Space="RGB" /></ParameterType>'
+             '<ParameterType Id="{p}PT-XYZ" Name="XYZ"><TypeColor Space="XYZ" /></ParameterType>'
+             '<ParameterType Id="{p}PT-Bin" Name="Bin"><TypeRestriction Base="BinaryValue" '
+             'SizeInBit="16"><Enumeration Text="Variant A" Value="0" BinaryValue="AAo=" '
+             'Id="{p}PT-Bin_EN-0" /><Enumeration Text="Variant B" Value="1" BinaryValue="ABQ=" '
+             'Id="{p}PT-Bin_EN-1" /></TypeRestriction></ParameterType>').format(p=PRE1)
+    params = "".join(
+        '<Parameter Id="{p}P-{n}" Name="{name}" Text="{name}" ParameterType="{p}PT-{t}" '
+        'Access="ReadWrite" Value="{v}"><Memory CodeSegment="{p}AS-4A00" BitOffset="0" '
+        'Offset="{off}" /></Parameter>'.format(p=PRE1, n=n, name=name, t=t, v=v, off=off)
+        for n, name, t, v, off in ((8, "Threshold", "Temp9", "21", 30),
+                                   (9, "Colour", "RGB", "#FF0000", 32),
+                                   (10, "Odd colour", "XYZ", "0", 40),
+                                   (11, "Hardware variant", "Bin", "0", 50)))
+    refs = "".join('<ParameterRef Id="{p}P-{n}_R-2{n}" RefId="{p}P-{n}" />'.format(p=PRE1, n=n)
+                   for n in (8, 9, 10, 11))
+    return distill_xml(app1_with(refs=refs, replace=[
+        ("</ParameterTypes>", types + "</ParameterTypes>"),
+        ("<Union SizeInBit=\"16\">", params + "<Union SizeInBit=\"16\">")]))
+
+
+class TestReviewTypes(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rec = app1_with_types()
+
+    def test_float_and_colour_have_a_size_and_an_extract_rule(self):
+        p = {x["id"]: x for x in self.rec["parameters"]}
+        self.assertEqual((p["P-8"]["size_bits"], p["P-9"]["size_bits"]), (16, 24))
+        o = tool_json(K.tool_parameters, self.rec, {"address": 18975})     # second float byte
+        self.assertEqual([x["id"] for x in o["parameters"]], ["P-8"])
+        self.assertEqual(o["parameters"][0]["extract"],
+                         {"bytes": 2, "shift": 0, "mask": "0xFFFF", "decode": "DPT 9"})
+
+    def test_decode_floats_colours_and_binary_enums_and_name_what_it_cannot(self):
+        d = tool_json(K.tool_decode, self.rec, {"address": 18974,      # offsets 30 .. 51
+                                               "data": "0C1A FF8000 %s 0014" % ("00" * 15)})
+        v = {x["id"]: x for x in d["values"]}
+        self.assertEqual((v["P-8"]["value"], v["P-8"]["encoding"]), (21.0, "DPT 9"))
+        self.assertEqual((v["P-9"]["value"], v["P-9"]["space"]), ([255, 128, 0], "RGB"))
+        self.assertEqual((v["P-11"]["value"], v["P-11"]["value_text"], v["P-11"]["raw_hex"]),
+                         ("1", "Variant B", "0014"))
+        self.assertEqual(d["skipped"], [{"id": "P-10", "kind": "color", "why": "size unknown"}])
+        d = tool_json(K.tool_decode, self.rec, {"address": 18974, "data": "7FFF"})
+        f = [x for x in d["values"] if x["id"] == "P-8"][0]
+        self.assertIsNone(f["value"])
+        self.assertIn("invalid", f["note"])
+
+
+class TestReviewBudget(unittest.TestCase):
+
+    def test_an_object_with_too_many_variants_comes_in_parts_with_full_conditions(self):
+        # A reply over budget cut every variant's conditions to the innermost
+        # one: same-size variants became indistinguishable, and nothing said so.
+        n = 40
+        # all alike but for the condition that shows them, as on push-buttons
+        corefs = "".join('<ComObjectRef Id="{p}O-0_R-{r}" RefId="{p}O-0" />'
+                         .format(p=PRE1, r=100 + i) for i in range(n))
+        place = ('<choose ParamRefId="%sP-5_R-6">' % PRE1 + "".join(
+            '<when test="{i}"><ComObjectRefRef RefId="{p}O-0_R-{r}" /></when>'.format(
+                p=PRE1, i=i, r=100 + i) for i in range(n)) + "</choose>")
+        rec = distill_xml(app1_with('<ParameterRefRef RefId="%sUP-20_R-20" />' % PRE1, place,
+                                    corefs=corefs))
+        total = len([c for c in rec["comobjects"] if c["number"] == 0][0]["variants"])
+        refs, voff, parts = [], 0, 0
+        while True:
+            args = {"numbers": [0]}
+            if voff:
+                args["variant_offset"] = voff
+            text = K.tool_comobjects(OneApp(rec), dict(args, app_id=rec["app_id"]), 3000)
+            self.assertLessEqual(K._esc_len(text), 3000)
+            o = json.loads(text)
+            c = o["comobjects"][0]
+            parts += 1
+            self.assertEqual((c["variants_total"], c["variants_offset"]), (total, voff))
+            self.assertEqual("variant_groups" in c, voff == 0)          # overview first
+            for v in c["variants"]:
+                refs.append(v["ref"])
+                if v["ref"].startswith("R-1") and len(v["ref"]) == 5:
+                    self.assertEqual(len(v["when"]), 2, v)              # mode + test value
+            if c["variants_next_offset"] is None:
+                break
+            self.assertIn("variant_offset %d" % c["variants_next_offset"], o["detail"])
+            voff = c["variants_next_offset"]
+        self.assertGreater(parts, 1)
+        self.assertEqual(len(refs), total)
+        self.assertEqual(len(set(refs)), total)
+        # A client that knows nothing of variant_offset and only follows
+        # next_offset must still get through every object, once each (the first
+        # version of this paging sent it back to the same object for ever).
+        seen, off, calls = [], 0, 0
+        while off is not None and calls < 50:
+            o = json.loads(K.tool_comobjects(OneApp(rec), {"app_id": rec["app_id"], "offset": off},
+                                             3000))
+            seen += [c["number"] for c in o["comobjects"]]
+            off, calls = o["next_offset"], calls + 1
+        self.assertIsNone(off)
+        self.assertEqual(seen, [c["number"] for c in rec["comobjects"]])
+
+    def test_a_reduced_reply_says_so_and_keeps_the_conditions_first(self):
+        # a long block name: what level 1 leaves out must outweigh its note
+        rec = distill_xml(app1_with(replace=[(
+            'Name="Kanal 1" Text="Channel 1"', 'Name="Kanal 1" Text="Channel 1 %s"' % ("x" * 300))]))
+        full = K.tool_parameters(OneApp(rec), {"app_id": rec["app_id"], "query": "channel name"},
+                                 K.RESPONSE_BUDGET)
+        self.assertNotIn('"detail"', full)
+        o = json.loads(K.tool_parameters(OneApp(rec), {"app_id": rec["app_id"],
+                                                       "query": "channel name"},
+                                         K._esc_len(full) - 1))
+        self.assertEqual(o["detail"], K._PARAM_NOTES[1])
+        p4 = o["parameters"][0]
+        self.assertEqual(len(p4["when_any"]), 2)                        # conditions untouched
+        self.assertNotIn("block", p4)
+
+
+CATALOG = """<?xml version="1.0" encoding="utf-8"?>
+<!-- SYNTHETIC test fixture written for knxprod-mcp.  Not manufacturer data. -->
+<KNX xmlns="http://knx.org/xml/project/20"><ManufacturerData><Manufacturer RefId="M-FFF0">
+<Catalog><CatalogSection Id="M-FFF0_CS-1" Name="Test" Number="1" DefaultLanguage="en-US">
+<CatalogItem Id="M-FFF0_CI-1" Name="2-gang" Number="1" DefaultLanguage="en-US"
+  ProductRefId="M-FFF0_H-TEST-1_P-TEST.2D0001" Hardware2ProgramRefId="M-FFF0_H-TEST-1_HP-1234-56-ABCD" />
+<CatalogItem Id="M-FFF0_CI-2" Name="4-gang" Number="2" DefaultLanguage="en-US"
+  ProductRefId="M-FFF0_H-TEST-1_P-TEST.2D0002" Hardware2ProgramRefId="M-FFF0_H-TEST-1_HP-0C0D-21-5A5A" />
+</CatalogSection></Catalog></Manufacturer></ManufacturerData></KNX>"""
+
+
+class TestReviewCatalogTemplate(unittest.TestCase):
+
+    def ingest(self, with_catalog):
+        # one hardware carrying two programs: APP1 and APP3
+        hw = _read(os.path.join(FIXTURE, "M-FFF0", "Hardware.xml")).replace(
+            b'</Hardware2Program>\n          </Hardware2Programs>',
+            b'</Hardware2Program>\n            <Hardware2Program Id="M-FFF0_H-TEST-1_HP-0C0D-21-5A5A" '
+            b'MediumTypes="MT-0"><ApplicationProgramRef RefId="M-FFF0_A-0C0D-21-5A5A" />'
+            b'</Hardware2Program>\n          </Hardware2Programs>', 1)
+        items = members("master", "app1", "app3") + [("M-FFF0/Hardware.xml", hw)]
+        if with_catalog:
+            items.append(("M-FFF0/Catalog.xml", CATALOG.encode()))
+        tmp = _tmpdir()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "two-programs.knxprod")
+        with open(path, "wb") as f:
+            f.write(zip_bytes(items))
+        K.ingest_file(path, os.path.join(tmp, "data"))
+        return {a: [p["order_number"] for p in load_json(os.path.join(
+                    tmp, "data", "apps", a + ".json"))["products"]] for a in (APP1, APP3)}
+
+    def test_products_follow_the_catalog(self):
+        # Linked per hardware, both programs listed both products.
+        self.assertEqual(self.ingest(True), {APP1: ["TEST-0001"], APP3: ["TEST-0002"]})
+
+    def test_without_a_catalog_the_hardware_links_them(self):
+        self.assertEqual(self.ingest(False), {APP1: ["TEST-0001", "TEST-0002"],
+                                              APP3: ["TEST-0001", "TEST-0002"]})
+
+    def test_an_empty_template_checks_nothing(self):
+        # A template of zeros carries no defaults; checking against it made a
+        # correct layout look half wrong.
+        xml = re.sub(r'(<AbsoluteSegment Id="%sAS-4A00"[^>]*>\s*<Data>)[^<]*(</Data>)' % PRE1,
+                     lambda m: m.group(1) + base64.b64encode(bytes(128)).decode() + m.group(2),
+                     _read(APP_XML).decode("utf-8"))
+        tc = distill_xml(xml)["counts"]["template_check"]
+        self.assertEqual((tc["checked"], tc["match"]), (0, 0))
+        self.assertGreater(tc["skipped_empty_template"], 0)
+
+    def test_candidates_come_with_a_warning(self):
+        rec = distill_xml(_read(APP_XML).decode("utf-8"))
+        with self.assertRaises(K.ToolError) as cm:
+            K.need_app(OneApp(rec), {"app_id": "FFF0123457"})
+        e = cm.exception.payload
+        self.assertEqual([c["app_id"] for c in e["candidates"]], [APP1])
+        self.assertIn("do not answer from them", e["note"])
+        with self.assertRaises(K.ToolError) as cm:
+            K.need_app(OneApp(rec), {"app_id": "FFF0999901"})
+        self.assertNotIn("note", cm.exception.payload)
 
 
 # ---------------------------------------------------------------------------

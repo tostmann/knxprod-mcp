@@ -48,6 +48,9 @@ every tool.
 - A name names the SLOT in the program, not what this installation uses it for
   (in switch mode a "slat position" slot may switch a pump). Do not present a
   slot name as the function without checking the configuration.
+- An object with more variants than one reply holds comes in parts, each
+  variant with its full conditions: `variants_next_offset` says where to go on
+  (`variant_offset`); the first part may add `variant_groups`, an overview.
 
 ## Parameters
 
@@ -59,6 +62,12 @@ every tool.
 - `union` members share bytes. `when` says which channel mode each belongs to;
   only the member of the configured mode is meaningful. `ui: false` marks a
   parameter ETS never shows.
+- `default`, `access` and `text` are what ETS shows. Where channel modes
+  differ, `variants` lists each ref with its own `default`/`access` and the
+  conditions that show it; then the parameter itself has no `default`.
+- Floats (DPT 9, IEEE-754) and colours have `extract.decode`; `prod-decode`
+  returns their value. Parameters it cannot cut out of the bytes are listed in
+  `skipped`, not left out.
 - Modules: many programs define a channel once (an ETS module) and instantiate
   it per channel. Every instance is listed on its own, with its own address or
   object number and `module` = the instance, e.g. "Channel B"; its ids start
@@ -71,11 +80,12 @@ every tool.
 ## Conditions: `when` and `when_any`
 
 `when` lists ETS conditions that must all hold for a variant or parameter to
-apply, usually the channel mode. `when_any` appears when ETS shows the item in
-several places: besides `when`, ONE of its condition sets must hold. Neither
-field: ETS shows it unconditionally. Only places ETS shows count; with
-`ui: false` ETS never shows the item, and a `when` says where it sits. Check conditions against values decoded
-from the device, not against defaults.
+apply, outermost (usually the channel mode) first. `when_any` appears when ETS
+shows the item in several places: besides `when`, ONE of its condition sets
+must hold. Neither field: ETS shows it unconditionally. `when_more`: the chain
+was longer than listed. Only places ETS shows count; with `ui: false` ETS never
+shows the item, and a `when` says where it sits. Check conditions against
+values decoded from the device, not against defaults.
 
 ## Byte order
 
@@ -95,7 +105,8 @@ Never write to a guessed address or for a guessed program version.
 
 Every reply stays at or below 12 000 bytes. Lists take `offset` and `limit`
 and return `total` and `next_offset` (null at the end). Ask narrow questions
-(numbers, address, query, module) instead of paging through everything.
+(numbers, address, query, module) instead of paging through everything. A reply
+that had to leave detail out says what in `detail`.
 
 ## Errors
 
