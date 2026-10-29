@@ -118,6 +118,8 @@ that had to leave detail out says what in `detail`.
   to add the manufacturer's `.knxprod` (copy it into the product folder or
   upload it). `candidates` are other versions of the program: their layout can
   differ, so do not answer from them in place of the device's own version.
+  With `indexing` the server is still reading product files: ask again later
+  before calling the program missing.
 - `ambiguous_app_id`: programs with different memory layouts report this
   ApplicationId, and the device cannot tell them apart. `programs` lists them
   with their order numbers: ask the user which product is installed and pass

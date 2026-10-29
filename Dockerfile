@@ -30,7 +30,8 @@ USER 10001:10001
 VOLUME ["/knxprod", "/data"]
 EXPOSE 8095
 
-# The first start indexes the whole product folder before the server listens.
+# The server listens at once and indexes the product folder in the background;
+# /healthz says how many files are still to be read.
 # "health" asks the running server, wherever it listens.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
   CMD ["python", "/app/knxprod_mcp.py", "health"]

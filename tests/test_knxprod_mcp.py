@@ -1474,6 +1474,69 @@ class TestReviewCatalogTemplate(unittest.TestCase):
             self.assertNotIn("note", cm.exception.payload)
 
 
+class TestBackgroundSync(unittest.TestCase):
+
+    def test_the_server_answers_while_it_indexes(self):
+        # A pile of new product files kept the server silent until all were
+        # read; now it listens at once and says what is still to come.
+        tmp = _tmpdir()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        products, data = os.path.join(tmp, "knxprod"), os.path.join(tmp, "index")
+        write_file(os.path.join(products, "a.knxprod"), full_knxprod())
+        gate, real = threading.Event(), K._ingest_locked
+
+        def held(*a, **kw):
+            gate.wait(60)
+            return real(*a, **kw)
+
+        K._ingest_locked = held
+        self.addCleanup(setattr, K, "_ingest_locked", real)
+        lines = []
+        svc = K.Service({"products": products, "data": data, "bind": "127.0.0.1", "port": 0,
+                         "scan_interval": 0}, log=lines.append)
+        svc.activate()
+        svc.start_scanner(initial=True)
+        t = threading.Thread(target=svc.httpd.serve_forever, daemon=True)
+        t.start()
+
+        def stop():
+            gate.set()
+            svc.httpd.shutdown()
+            svc.close()
+            t.join(5)
+
+        self.addCleanup(stop)
+
+        def get(path, payload=None):
+            conn = http.client.HTTPConnection("127.0.0.1", svc.port, timeout=30)
+            try:
+                if payload is None:
+                    conn.request("GET", path, headers={"Host": "127.0.0.1"})
+                else:
+                    conn.request("POST", path, json.dumps(payload),
+                                 {"Host": "127.0.0.1", "Content-Type": "application/json"})
+                return json.loads(conn.getresponse().read())
+            finally:
+                conn.close()
+
+        def app1():
+            r = get("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "prod-application", "arguments": {"app_id": APP1}}})
+            return json.loads(r["result"]["content"][0]["text"])
+
+        self.assertTrue(wait_for(lambda: get("/healthz")["sync"].get("current_file")))
+        h = get("/healthz")
+        self.assertEqual(h["sync"], {"indexing": True, "pending_files": 1,
+                                     "current_file": "a.knxprod"})
+        o = app1()
+        self.assertEqual((o["error"], o["indexing"]["pending_files"]), ("unknown_app_id", 1))
+        self.assertIn("ask again", o["hint"])
+        gate.set()
+        self.assertTrue(wait_for(lambda: not get("/healthz")["sync"]["indexing"]))
+        self.assertEqual(app1()["app_id"], APP1)
+        self.assertTrue(any("2 application program(s)" in ln for ln in lines), lines)
+
+
 # ---------------------------------------------------------------------------
 # 4c. the index database: rows, full program ids, search
 # ---------------------------------------------------------------------------
@@ -2117,6 +2180,7 @@ class TestHttp(unittest.TestCase):
     def test_a_initial_sync_before_serving(self):
         h = self.srv.health()
         self.assertEqual((h["ok"], h["apps"], h["files"], h["file_errors"]), (True, 1, 1, 0))
+        self.assertEqual(h["sync"], {"indexing": False, "pending_files": 0})
         self.assertEqual(h["mdns"], {"enabled": False, "name": None, "address": None,
                                      "status": "off"})
         self.assertIs(h["skill"], True)

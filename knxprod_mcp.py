@@ -2688,7 +2688,33 @@ def _stats(db):
             "file_errors": files[0][1] if files else 0}
 
 
-def sync_products(products_dir, data_dir, settle=SETTLE_SECONDS, log=None):
+class SyncState:
+    """What the product scan is doing, for /healthz and the tools: whether
+    files are being read and how many are left.  Until the first pass ends the
+    index counts as being built."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.pending, self.current, self.passes = 0, None, 0
+
+    def step(self, rel, left):
+        with self._lock:
+            self.pending, self.current = left, rel
+
+    def end(self):
+        with self._lock:
+            self.pending, self.current = 0, None
+            self.passes += 1
+
+    def snapshot(self):
+        with self._lock:
+            o = {"indexing": self.pending > 0 or not self.passes, "pending_files": self.pending}
+            if self.current:
+                o["current_file"] = self.current
+            return o
+
+
+def sync_products(products_dir, data_dir, settle=SETTLE_SECONDS, log=None, state=None):
     """Bring the index in line with the product directory: index new and
     changed files, drop the applications of files that are gone.  A file is
     read only once it has not changed for `settle` seconds; one whose size
@@ -2700,30 +2726,34 @@ def sync_products(products_dir, data_dir, settle=SETTLE_SECONDS, log=None):
     data_dir = os.path.abspath(data_dir)
     summary = {"added": [], "changed": [], "refreshed": [], "removed": [], "unchanged": 0,
                "pending": [], "errors": {}, "apps_removed": [], "missing": False}
-    if not os.path.isdir(products_dir):
-        summary["missing"] = True
-        con = _open_reader(_db_path(data_dir))
-        try:
-            summary.update(_stats(_Reader(con)))
-        finally:
-            if con is not None:
+    try:
+        if not os.path.isdir(products_dir):
+            summary["missing"] = True
+            con = _open_reader(_db_path(data_dir))
+            try:
+                summary.update(_stats(_Reader(con)))
+            finally:
+                if con is not None:
+                    con.close()
+            summary["seconds"] = round(time.monotonic() - t0, 2)
+            return summary
+        with _IngestLock(data_dir):
+            con, old_schema = _open_writer(data_dir, log)
+            try:
+                if old_schema is not None:
+                    summary["rebuilt_from_schema"] = old_schema
+                _sync_locked(con, products_dir, data_dir, settle, log, summary, state)
+                summary.update(_stats(_Reader(con)))
+            finally:
                 con.close()
-        summary["seconds"] = round(time.monotonic() - t0, 2)
-        return summary
-    with _IngestLock(data_dir):
-        con, old_schema = _open_writer(data_dir, log)
-        try:
-            if old_schema is not None:
-                summary["rebuilt_from_schema"] = old_schema
-            _sync_locked(con, products_dir, data_dir, settle, log, summary)
-            summary.update(_stats(_Reader(con)))
-        finally:
-            con.close()
+    finally:
+        if state is not None:
+            state.end()
     summary["seconds"] = round(time.monotonic() - t0, 2)
     return summary
 
 
-def _sync_locked(con, products_dir, data_dir, settle, log, summary):
+def _sync_locked(con, products_dir, data_dir, settle, log, summary, state=None):
     files = {r[0]: {"sha256": r[1], "size": r[2], "mtime_ns": r[3], "reingest": r[4]}
              for r in con.execute("SELECT rel, sha256, size, mtime_ns, reingest FROM files")}
     present = product_files(products_dir)
@@ -2762,6 +2792,8 @@ def _sync_locked(con, products_dir, data_dir, settle, log, summary):
         todo.append(rel)
     while todo:
         rel = todo.pop(0)
+        if state is not None:
+            state.step(rel, len(todo) + 1)
         full, st = present[rel]
         try:
             st = os.stat(full)
@@ -2909,12 +2941,22 @@ def _open_reader(path):
     return con
 
 
+def _indexing(state):
+    """The scan's state while it is still reading product files, else None."""
+    s = state.snapshot() if state is not None else None
+    return s if s and s["indexing"] else None
+
+
 class _Reader:
     """The queries of one request, on one connection and in one read
     transaction: a sync committing meanwhile is not seen in halves."""
 
-    def __init__(self, con):
+    def __init__(self, con, sync_state=None):
         self.con = con
+        self.sync_state = sync_state
+
+    def indexing(self):
+        return _indexing(self.sync_state)
 
     def rows(self, sql, args=()):
         if self.con is None:
@@ -3023,6 +3065,7 @@ class Store:
         self._lock = threading.Lock()
         self._pool = []
         self._entries = (None, [])
+        self.sync_state = None              # the Service's SyncState, if any
 
     @contextlib.contextmanager
     def reader(self):
@@ -3033,7 +3076,7 @@ class Store:
         if con is not None:
             con.execute("BEGIN")
         try:
-            yield _Reader(con)
+            yield _Reader(con, self.sync_state)
         finally:
             if con is not None:
                 try:
@@ -3269,9 +3312,15 @@ def need_app(db, args):
         extra["note"] = ("candidates are other versions of this program: objects, variants and "
                          "memory layout can differ, do not answer from them in place of the "
                          "device's own version")
+    hint = "prod-applications lists what is ingested"
+    busy = db.indexing()
+    if busy:
+        extra["indexing"] = busy
+        hint = ("the server is still reading product files (%d to go): ask again in a few "
+                "minutes before calling the program missing" % busy["pending_files"])
     raise ToolError("unknown_app_id", "application program %s is not ingested"
                     % (full_id or app_id), app_id=full_id or app_id, candidates=cands[:10],
-                    hint="prod-applications lists what is ingested", **extra)
+                    hint=hint, **extra)
 
 
 def _mfr_match(e, wanted):
@@ -3372,6 +3421,9 @@ def tool_applications(store, args, budget):
         items.append(e)
     window = items[offset:offset + limit]
     header = {"ingested": store.stats()["apps_total"]}
+    busy = _indexing(store.sync_state)
+    if busy:
+        header["indexing"] = busy
     if not entries:
         header["note"] = "nothing ingested yet"
     elif any(e.get("shared_app_id") for e in window):
@@ -4992,8 +5044,10 @@ class Handler(BaseHTTPRequestHandler):
                                extra={"Allow": "POST, OPTIONS"})
             elif path == "/healthz" and method == "GET":
                 st = self.server.store.stats()
+                sync = getattr(self.server, "sync_state", None)
                 self._json(200, {"ok": True, "version": VERSION, "apps": st["apps_total"],
                                  "files": st["files_total"], "file_errors": st["file_errors"],
+                                 "sync": sync.snapshot() if sync else None,
                                  "skill": os.path.isfile(SKILL_FILE),
                                  "mdns": self.server.mdns_info()})
             else:
@@ -5181,7 +5235,7 @@ MDNS_OFF = {"enabled": False, "name": None, "address": None, "status": "off"}
 def make_server(bind, port, data_dir, products_dir, allowed_hosts=(), upload_origins=None,
                 allow_any_bind=False, activate=True):
     """Create the HTTP server and bind its socket.  With activate=False it does
-    not accept connections yet (Service listens only after the first sync)."""
+    not accept connections yet (Service.activate)."""
     b = (bind or "").strip()
     if b.startswith("[") and b.endswith("]"):
         b = b[1:-1]
@@ -5215,19 +5269,30 @@ def make_server(bind, port, data_dir, products_dir, allowed_hosts=(), upload_ori
 
 
 class ProductScanner(threading.Thread):
-    """Re-syncs the product directory every `interval` seconds."""
+    """Syncs the product directory: with `initial` once at once (the start of
+    the server), then every `interval` seconds (0: never again)."""
 
-    def __init__(self, products_dir, data_dir, interval, log):
+    def __init__(self, products_dir, data_dir, interval, log, state=None, initial=False):
         super().__init__(name="knxprod-scan", daemon=True)
         self.products_dir, self.data_dir = products_dir, data_dir
         self.interval, self.log = interval, log
+        self.state, self.initial = state, initial
         self.stop_event = threading.Event()
 
     def run(self):
         missing = False
-        while not self.stop_event.wait(self.interval):
+        first = self.initial
+        while first or (self.interval > 0 and not self.stop_event.wait(self.interval)):
             try:
-                s = sync_products(self.products_dir, self.data_dir, log=self.log)
+                s = sync_products(self.products_dir, self.data_dir,
+                                  settle=SETTLE_SECONDS if self.interval > 0 else 0,
+                                  log=self.log, state=self.state)
+                if first:
+                    self.log("%s product directory %s: %d file(s), %d application program(s), "
+                             "%d error(s), %d pending, %.1f s" % (
+                                 _utc_now(), self.products_dir, s["files_total"],
+                                 s["apps_total"], s["file_errors"], len(s["pending"]),
+                                 s["seconds"]))
                 if s["missing"] != missing:
                     missing = s["missing"]
                     self.log("%s product directory %s %s" % (
@@ -5235,11 +5300,13 @@ class ProductScanner(threading.Thread):
                         "is missing; the index stays as it is" if missing else "is back"))
             except Exception:                         # pragma: no cover - logged
                 self.log("%s scan failed: %s" % (_utc_now(), traceback.format_exc(limit=3)))
+            first = False
 
 
 class Service:
-    """Prepare directories, listen, sync the product directory, then serve and
-    re-scan.  serve() uses it; tests drive it step by step."""
+    """Prepare directories, listen, and keep the index in line with the product
+    directory in the background.  serve() uses it; tests drive it step by
+    step."""
 
     def __init__(self, cfg, log=None):
         self.cfg = cfg
@@ -5251,6 +5318,8 @@ class Service:
                                  cfg.get("allowed_hosts", ()), cfg.get("upload_origins"),
                                  cfg.get("allow_any_bind", False), activate=False)
         self.httpd.log_line = self.log
+        self.sync_state = SyncState()
+        self.httpd.sync_state = self.httpd.store.sync_state = self.sync_state
         self.port = self.httpd.server_address[1]
         self.scanner = None
         self.mdns = None
@@ -5259,9 +5328,12 @@ class Service:
                      % (_utc_now(), SKILL_FILE, SKILL_URI))
 
     def initial_sync(self):
+        """The first sync, blocking (tests, a caller that wants it before
+        listening); serve() runs it in the background instead."""
         interval = self.cfg.get("scan_interval", DEFAULT_SCAN_INTERVAL)
         s = sync_products(self.products, self.data,
-                          settle=SETTLE_SECONDS if interval > 0 else 0, log=self.log)
+                          settle=SETTLE_SECONDS if interval > 0 else 0, log=self.log,
+                          state=self.sync_state)
         self.log("%s product directory %s: %d file(s), %d application program(s), "
                  "%d error(s), %d pending, %.1f s" % (
                      _utc_now(), self.products, s["files_total"], s["apps_total"],
@@ -5271,10 +5343,11 @@ class Service:
     def activate(self):
         self.httpd.server_activate()
 
-    def start_scanner(self):
+    def start_scanner(self, initial=False):
         interval = self.cfg.get("scan_interval", DEFAULT_SCAN_INTERVAL)
-        if interval > 0:
-            self.scanner = ProductScanner(self.products, self.data, interval, self.log)
+        if interval > 0 or initial:
+            self.scanner = ProductScanner(self.products, self.data, interval, self.log,
+                                          self.sync_state, initial=initial)
             self.scanner.start()
 
     def start_mdns(self):
@@ -5306,13 +5379,14 @@ class Service:
 
 
 def serve(cfg):
+    # Listen at once and index in the background: a big pile of new product
+    # files used to keep the server silent for hours after a restart.
     svc = Service(cfg)
-    svc.initial_sync()
     svc.activate()
     info_path = os.path.join(svc.data, "server.json")
     atomic_write_json(info_path, {"host": svc.httpd.server_address[0], "port": svc.port,
                                   "pid": os.getpid(), "version": VERSION, "started": _utc_now()})
-    svc.start_scanner()
+    svc.start_scanner(initial=True)
     svc.start_mdns()
 
     def _stop(signum, frame):

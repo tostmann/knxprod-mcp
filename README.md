@@ -37,9 +37,11 @@ on the LAN via mDNS/DNS-SD, so clients can find it without a URL.
    another user, start it with `KNXPROD_UID=$(id -u) KNXPROD_GID=$(id -g)
    docker compose up -d`.
 
-3. **It indexes them.** On start the server reads every product file once, then
-   starts listening. A large manufacturer database takes some seconds. Later
-   starts only read new or changed files.
+3. **It indexes them.** The server listens at once and reads every product file
+   in the background; a large manufacturer database takes some seconds. Until
+   it is done, `/healthz` shows `"sync": {"indexing": true, "pending_files": N}`
+   and the tools say so when they do not find a program yet. Later starts only
+   read new or changed files.
 
    ```sh
    docker compose logs -f              # "indexed <file>: N application program(s) ..."
@@ -229,8 +231,9 @@ python3 knxprod_mcp.py health --data ./knxprod-index                       # 0 i
   how far each member expands (more than 200:1 is refused) and how much product
   data they hold uncompressed (`KNXPROD_ZIP_MAX_MB`). Plugins and pictures in a
   product file are never unpacked and do not count.
-- `GET /healthz`: liveness, index counts and the mDNS state. The container's
-  health check (`knxprod_mcp.py health`) uses it.
+- `GET /healthz`: liveness, index counts, whether product files are still being
+  read (`sync`) and the mDNS state. The container's health check
+  (`knxprod_mcp.py health`) uses it.
 
 ## Security
 
