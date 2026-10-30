@@ -196,6 +196,54 @@ in, `total`/`next_offset` out). A reply that had to leave detail out says so in
 `detail`, and an object with more variants than one reply holds comes in parts
 (`variants_next_offset` out, `variant_offset` in).
 
+## Product pack for a device
+
+A device that keeps an installation's record does not need the whole index,
+only the application programs of the devices it meets. `pack` writes them into
+one SQLite file:
+
+```sh
+python knxprod_mcp.py pack app.pack --app 000C570110 --app 000C570011
+python knxprod_mcp.py pack vendor.pack --manufacturer M-0083
+python knxprod_mcp.py pack all.pack --catalogue    # every program, no lookup indexes
+```
+
+The objects of a program are stored in zlib-compressed chunks (64 per chunk by
+default, `--chunk`): reading one parameter inflates one chunk, listing a whole
+program inflates each chunk once. An `item` table says which chunk holds an
+object and carries the memory location of each parameter and the number of each
+com object, so a device can join the values it reads from a bus device with
+their descriptions without inflating anything.
+
+| table | content |
+|---|---|
+| `meta` | `format` = `knxprod-pack`, `version` = 1, `chunk`, `created`, `generator` |
+| `program` | `prog` (integer key in this file), `full_id`, `app_id`, `manufacturer`, `name`, `header` (zlib JSON), `entry` (JSON) |
+| `chunk` | `prog`, `kind` (`p` parameters, `c` com objects, `t` types), `n`, `body`: zlib of a JSON array |
+| `item` | `prog`, `kind`, `n`, `pos` (index in the chunk's array), `id`, `module`, `address`, `bit`, `size_bits`, `number` |
+
+The file uses a rollback journal (no WAL), so it opens on small SQLite builds.
+A pack written with `--catalogue` has no lookup indexes and serves as a
+read-only catalogue (an installer's SD card, say); a device copies the programs
+it needs into a cache with the same schema plus the lookup indexes, giving them
+new `prog` numbers:
+
+```sql
+ATTACH 'catalogue.pack' AS cat;
+INSERT INTO program(full_id, app_id, manufacturer, name, header, entry)
+  SELECT full_id, app_id, manufacturer, name, header, entry FROM cat.program WHERE app_id = :app;
+INSERT INTO chunk SELECT d.prog, c.kind, c.n, c.body FROM cat.chunk c
+  JOIN cat.program s ON s.prog = c.prog JOIN main.program d ON d.full_id = s.full_id
+  WHERE s.app_id = :app;
+-- item likewise
+```
+
+There is no search text in a pack: search the catalogue on the server, a
+cache's few programs by inflating them.
+
+A pack contains manufacturer data from your product files. It is meant for
+your own devices; check the manufacturer's terms before passing it on.
+
 ## Configuration
 
 Every option can also be set as an environment variable; a command-line flag

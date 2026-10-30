@@ -5480,6 +5480,149 @@ def health_check(data_dir, timeout=4.0):
 
 
 # ---------------------------------------------------------------------------
+# product pack: the index's data for a device
+# ---------------------------------------------------------------------------
+#
+# A device that keeps an installation's record (a KNX stick, say) needs the
+# texts and memory layout of the applications it meets, not a whole index.  A
+# pack is one SQLite file with what this index knows about some application
+# programs, compressed in chunks so that a small machine can read one
+# parameter without inflating a whole program and list a whole program
+# quickly.  The same file serves as a read-only catalogue (an installer's SD
+# card) and as the device's cache: the device copies the programs it needs
+# with ATTACH and INSERT ... SELECT.
+#
+# Format version 1 (rollback journal, 4 KiB pages):
+#   meta(key, value)                         format, version, chunk, created, generator
+#   program(prog, full_id, app_id, manufacturer, name, header, entry)
+#       prog: integer key of the program in this file; header: zlib JSON as in
+#       the index; entry: the JSON entry of list_programs
+#   chunk(prog, kind, n, body)               body: zlib of a JSON array of up to
+#       `chunk` objects; kind p = parameters (index order: by address),
+#       c = com objects (by number), t = types
+#   item(prog, kind, n, pos, id, module, address, bit, size_bits, number)
+#       one row per object: which chunk (n) and where in it (pos); the memory
+#       location of a parameter and the number of a com object without inflating
+#
+# A catalogue (lookup_indexes=False) has only the primary keys: a device copies
+# whole programs out of it, by prog.  The copy -- the device's cache -- gets the
+# lookup indexes (item by id, parameters by memory location).  There is no
+# search text: a catalogue is searched on a server, a cache by inflating its few
+# programs.
+#
+# The pack holds manufacturer data from your product files.  It is for your
+# own devices, not for passing on.
+
+PACK_FORMAT = "knxprod-pack"
+PACK_VERSION = 1
+PACK_CHUNK = 64
+_PACK_SCHEMA = (
+    "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID",
+    "CREATE TABLE program(prog INTEGER PRIMARY KEY, full_id TEXT NOT NULL UNIQUE, "
+    "app_id TEXT NOT NULL, manufacturer TEXT, name TEXT, header BLOB NOT NULL, "
+    "entry TEXT NOT NULL)",
+    "CREATE INDEX program_app ON program(app_id)",
+    # a rowid table: in a WITHOUT ROWID table the compressed chunks spill onto
+    # overflow pages and take almost twice their size
+    "CREATE TABLE chunk(prog INTEGER NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL, "
+    "body BLOB NOT NULL, UNIQUE(prog, kind, n))",
+    "CREATE TABLE item(prog INTEGER NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL, "
+    "pos INTEGER NOT NULL, id TEXT NOT NULL, module TEXT, address INTEGER, bit INTEGER, "
+    "size_bits INTEGER, number INTEGER, PRIMARY KEY(prog, kind, n, pos)) WITHOUT ROWID",
+)
+PACK_LOOKUP_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS item_id ON item(prog, kind, id)",
+    "CREATE INDEX IF NOT EXISTS item_address ON item(prog, address, bit) "
+    "WHERE kind = 'p' AND address IS NOT NULL",
+)
+
+
+def _pack_chunks(con, prog, kind, objs, size):
+    """objs: [(body_bytes, item_tuple_without_position)] in order."""
+    for n in range(0, (len(objs) + size - 1) // size):
+        part = objs[n * size:(n + 1) * size]
+        con.execute("INSERT INTO chunk VALUES(?,?,?,?)", (
+            prog, kind, n, zlib.compress(b"[" + b",".join(b for b, _ in part) + b"]", 6)))
+        con.executemany("INSERT INTO item VALUES(?,?,?,?,?,?,?,?,?,?)", [
+            (prog, kind, n, pos) + it for pos, (_b, it) in enumerate(part)])
+
+
+def write_pack(data_dir, out_path, apps=None, manufacturers=None, chunk=PACK_CHUNK,
+               lookup_indexes=True, log=None):
+    """Write the pack for the given application ids and/or manufacturer ids
+    (all programs when neither is given); lookup_indexes=False for a
+    catalogue.  -> facts."""
+    if chunk < 1:
+        raise ConfigError("chunk must be at least 1")
+    src = sqlite3.connect("file:%s?mode=ro" % _db_path(os.path.abspath(data_dir)), uri=True)
+    try:
+        progs = src.execute("SELECT pk, full_id, app_id, header, entry FROM programs "
+                            "ORDER BY full_id").fetchall()
+        want_apps = {a.upper() for a in apps or ()}
+        want_mfr = {m.upper() for m in manufacturers or ()}
+        if want_apps or want_mfr:
+            progs = [p for p in progs if p[2].upper() in want_apps
+                     or p[1].split("_", 1)[0].upper() in want_mfr]
+        tmp = "%s.%d.tmp" % (out_path, os.getpid())
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        dst = sqlite3.connect(tmp)
+        try:
+            dst.execute("PRAGMA page_size=4096")
+            dst.execute("PRAGMA journal_mode=DELETE")
+            for stmt in _PACK_SCHEMA:
+                dst.execute(stmt)
+            dst.executemany("INSERT INTO meta VALUES(?,?)", [
+                ("format", PACK_FORMAT), ("version", str(PACK_VERSION)), ("chunk", str(chunk)),
+                ("created", _utc_now()), ("generator", "knxprod-mcp %s" % VERSION)])
+            items = 0
+            for prog, (pk, full_id, app_id, header, entry) in enumerate(progs, 1):
+                head = _unpack(header)
+                mfr = head.get("manufacturer") or {}
+                dst.execute("INSERT INTO program VALUES(?,?,?,?,?,?,?)", (
+                    prog, full_id, app_id, mfr.get("id"), head.get("name"), header, entry))
+                params = []
+                for addr, bits, mod, body in src.execute(
+                        "SELECT p.address, p.size_bits, p.module_id, b.body FROM params p "
+                        "JOIN param_bodies b ON b.id=p.id WHERE p.pk=? ORDER BY p.id", (pk,)):
+                    raw = zlib.decompress(body)
+                    o = json.loads(raw)
+                    params.append((raw, (o.get("id") or "", mod, addr, o.get("bit_offset"),
+                                         bits, None)))
+                objs = []
+                for num, mod, body in src.execute(
+                        "SELECT o.number, o.module_id, b.body FROM comobjects o JOIN "
+                        "comobject_bodies b ON b.id=o.id WHERE o.pk=? ORDER BY o.id", (pk,)):
+                    raw = zlib.decompress(body)
+                    o = json.loads(raw)
+                    objs.append((raw, (o.get("id") or str(num), mod, None, None,
+                                       o.get("size_bits"), num)))
+                types = [(zlib.decompress(body), (tid, None, None, None, None, None))
+                         for tid, body in src.execute(
+                             "SELECT id, body FROM types WHERE pk=? ORDER BY id", (pk,))]
+                for kind, rows in (("p", params), ("c", objs), ("t", types)):
+                    _pack_chunks(dst, prog, kind, rows, chunk)
+                items += len(params) + len(objs) + len(types)
+                if log:
+                    log("packed %s (%d parameters, %d com objects, %d types)"
+                        % (full_id, len(params), len(objs), len(types)))
+            if lookup_indexes:
+                for stmt in PACK_LOOKUP_INDEXES:
+                    dst.execute(stmt)
+            dst.commit()
+            dst.execute("VACUUM")
+        finally:
+            dst.close()
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, out_path)
+        _fsync_dir(os.path.dirname(os.path.abspath(out_path)))
+    finally:
+        src.close()
+    return {"programs": len(progs), "items": items, "bytes": os.path.getsize(out_path)}
+
+
+# ---------------------------------------------------------------------------
 # configuration and CLI
 # ---------------------------------------------------------------------------
 
@@ -5503,6 +5646,18 @@ def build_parser():
     py = sub.add_parser("sync", help="sync the product directory with the index once and exit")
     ph = sub.add_parser("health", help="exit 0 if the running server answers /healthz")
     ph.add_argument("--data", help="index directory (KNXPROD_DATA, default %s)" % DEFAULT_DATA)
+    pp = sub.add_parser("pack", help="write a product pack (one SQLite file) for a device")
+    pp.add_argument("out", help="the pack file to write")
+    pp.add_argument("--data", help="index directory (KNXPROD_DATA, default %s)" % DEFAULT_DATA)
+    pp.add_argument("--app", action="append", help="application id, e.g. 000C570110 "
+                                                   "(repeatable; default: every program)")
+    pp.add_argument("--manufacturer", action="append", help="manufacturer id, e.g. M-0083 "
+                                                            "(repeatable)")
+    pp.add_argument("--chunk", type=int, default=PACK_CHUNK,
+                    help="objects per compressed chunk (default %d)" % PACK_CHUNK)
+    pp.add_argument("--catalogue", action="store_true",
+                    help="no lookup indexes: a read-only catalogue a device copies whole "
+                         "programs from (much smaller for many programs)")
     for p in (ps, py):
         p.add_argument("--products", help="product directory, scanned recursively for "
                                           ".knxprod/.zip (KNXPROD_DIR, default %s)"
@@ -5607,6 +5762,17 @@ def resolve_config(args):
 def main(argv=None):
     global ZIP_MAX_TOTAL
     args = build_parser().parse_args(argv)
+    if args.cmd == "pack":
+        try:
+            r = write_pack(args.data or _env("KNXPROD_DATA") or DEFAULT_DATA, args.out,
+                           args.app, args.manufacturer, args.chunk,
+                           lookup_indexes=not args.catalogue)
+        except (ConfigError, sqlite3.Error) as e:
+            print("knxprod-mcp: %s" % e, file=sys.stderr)
+            return 2
+        print("%s: %d application programs, %d objects, %d bytes" % (
+            args.out, r["programs"], r["items"], r["bytes"]))
+        return 0 if r["programs"] else 1
     try:
         cfg = resolve_config(args)
         ZIP_MAX_TOTAL = cfg["zip_max_mb"] << 20
