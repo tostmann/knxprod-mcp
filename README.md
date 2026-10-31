@@ -222,7 +222,7 @@ descriptions without inflating anything.
 
 | table | content |
 |---|---|
-| `meta` | `format` = `knxprod-pack`, `version` = 1, `chunk`, `created`, `generator` |
+| `meta` | `format` = `knxprod-pack`, `version` = 2, `chunk`, `created`, `generator` |
 | `program` | `prog` (integer key in this file), `full_id`, `app_id`, `manufacturer`, `name`, `layout`, `max_nbytes`, `preferred`, `header` (zlib JSON, with `segments`), `entry` (JSON) |
 | `alias` | `alias`, `prog`: other application ids that report the program |
 | `chunk` | `prog`, `kind` (`p` parameters, `c` com objects, `t` types), `n`, `body`: zlib of a JSON array |
@@ -252,27 +252,30 @@ The file uses a rollback journal (no WAL), so it opens on small SQLite builds.
 A pack written with `--catalogue` has no lookup indexes and serves as a
 read-only catalogue (an installer's SD card, say); a device copies the programs
 it needs into a cache with the same schema plus the lookup indexes, giving them
-new `prog` numbers. Copying again changes nothing:
+new `prog` numbers. Copying again changes nothing; the last three statements
+copy what belongs to the programs the cache holds:
 
 ```sql
 ATTACH 'catalogue.pack' AS cat;
--- the preferred program of each layout of the application id
+-- the preferred program of each layout of the application id, or of the
+-- programs that report it as an OEM alias
 INSERT OR IGNORE INTO program(full_id, app_id, manufacturer, name, layout, max_nbytes,
                               preferred, header, entry)
   SELECT full_id, app_id, manufacturer, name, layout, max_nbytes, preferred, header, entry
-  FROM cat.program WHERE app_id = :app AND preferred = 1;
+  FROM cat.program s WHERE s.preferred = 1
+  AND (s.app_id = :app OR s.prog IN (SELECT prog FROM cat.alias WHERE alias = :app));
 -- everything else under the new numbers, matched by full_id
 INSERT OR IGNORE INTO alias
   SELECT c.alias, d.prog FROM cat.alias c JOIN cat.program s ON s.prog = c.prog
-  JOIN main.program d ON d.full_id = s.full_id WHERE s.app_id = :app AND s.preferred = 1;
+  JOIN main.program d ON d.full_id = s.full_id;
 INSERT OR IGNORE INTO chunk
   SELECT d.prog, c.kind, c.n, c.body FROM cat.chunk c JOIN cat.program s ON s.prog = c.prog
-  JOIN main.program d ON d.full_id = s.full_id WHERE s.app_id = :app AND s.preferred = 1;
+  JOIN main.program d ON d.full_id = s.full_id;
 INSERT OR IGNORE INTO item
   SELECT d.prog, c.kind, c.n, c.pos, c.id, c.module, c.segment, c.seg_offset, c.address,
          c.bit, c.size_bits, c.number
   FROM cat.item c JOIN cat.program s ON s.prog = c.prog
-  JOIN main.program d ON d.full_id = s.full_id WHERE s.app_id = :app AND s.preferred = 1;
+  JOIN main.program d ON d.full_id = s.full_id;
 ```
 
 There is no search text in a pack: search the catalogue on the server, a

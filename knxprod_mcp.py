@@ -5492,7 +5492,8 @@ def health_check(data_dir, timeout=4.0):
 # card) and as the device's cache: the device copies the programs it needs
 # with ATTACH and INSERT ... SELECT.
 #
-# Format version 1 (rollback journal, 4 KiB pages):
+# Format version 2 (rollback journal, 4 KiB pages; version 1 was the first draft,
+# without segments, layout, preference and aliases -- not readable as 2):
 #   meta(key, value)                         format, version, chunk, created, generator
 #   program(prog, full_id, app_id, manufacturer, name, layout, max_nbytes,
 #           preferred, header, entry)
@@ -5523,7 +5524,7 @@ def health_check(data_dir, timeout=4.0):
 # own devices, not for passing on.
 
 PACK_FORMAT = "knxprod-pack"
-PACK_VERSION = 1
+PACK_VERSION = 2
 PACK_CHUNK = 64
 _PACK_SCHEMA = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID",

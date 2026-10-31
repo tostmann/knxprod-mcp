@@ -3152,8 +3152,8 @@ class TestPack(unittest.TestCase):
         out, facts, db = self.pack("all.sqlite", chunk=2)
         progs = self.index.execute("SELECT pk, full_id FROM programs").fetchall()
         self.assertEqual(facts["programs"], len(progs))
-        self.assertEqual(dict(db.execute("SELECT key, value FROM meta"))["format"],
-                         "knxprod-pack")
+        meta = dict(db.execute("SELECT key, value FROM meta"))
+        self.assertEqual((meta["format"], meta["version"]), ("knxprod-pack", "2"))
         prog_of = dict(db.execute("SELECT full_id, prog FROM program"))
         chunks = {(g, k, n): json.loads(zlib.decompress(b))
                   for g, k, n, b in db.execute("SELECT prog, kind, n, body FROM chunk")}
@@ -3239,6 +3239,41 @@ class TestPack(unittest.TestCase):
                          cat.execute(count.format(""), {"app": app}).fetchone())
         self.assertEqual(dev.execute("SELECT prog FROM program WHERE app_id=?", (app,)).fetchone(),
                          (2,))
+
+    def test_twins_one_preferred_and_the_cache_takes_it(self):
+        # two programs of one application id and one layout: one is preferred, and
+        # the README's copy takes that one only -- by its id and by an OEM alias
+        data = os.path.join(self.tmp, "data-twin")
+        os.makedirs(data)
+        copy = sqlite3.connect(os.path.join(data, K.DB_NAME))
+        self.index.backup(copy)
+        full_id, app = copy.execute("SELECT full_id, app_id FROM programs WHERE pk=1").fetchone()
+        alias = copy.execute("SELECT alias FROM aliases WHERE pk=1").fetchone()[0]
+        copy.execute("INSERT INTO programs(full_id, app_id, written_by, p_lo, p_hi, c_lo, c_hi, "
+                     "max_nbytes, layout, header, entry) SELECT full_id || 'Z', app_id, "
+                     "written_by, p_lo, p_hi, c_lo, c_hi, max_nbytes, layout, header, entry "
+                     "FROM programs WHERE pk=1")
+        copy.commit()
+        copy.close()
+        cat_path, _f, cat = self.pack("twin.cat", data=data, lookup_indexes=False)
+        self.assertEqual(cat.execute("SELECT full_id, preferred FROM program WHERE app_id=? "
+                                     "ORDER BY full_id", (app,)).fetchall(),
+                         [(full_id, 1), (full_id + "Z", 0)])
+        for n, key in enumerate((app, alias)):
+            dev = sqlite3.connect(os.path.join(self.tmp, "twin-dev-%d.sqlite" % n))
+            self.addCleanup(dev.close)
+            for stmt in K._PACK_SCHEMA + K.PACK_LOOKUP_INDEXES:
+                dev.execute(stmt)
+            dev.execute("ATTACH ? AS cat", (cat_path,))
+            for stmt in README_COPY_SQL:
+                dev.execute(stmt, {"app": key})
+            dev.commit()
+            self.assertEqual([r[0] for r in dev.execute("SELECT full_id FROM program")],
+                             [full_id], key)
+            self.assertEqual(dev.execute("SELECT count(*) FROM item").fetchone(),
+                             cat.execute("SELECT count(*) FROM item i JOIN program p USING "
+                                         "(prog) WHERE p.full_id=?", (full_id,)).fetchone())
+            self.assertEqual(dev.execute("SELECT alias FROM alias").fetchall(), [(alias,)])
 
     def test_selects_by_application_and_manufacturer(self):
         app, full_id = self.index.execute("SELECT app_id, full_id FROM programs "
