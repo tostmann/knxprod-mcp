@@ -321,6 +321,9 @@
             <TranslationElement RefId="M-FFF0_A-0C0D-21-5A5A_MD-1_O-1_R-1">
               <Translation AttributeName="Text" Text="Kanal {{ChName}}: {{0}}" />
             </TranslationElement>
+            <TranslationElement RefId="M-FFF0_A-0C0D-21-5A5A_MD-1_PB-1">
+              <Translation AttributeName="Text" Text="Kanal {{ChName}} - Schalten" />
+            </TranslationElement>
             <TranslationElement RefId="M-FFF0_A-0C0D-21-5A5A_MD-3_P-1">
               <Translation AttributeName="Text" Text="Sensor {{SensNo}} Offset (0,1 K)" />
             </TranslationElement>

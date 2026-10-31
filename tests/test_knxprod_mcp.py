@@ -402,7 +402,7 @@ class TestDistill(unittest.TestCase):
         self.assertNotIn("name", p1)
         self.assertEqual(p1["variants"], [{"text": "Operating mode of channel 1 (expert)",
                                            "ref": "R-2", "ui": False}])     # never placed
-        self.assertEqual(p1["block"], "Channel 1")
+        self.assertEqual((p1["block"], p1["block_de"]), ("Channel 1", "Kanal 1"))
         p2 = by_id(ps, "P-2")
         self.assertEqual((p2["address"], p2["bit_offset"], p2["size_bits"]), (19011, 0, 1))
         p3 = by_id(ps, "P-3")
@@ -431,8 +431,13 @@ class TestDistill(unittest.TestCase):
         self.assertEqual(up11["union"], {"size_bits": 16, "default": False})
         self.assertEqual(up10["when"], ["Channel 1 operating mode = 1 (Blind)"])
         self.assertEqual(up11["when"], ["Channel 1 operating mode = 2 (Switch)"])
+        # German where the product data has it, English where it has not
+        self.assertEqual(up10["when_de"], ["Betriebsart Kanal 1 = 1 (Jalousie)"])
+        self.assertEqual(up11["when_de"], ["Betriebsart Kanal 1 = 2 (Switch)"])
         enum = self.rec["types"][p1["type"]]
         self.assertEqual(enum["values"], [["0", "Off"], ["1", "Blind"], ["2", "Switch"]])
+        self.assertEqual(enum["values_de"], [["1", "Jalousie"]])
+        self.assertNotIn("values_de", self.rec["types"][by_id(ps, "P-2")["type"]])
         addrs = [p.get("address") for p in ps if p.get("address") is not None]
         self.assertEqual(addrs, sorted(addrs))
         self.assertEqual(ps[-1]["id"], "P-7")
@@ -453,6 +458,8 @@ class TestDistill(unittest.TestCase):
                          ("R-3", "1 Bit", 1, "CRW---", "1.001"))
         self.assertEqual((v3["text"], v3["text_de"]), ("Switch pump", "Pumpe schalten"))
         self.assertEqual(v3["when"], ["Channel 1 operating mode = 2 (Switch)"])
+        # German conditions and blocks are for parameters only
+        self.assertFalse({"when_de", "block_de"} & (set(v2) | set(v3)))
 
     def test_every_place_the_ui_shows_an_item_counts(self):
         # Real programs show one status parameter through four refs, one per
@@ -463,12 +470,17 @@ class TestDistill(unittest.TestCase):
         self.assertEqual(p4["when"], ["Channel 1 operating mode = 1 (Blind)"])
         self.assertEqual(p4["when_any"], [["Scene 1 active = 0 (disabled)"],
                                           ["Scene 1 active = 1 (enabled)"]])
+        self.assertEqual(p4["when_de"], ["Betriebsart Kanal 1 = 1 (Jalousie)"])
+        self.assertNotIn("when_any_de", p4)             # no German for the scene setting
         self.assertNotIn("ui", p4)
         self.assertEqual(p4["seen"], 2)
         p6 = by_id(ps, "P-6")                       # one ref, shown in both modes;
         self.assertNotIn("when", p6)                # a hidden one under "other" adds nothing
         self.assertEqual(p6["when_any"], [["Channel 1 operating mode = 1 (Blind)"],
                                           ["Channel 1 operating mode = 2 (Switch)"]])
+        self.assertEqual(p6["when_any_de"], [["Betriebsart Kanal 1 = 1 (Jalousie)"],
+                                             ["Betriebsart Kanal 1 = 2 (Switch)"]])
+        self.assertNotIn("when_de", p6)
         self.assertEqual(p6["seen"], 2)
         p5 = by_id(ps, "P-5")                       # only a hidden ref: never shown
         self.assertEqual((p5["ui"], p5["when"]), (False, ["Channel 1 operating mode = 2 (Switch)"]))
@@ -900,6 +912,8 @@ class TestModules(unittest.TestCase):
                          ("Sensor 2 offset (0.1 K)", "Sensor 2 Offset (0,1 K)"))
         self.assertEqual(p["MD-1_M-3_P-1"]["text"], "Channel Right description")
         self.assertEqual(p["MD-1_M-1_P-3"]["block"], "Channel Left - switching")
+        self.assertEqual(p["MD-1_M-1_P-3"]["block_de"], "Kanal Links - Schalten")
+        self.assertEqual(p["MD-1_M-3_P-3"]["block_de"], "Kanal Rechts - Schalten")
         self.assertEqual(c["MD-3_M-4_MI-3_O-1"]["text"], "Sensor 3 temperature")
         # {{0}} = the text parameter (empty by default), {{0:default}}
         v = c["MD-1_M-3_O-1"]["variants"][0]
@@ -3187,6 +3201,10 @@ class TestPack(unittest.TestCase):
         self.assertGreater(db.execute("SELECT count(*) FROM item WHERE kind='p' AND segment IS "
                                       "NOT NULL AND address IS NULL").fetchone()[0], 0)
         self.assertGreater(db.execute("SELECT max(n) FROM chunk").fetchone()[0], 0)
+        # the German texts travel with the objects
+        bodies = [o for c in chunks.values() for o in c]
+        for key in ("when_de", "when_any_de", "block_de", "values_de"):
+            self.assertTrue(any(key in o for o in bodies), key)
         with open(out, "rb") as f:
             self.assertEqual(f.read(20)[18:20], b"\x01\x01")   # rollback journal, no WAL
         self.assertEqual(self.leftovers(), [])

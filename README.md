@@ -247,6 +247,11 @@ Reading it:
   same reason, and a com object's `size_bits` is that of its base; its
   variants may differ.
 - **Ids.** `item.id` and `item.module` are the ids as in the bodies.
+- **Language.** Texts are English (the program's default language where it has
+  no English). Where the product file has German that differs, a parameter
+  carries it beside: `text_de`, `block_de`, `when_de`, `when_any_de`; an
+  enumeration type `values_de` (the values whose text differs). A condition in
+  `when_de` reads German as far as its parameter and value have German texts.
 
 The file uses a rollback journal (no WAL), so it opens on small SQLite builds.
 A pack written with `--catalogue` has no lookup indexes and serves as a

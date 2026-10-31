@@ -193,6 +193,9 @@
             <TranslationElement RefId="M-FFF0_A-1234-56-ABCD_PT-Mode_EN-1">
               <Translation AttributeName="Text" Text="Jalousie" />
             </TranslationElement>
+            <TranslationElement RefId="M-FFF0_A-1234-56-ABCD_PB-1">
+              <Translation AttributeName="Text" Text="Kanal 1" />
+            </TranslationElement>
           </TranslationUnit>
         </Language>
       </Languages>

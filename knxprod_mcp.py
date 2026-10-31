@@ -86,7 +86,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
 VERSION = "0.6.1"
-SCHEMA_VERSION = 10                # index database format; another value rebuilds the index
+SCHEMA_VERSION = 11                # index database format; another value rebuilds the index
 DB_NAME = "index.sqlite"
 SERVER_NAME = "knxprod-mcp"
 
@@ -689,6 +689,26 @@ def _when_fields(alts):
     return o
 
 
+def _when_fields_de(o, alts, alts_de):
+    """when_de / when_any_de: the conditions of o (_when_fields of alts) in
+    German, each where it differs.  alts_de runs parallel to alts, so every
+    English condition finds its German text by position."""
+    de = {}
+    for a, b in zip(alts, alts_de):
+        for en, g in zip(a, b):
+            de.setdefault(en, g)
+    out = {}
+    if o.get("when"):
+        w = [de.get(c, c) for c in o["when"]]
+        if w != o["when"]:
+            out["when_de"] = w
+    if o.get("when_any"):
+        w = [[de.get(c, c) for c in a] for a in o["when_any"]]
+        if w != o["when_any"]:
+            out["when_any_de"] = w
+    return out
+
+
 def walk_dynamic(dyn):
     """Record, per ComObjectRef/ParameterRef id, how often the ETS UI shows it,
     every distinct set of innermost conditions (choose/when) it is shown under
@@ -1098,13 +1118,19 @@ def build_record(raw, langs, master, hw, source, rows=None):
     T = _Texts(en, de, a.get("DefaultLanguage"))
     name, name_de = T.get(full_id, "Name", a.get("Name"))
 
-    # -- types, enum texts in English
+    # -- types, enum texts in English; values_de: the German ones that differ
     types_out = {}
     for tid, t in raw.types.items():
         o = {k: v for k, v in t.items() if k != "values" and v is not None}
         if t.get("kind") == "enum":
-            o["values"] = [[v["value"], T.get(v["id"], "Text", v["text"])[0]]
-                           for v in t.get("values", [])]
+            o["values"], de = [], []
+            for v in t.get("values", []):
+                t_en, t_de = T.get(v["id"], "Text", v["text"])
+                o["values"].append([v["value"], t_en])
+                if t_de:
+                    de.append([v["value"], t_de])
+            if de:
+                o["values_de"] = de
             binary = [[v["binary"], v["value"]] for v in t.get("values", []) if v.get("binary")]
             if binary:
                 o["binary"] = binary            # stored bytes (hex) -> value
@@ -1253,28 +1279,31 @@ def build_record(raw, langs, master, hw, source, rows=None):
                 t_de = None
         return t_en, t_de
 
-    # -- ETS conditions (Dynamic) rendered as text
-    def pref_text(pref_id, names=None):
+    # -- ETS conditions (Dynamic) rendered as text; de: in German where the
+    # product data has German, in English where it has not
+    def pref_text(pref_id, names=None, de=False):
         r = pref_by_id.get(pref_id)
         if r is None:
             return short(pref_id) or "?", None
         p = params_by_id.get(r["ref"])
         text = None
         if r.get("text"):
-            text = text2(pref_id, "Text", r["text"], names, r.get("text_param"))[0]
+            t = text2(pref_id, "Text", r["text"], names, r.get("text_param"))
+            text = (de and t[1]) or t[0]
         elif p is not None:
-            text = text2(p["id"], "Text", p["text"], names, p.get("text_param"))[0]
+            t = text2(p["id"], "Text", p["text"], names, p.get("text_param"))
+            text = (de and t[1]) or t[0]
         if not text and p is not None:
             text = _norm(p.get("name")) or short(p["id"])
         return text or short(pref_id), p
 
-    def value_text(p, value):
+    def value_text(p, value, de=False):
         if p is None or not p.get("type"):
             return None
         ty = types_out.get(short(p["type"]))
         if not ty or ty.get("kind") != "enum":
             return None
-        for v, txt in ty["values"]:
+        for v, txt in (ty.get("values_de", []) if de else []) + ty["values"]:
             if v == value:
                 return txt
         return None
@@ -1284,16 +1313,16 @@ def build_record(raw, langs, master, hw, source, rows=None):
     # instance.  Rendering them again and again was a third of the indexing.
     rendered = {}
 
-    def render_cond(cond, names=None):
-        key = (cond, id(names) if names is not None else None)
+    def render_cond(cond, names=None, de=False):
+        key = (cond, id(names) if names is not None else None, de)
         text = rendered.get(key)
         if text is None:
-            text = rendered[key] = _render_cond(cond, names)
+            text = rendered[key] = _render_cond(cond, names, de)
         return text
 
-    def _render_cond(cond, names):
+    def _render_cond(cond, names, de):
         pref, test, others = cond
-        text, p = pref_text(pref, names)
+        text, p = pref_text(pref, names, de)
         if test is not None:
             vals = test.split()
             if vals and all(_is_intlike(v) for v in vals):
@@ -1301,7 +1330,7 @@ def build_record(raw, langs, master, hw, source, rows=None):
                 # the seventh look out of scope.  Texts for the first six only.
                 shown = []
                 for i, v in enumerate(vals):
-                    vt = value_text(p, v) if i < 6 else None
+                    vt = value_text(p, v, de) if i < 6 else None
                     shown.append("%s (%s)" % (v, vt) if vt else v)
                 if len(vals) == 1:
                     return "%s = %s" % (text, shown[0])
@@ -1310,37 +1339,50 @@ def build_record(raw, langs, master, hw, source, rows=None):
         return "%s = other (not %s)" % (text, " | ".join(others))
 
     def block_label(b, names=None):
+        """(English, German where it differs) label of a block."""
         if b is None:
-            return None
+            return None, None
         _kind, bid, text, pref_id, nm, text_param = b
         if text:
-            return text2(bid, "Text", text, names, text_param)[0] or None
-        if pref_id:
-            return pref_text(pref_id, names)[0] or None
-        return _norm(nm) or None
+            en, de = text2(bid, "Text", text, names, text_param)
+        elif pref_id:
+            en, de = pref_text(pref_id, names)[0], pref_text(pref_id, names, True)[0]
+        else:
+            en, de = _norm(nm), None
+        return en or None, (de if de and de != en else None)
 
-    def context(entry, inst=None):
+    def context(entry, inst=None, de=False):
         """when / when_any / block / seen of a UI reference; for a module
         instance its own conditions come first, then the innermost ones of
         the module.  Every place the UI shows it is one set of conditions
-        (_when_fields)."""
+        (_when_fields).  de: also when_de / when_any_de / block_de, the
+        German texts where they differ -- for parameters, which a device
+        describes from a pack by their memory location."""
         names = inst["names"] if inst else None
         outer = inst["outer"] if inst else []
-        alts, cut = [], False
+        outer_de = inst["outer_de"] if inst else []
+        alts, alts_de, cut = [], [], False
         for conds in (entry[1] if entry else [()]):
             alt = list(outer) + [render_cond(c, names) for c in conds]
             if len(alt) > MAX_CONDS:            # outermost kept: they name the mode
                 alt, cut = alt[:MAX_CONDS], True
             alts.append(alt)
+            if de:
+                alts_de.append((list(outer_de) + [render_cond(c, names, True)
+                                                  for c in conds])[:MAX_CONDS])
         o = _when_fields(alts)
+        if de:
+            o.update(_when_fields_de(o, alts, alts_de))
         if cut:
             o["when_more"] = True
         if entry is None:
             o["ui"] = False
             return o
-        bl = block_label(entry[2], names)
+        bl, bl_de = block_label(entry[2], names)
         if bl:
             o["block"] = bl
+            if de and bl_de:
+                o["block_de"] = bl_de
         if entry[0] > 1:
             o["seen"] = entry[0]
         return o
@@ -1389,6 +1431,8 @@ def build_record(raw, langs, master, hw, source, rows=None):
             # every condition placing it, the enclosing instance's first
             outer = (list(parent["outer"]) if parent else []) + [
                 render_cond(c, pnames) for c in mod["conds"]]
+            outer_de = (list(parent["outer_de"]) if parent else []) + [
+                render_cond(c, pnames, True) for c in mod["conds"]]
             rep = mod.get("repeat")
             count, count_pref = 1, None
             if rep is not None:
@@ -1451,14 +1495,16 @@ def build_record(raw, langs, master, hw, source, rows=None):
                     unsupported["allocator_after_variable_repeat"] += 1
                 iid = ((parent["id"] + "_" + local_id(mod["id"], parent["md"])) if parent
                        else short(mod["id"])) + ("_MI-%d" % i if rep is not None else "")
-                o_outer = list(outer)
+                o_outer, o_outer_de = list(outer), list(outer_de)
                 if count_pref:
                     o_outer.append("%s >= %d" % (pref_text(count_pref, pnames)[0], i))
-                label = block_label(md.dynamic.get("first_block"), names)
+                    o_outer_de.append("%s >= %d" % (pref_text(count_pref, pnames, True)[0], i))
+                label = block_label(md.dynamic.get("first_block"), names)[0]
                 label = label or _norm(mod.get("name")) or "%s %d" % (
                     md.attrs.get("Name") or short(md.full_id), i)
                 group.append({"id": iid, "md": md, "values": values, "names": names,
-                              "outer": o_outer, "label": label, "index": i})
+                              "outer": o_outer, "outer_de": o_outer_de, "label": label,
+                              "index": i})
             if count_pref:
                 for lid in used:
                     if lid in counters:
@@ -1606,9 +1652,9 @@ def build_record(raw, langs, master, hw, source, rows=None):
         # a status parameter look visible with status signals switched off.
         # Shown nowhere: ui false, and `when` tells where it sits in the tree.
         if shown:
-            o.update(context(_merge_entries(shown), inst))
+            o.update(context(_merge_entries(shown), inst, de=True))
         else:
-            ctx = context(_merge_entries(hidden), inst)
+            ctx = context(_merge_entries(hidden), inst, de=True)
             ctx.pop("seen", None)
             ctx["ui"] = False
             o.update(ctx)
@@ -1897,8 +1943,8 @@ def _param_row(o):
     segment, size_bits, bytes occupied, module id and label (lower case),
     search text, and the body last."""
     mem = o.get("storage") == "memory"
-    fields = [o.get("text"), o.get("text_de"), o.get("name"), o.get("block"), o.get("id"),
-              (o.get("module") or {}).get("label")]
+    fields = [o.get("text"), o.get("text_de"), o.get("name"), o.get("block"), o.get("block_de"),
+              o.get("id"), (o.get("module") or {}).get("label")]
     fields += [v.get("text") for v in o.get("variants", [])]
     return ((o.get("storage"), o.get("segment") if mem else None, o.get("address"),
              o.get("offset") if mem else None, o.get("size_bits"),
@@ -5513,6 +5559,9 @@ def health_check(data_dir, timeout=4.0):
 #       parameter's memory location -- segment and seg_offset in it, address
 #       when the segment is absolute -- and a com object's number, without
 #       inflating
+#
+# The bodies are English with German beside where it differs: a parameter's
+# text_de, block_de, when_de and when_any_de, an enumeration's values_de.
 #
 # A catalogue (lookup_indexes=False) has only the primary keys: a device copies
 # whole programs out of it, by prog.  The copy -- the device's cache -- gets the
