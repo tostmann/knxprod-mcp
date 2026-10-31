@@ -5494,21 +5494,30 @@ def health_check(data_dir, timeout=4.0):
 #
 # Format version 1 (rollback journal, 4 KiB pages):
 #   meta(key, value)                         format, version, chunk, created, generator
-#   program(prog, full_id, app_id, manufacturer, name, header, entry)
-#       prog: integer key of the program in this file; header: zlib JSON as in
-#       the index; entry: the JSON entry of list_programs
+#   program(prog, full_id, app_id, manufacturer, name, layout, max_nbytes,
+#           preferred, header, entry)
+#       prog: integer key of the program in this file; layout: fingerprint of
+#       the memory layout (programs of one app id and one layout are the same
+#       program; of different layouts, the app id alone cannot tell them apart);
+#       preferred: 1 for the one program per (app_id, layout) this pack
+#       prefers, as resolve_program does; header: zlib JSON as in the index,
+#       with the segments; entry: the JSON entry of list_programs
+#   alias(alias, prog)                       other app ids that report the program (OEM)
 #   chunk(prog, kind, n, body)               body: zlib of a JSON array of up to
 #       `chunk` objects; kind p = parameters (index order: by address),
 #       c = com objects (by number), t = types
-#   item(prog, kind, n, pos, id, module, address, bit, size_bits, number)
-#       one row per object: which chunk (n) and where in it (pos); the memory
-#       location of a parameter and the number of a com object without inflating
+#   item(prog, kind, n, pos, id, module, segment, seg_offset, address, bit,
+#        size_bits, number)
+#       one row per object: which chunk (n) and where in it (pos); a
+#       parameter's memory location -- segment and seg_offset in it, address
+#       when the segment is absolute -- and a com object's number, without
+#       inflating
 #
 # A catalogue (lookup_indexes=False) has only the primary keys: a device copies
 # whole programs out of it, by prog.  The copy -- the device's cache -- gets the
-# lookup indexes (item by id, parameters by memory location).  There is no
-# search text: a catalogue is searched on a server, a cache by inflating its few
-# programs.
+# lookup indexes (item by id, parameters by memory location, com objects by
+# number).  There is no search text: a catalogue is searched on a server, a
+# cache by inflating its few programs.
 #
 # The pack holds manufacturer data from your product files.  It is for your
 # own devices, not for passing on.
@@ -5519,53 +5528,128 @@ PACK_CHUNK = 64
 _PACK_SCHEMA = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID",
     "CREATE TABLE program(prog INTEGER PRIMARY KEY, full_id TEXT NOT NULL UNIQUE, "
-    "app_id TEXT NOT NULL, manufacturer TEXT, name TEXT, header BLOB NOT NULL, "
+    "app_id TEXT NOT NULL, manufacturer TEXT, name TEXT, layout TEXT NOT NULL, "
+    "max_nbytes INTEGER NOT NULL, preferred INTEGER NOT NULL, header BLOB NOT NULL, "
     "entry TEXT NOT NULL)",
     "CREATE INDEX program_app ON program(app_id)",
+    "CREATE TABLE alias(alias TEXT NOT NULL, prog INTEGER NOT NULL, PRIMARY KEY(alias, prog)) "
+    "WITHOUT ROWID",
     # a rowid table: in a WITHOUT ROWID table the compressed chunks spill onto
     # overflow pages and take almost twice their size
     "CREATE TABLE chunk(prog INTEGER NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL, "
     "body BLOB NOT NULL, UNIQUE(prog, kind, n))",
     "CREATE TABLE item(prog INTEGER NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL, "
-    "pos INTEGER NOT NULL, id TEXT NOT NULL, module TEXT, address INTEGER, bit INTEGER, "
-    "size_bits INTEGER, number INTEGER, PRIMARY KEY(prog, kind, n, pos)) WITHOUT ROWID",
+    "pos INTEGER NOT NULL, id TEXT NOT NULL, module TEXT, segment TEXT, seg_offset INTEGER, "
+    "address INTEGER, bit INTEGER, size_bits INTEGER, number INTEGER, "
+    "PRIMARY KEY(prog, kind, n, pos)) WITHOUT ROWID",
 )
 PACK_LOOKUP_INDEXES = (
     "CREATE INDEX IF NOT EXISTS item_id ON item(prog, kind, id)",
     "CREATE INDEX IF NOT EXISTS item_address ON item(prog, address, bit) "
     "WHERE kind = 'p' AND address IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS item_segment ON item(prog, segment, seg_offset, bit) "
+    "WHERE kind = 'p' AND segment IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS item_number ON item(prog, number) WHERE kind = 'c'",
 )
+_PACK_ITEM_SQL = "INSERT INTO item VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
 
 
-def _pack_chunks(con, prog, kind, objs, size):
-    """objs: [(body_bytes, item_tuple_without_position)] in order."""
-    for n in range(0, (len(objs) + size - 1) // size):
-        part = objs[n * size:(n + 1) * size]
-        con.execute("INSERT INTO chunk VALUES(?,?,?,?)", (
-            prog, kind, n, zlib.compress(b"[" + b",".join(b for b, _ in part) + b"]", 6)))
-        con.executemany("INSERT INTO item VALUES(?,?,?,?,?,?,?,?,?,?)", [
-            (prog, kind, n, pos) + it for pos, (_b, it) in enumerate(part)])
+class _ChunkWriter:
+    """Writes the objects of one kind of one program as they come, a chunk at
+    a time: a program of hundreds of thousands of parameters never sits in
+    memory whole."""
+
+    def __init__(self, con, prog, kind, size):
+        self.con, self.prog, self.kind, self.size = con, prog, kind, size
+        self.n, self.part, self.count = 0, [], 0
+
+    def add(self, raw, item):
+        self.part.append((raw, item))
+        self.count += 1
+        if len(self.part) == self.size:
+            self.flush()
+
+    def flush(self):
+        if not self.part:
+            return
+        self.con.execute("INSERT INTO chunk VALUES(?,?,?,?)", (
+            self.prog, self.kind, self.n,
+            zlib.compress(b"[" + b",".join(b for b, _ in self.part) + b"]", 6)))
+        self.con.executemany(_PACK_ITEM_SQL, [
+            (self.prog, self.kind, self.n, pos) + it for pos, (_b, it) in enumerate(self.part)])
+        self.n += 1
+        self.part = []
+
+
+def _pack_program(src, dst, prog, pk, chunk):
+    """Copy the objects of program pk into the pack as prog -> object count."""
+    params = _ChunkWriter(dst, prog, "p", chunk)
+    for seg, off, addr, bits, body in src.execute(
+            "SELECT p.segment, p.seg_offset, p.address, p.size_bits, b.body FROM params p "
+            "JOIN param_bodies b ON b.id=p.id WHERE p.pk=? ORDER BY p.id", (pk,)):
+        raw = zlib.decompress(body)
+        o = json.loads(raw)
+        params.add(raw, (o["id"], (o.get("module") or {}).get("id"), seg, off, addr,
+                         o.get("bit_offset"), bits, None))
+    objs = _ChunkWriter(dst, prog, "c", chunk)
+    for num, body in src.execute(
+            "SELECT o.number, b.body FROM comobjects o JOIN comobject_bodies b ON b.id=o.id "
+            "WHERE o.pk=? ORDER BY o.id", (pk,)):
+        raw = zlib.decompress(body)
+        o = json.loads(raw)
+        objs.add(raw, (o["id"], (o.get("module") or {}).get("id"), None, None, None, None,
+                       o.get("size_bits"), num))
+    types = _ChunkWriter(dst, prog, "t", chunk)
+    for tid, body in src.execute("SELECT id, body FROM types WHERE pk=? ORDER BY id", (pk,)):
+        types.add(zlib.decompress(body), (tid, None, None, None, None, None, None, None))
+    for w in (params, objs, types):
+        w.flush()
+    return params.count + objs.count + types.count
+
+
+def _open_index_ro(data_dir):
+    path = _db_path(os.path.abspath(data_dir))
+    if not os.path.exists(path):
+        raise ConfigError("no index at %s" % path)
+    try:
+        src = sqlite3.connect("file:%s?mode=ro" % path, uri=True, isolation_level=None)
+        src.execute("SELECT count(*) FROM programs").fetchone()
+    except sqlite3.OperationalError as e:
+        raise ConfigError("cannot read the index %s (%s); a read-only copy of the data "
+                          "directory needs the index's -wal and -shm files, or an index "
+                          "without them" % (path, e))
+    return src
 
 
 def write_pack(data_dir, out_path, apps=None, manufacturers=None, chunk=PACK_CHUNK,
                lookup_indexes=True, log=None):
-    """Write the pack for the given application ids and/or manufacturer ids
-    (all programs when neither is given); lookup_indexes=False for a
-    catalogue.  -> facts."""
+    """Write the pack for the given application ids (also matched against
+    OEM aliases) and/or manufacturer ids (all programs when neither is given);
+    lookup_indexes=False for a catalogue.  -> facts.  Each program is read in a
+    transaction of its own, so a sync running meanwhile cannot tear one; a
+    program the sync removed is left out and counted as vanished."""
     if chunk < 1:
         raise ConfigError("chunk must be at least 1")
-    src = sqlite3.connect("file:%s?mode=ro" % _db_path(os.path.abspath(data_dir)), uri=True)
+    src = _open_index_ro(data_dir)
+    tmp = None
     try:
-        progs = src.execute("SELECT pk, full_id, app_id, header, entry FROM programs "
-                            "ORDER BY full_id").fetchall()
+        progs = src.execute("SELECT full_id, app_id FROM programs ORDER BY full_id").fetchall()
+        aliases = collections.defaultdict(list)
+        for alias, full_id in src.execute("SELECT a.alias, p.full_id FROM aliases a JOIN "
+                                          "programs p ON p.pk=a.pk ORDER BY a.alias"):
+            aliases[full_id].append(alias)
         want_apps = {a.upper() for a in apps or ()}
         want_mfr = {m.upper() for m in manufacturers or ()}
         if want_apps or want_mfr:
-            progs = [p for p in progs if p[2].upper() in want_apps
-                     or p[1].split("_", 1)[0].upper() in want_mfr]
+            progs = [p for p in progs if p[1].upper() in want_apps
+                     or any(a.upper() in want_apps for a in aliases.get(p[0], ()))
+                     or p[0].split("_", 1)[0].upper() in want_mfr]
+        if not progs:
+            raise ConfigError("no application program matches; %s left as it was" % out_path)
         tmp = "%s.%d.tmp" % (out_path, os.getpid())
-        if os.path.exists(tmp):
-            os.remove(tmp)
+        for leftover in (tmp, tmp + "-journal"):
+            if os.path.exists(leftover):
+                os.remove(leftover)
         dst = sqlite3.connect(tmp)
         try:
             dst.execute("PRAGMA page_size=4096")
@@ -5575,37 +5659,38 @@ def write_pack(data_dir, out_path, apps=None, manufacturers=None, chunk=PACK_CHU
             dst.executemany("INSERT INTO meta VALUES(?,?)", [
                 ("format", PACK_FORMAT), ("version", str(PACK_VERSION)), ("chunk", str(chunk)),
                 ("created", _utc_now()), ("generator", "knxprod-mcp %s" % VERSION)])
-            items = 0
-            for prog, (pk, full_id, app_id, header, entry) in enumerate(progs, 1):
-                head = _unpack(header)
-                mfr = head.get("manufacturer") or {}
-                dst.execute("INSERT INTO program VALUES(?,?,?,?,?,?,?)", (
-                    prog, full_id, app_id, mfr.get("id"), head.get("name"), header, entry))
-                params = []
-                for addr, bits, mod, body in src.execute(
-                        "SELECT p.address, p.size_bits, p.module_id, b.body FROM params p "
-                        "JOIN param_bodies b ON b.id=p.id WHERE p.pk=? ORDER BY p.id", (pk,)):
-                    raw = zlib.decompress(body)
-                    o = json.loads(raw)
-                    params.append((raw, (o.get("id") or "", mod, addr, o.get("bit_offset"),
-                                         bits, None)))
-                objs = []
-                for num, mod, body in src.execute(
-                        "SELECT o.number, o.module_id, b.body FROM comobjects o JOIN "
-                        "comobject_bodies b ON b.id=o.id WHERE o.pk=? ORDER BY o.id", (pk,)):
-                    raw = zlib.decompress(body)
-                    o = json.loads(raw)
-                    objs.append((raw, (o.get("id") or str(num), mod, None, None,
-                                       o.get("size_bits"), num)))
-                types = [(zlib.decompress(body), (tid, None, None, None, None, None))
-                         for tid, body in src.execute(
-                             "SELECT id, body FROM types WHERE pk=? ORDER BY id", (pk,))]
-                for kind, rows in (("p", params), ("c", objs), ("t", types)):
-                    _pack_chunks(dst, prog, kind, rows, chunk)
-                items += len(params) + len(objs) + len(types)
+            items, prog, vanished, rank = 0, 0, [], {}
+            for full_id, _app in progs:
+                src.execute("BEGIN")
+                try:
+                    row = src.execute("SELECT pk, app_id, layout, max_nbytes, header, entry "
+                                      "FROM programs WHERE full_id=?", (full_id,)).fetchone()
+                    if row is None:
+                        vanished.append(full_id)
+                        continue
+                    pk, app_id, layout, max_nbytes, header, entry = row
+                    prog += 1
+                    head = _unpack(header)
+                    mfr = head.get("manufacturer") or {}
+                    dst.execute("INSERT INTO program VALUES(?,?,?,?,?,?,?,0,?,?)", (
+                        prog, full_id, app_id, mfr.get("id"), head.get("name"), layout,
+                        max_nbytes, header, entry))
+                    dst.executemany("INSERT INTO alias VALUES(?,?)", [
+                        (a, prog) for (a,) in src.execute(
+                            "SELECT alias FROM aliases WHERE pk=? ORDER BY alias", (pk,))])
+                    n = _pack_program(src, dst, prog, pk, chunk)
+                finally:
+                    src.execute("COMMIT")
+                items += n
+                key = (app_id, layout)
+                pref = _preference(head.get("converted_from_pre_ets4"),
+                                   len(head.get("products") or []), full_id)
+                if key not in rank or pref < rank[key][0]:
+                    rank[key] = (pref, prog)
                 if log:
-                    log("packed %s (%d parameters, %d com objects, %d types)"
-                        % (full_id, len(params), len(objs), len(types)))
+                    log("packed %s (%d objects)" % (full_id, n))
+            dst.executemany("UPDATE program SET preferred=1 WHERE prog=?",
+                            [(p,) for _pref, p in rank.values()])
             if lookup_indexes:
                 for stmt in PACK_LOOKUP_INDEXES:
                     dst.execute(stmt)
@@ -5616,11 +5701,18 @@ def write_pack(data_dir, out_path, apps=None, manufacturers=None, chunk=PACK_CHU
         with open(tmp, "rb") as f:
             os.fsync(f.fileno())
         os.replace(tmp, out_path)
+        tmp = None
         _fsync_dir(os.path.dirname(os.path.abspath(out_path)))
     finally:
         src.close()
-    return {"programs": len(progs), "items": items, "bytes": os.path.getsize(out_path)}
-
+        if tmp is not None:
+            for leftover in (tmp, tmp + "-journal"):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+    return {"programs": prog, "items": items, "vanished": vanished,
+            "bytes": os.path.getsize(out_path)}
 
 # ---------------------------------------------------------------------------
 # configuration and CLI
@@ -5767,12 +5859,17 @@ def main(argv=None):
             r = write_pack(args.data or _env("KNXPROD_DATA") or DEFAULT_DATA, args.out,
                            args.app, args.manufacturer, args.chunk,
                            lookup_indexes=not args.catalogue)
-        except (ConfigError, sqlite3.Error) as e:
+        except ConfigError as e:
+            print("knxprod-mcp: %s" % e, file=sys.stderr)
+            return 1
+        except sqlite3.Error as e:
             print("knxprod-mcp: %s" % e, file=sys.stderr)
             return 2
         print("%s: %d application programs, %d objects, %d bytes" % (
             args.out, r["programs"], r["items"], r["bytes"]))
-        return 0 if r["programs"] else 1
+        for full_id in r["vanished"]:
+            print("  left out (removed from the index meanwhile): %s" % full_id)
+        return 0
     try:
         cfg = resolve_config(args)
         ZIP_MAX_TOTAL = cfg["zip_max_mb"] << 20

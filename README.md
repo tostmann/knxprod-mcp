@@ -208,38 +208,78 @@ python knxprod_mcp.py pack vendor.pack --manufacturer M-0083
 python knxprod_mcp.py pack all.pack --catalogue    # every program, no lookup indexes
 ```
 
+`--app` also matches the other application ids a program reports (OEM aliases).
+When nothing matches, `pack` says so and leaves an existing file alone. Each
+program is read in a transaction of its own, so a sync running meanwhile cannot
+tear one; a program the sync removed is left out and named.
+
 The objects of a program are stored in zlib-compressed chunks (64 per chunk by
 default, `--chunk`): reading one parameter inflates one chunk, listing a whole
 program inflates each chunk once. An `item` table says which chunk holds an
-object and carries the memory location of each parameter and the number of each
-com object, so a device can join the values it reads from a bus device with
-their descriptions without inflating anything.
+object and carries where a parameter lives in memory and the number of each com
+object, so a device can join the values it reads from a bus device with their
+descriptions without inflating anything.
 
 | table | content |
 |---|---|
 | `meta` | `format` = `knxprod-pack`, `version` = 1, `chunk`, `created`, `generator` |
-| `program` | `prog` (integer key in this file), `full_id`, `app_id`, `manufacturer`, `name`, `header` (zlib JSON), `entry` (JSON) |
+| `program` | `prog` (integer key in this file), `full_id`, `app_id`, `manufacturer`, `name`, `layout`, `max_nbytes`, `preferred`, `header` (zlib JSON, with `segments`), `entry` (JSON) |
+| `alias` | `alias`, `prog`: other application ids that report the program |
 | `chunk` | `prog`, `kind` (`p` parameters, `c` com objects, `t` types), `n`, `body`: zlib of a JSON array |
-| `item` | `prog`, `kind`, `n`, `pos` (index in the chunk's array), `id`, `module`, `address`, `bit`, `size_bits`, `number` |
+| `item` | `prog`, `kind`, `n`, `pos` (index in the chunk's array), `id`, `module`, `segment`, `seg_offset`, `address`, `bit`, `size_bits`, `number` |
+
+Reading it:
+
+- **Which program.** Look the application id a device reports up in
+  `program.app_id`, then in `alias`. Programs of one application id and one
+  `layout` are the same program; take the one with `preferred` = 1. Programs of
+  different layouts cannot be told apart by the application id alone.
+- **Where a parameter lives.** In a relative segment (most programs since ETS4)
+  by `segment` and `seg_offset`: the segment's place in the device comes from
+  the load procedure, its size and kind from `header.segments`. In an absolute
+  segment `address` holds the address as well. `bit` counts from the most
+  significant bit of the first byte; `size_bits` may run over byte boundaries.
+  Properties (storage `property`) carry their object and property id in the
+  body, not in `item`.
+- **Several objects at one place.** One memory location can hold parameters of
+  alternative modules or the members of a union; which one counts depends on
+  the conditions in their bodies (`when`). Com object numbers repeat for the
+  same reason, and a com object's `size_bits` is that of its base; its
+  variants may differ.
+- **Ids.** `item.id` and `item.module` are the ids as in the bodies.
 
 The file uses a rollback journal (no WAL), so it opens on small SQLite builds.
 A pack written with `--catalogue` has no lookup indexes and serves as a
 read-only catalogue (an installer's SD card, say); a device copies the programs
 it needs into a cache with the same schema plus the lookup indexes, giving them
-new `prog` numbers:
+new `prog` numbers. Copying again changes nothing:
 
 ```sql
 ATTACH 'catalogue.pack' AS cat;
-INSERT INTO program(full_id, app_id, manufacturer, name, header, entry)
-  SELECT full_id, app_id, manufacturer, name, header, entry FROM cat.program WHERE app_id = :app;
-INSERT INTO chunk SELECT d.prog, c.kind, c.n, c.body FROM cat.chunk c
-  JOIN cat.program s ON s.prog = c.prog JOIN main.program d ON d.full_id = s.full_id
-  WHERE s.app_id = :app;
--- item likewise
+-- the preferred program of each layout of the application id
+INSERT OR IGNORE INTO program(full_id, app_id, manufacturer, name, layout, max_nbytes,
+                              preferred, header, entry)
+  SELECT full_id, app_id, manufacturer, name, layout, max_nbytes, preferred, header, entry
+  FROM cat.program WHERE app_id = :app AND preferred = 1;
+-- everything else under the new numbers, matched by full_id
+INSERT OR IGNORE INTO alias
+  SELECT c.alias, d.prog FROM cat.alias c JOIN cat.program s ON s.prog = c.prog
+  JOIN main.program d ON d.full_id = s.full_id WHERE s.app_id = :app AND s.preferred = 1;
+INSERT OR IGNORE INTO chunk
+  SELECT d.prog, c.kind, c.n, c.body FROM cat.chunk c JOIN cat.program s ON s.prog = c.prog
+  JOIN main.program d ON d.full_id = s.full_id WHERE s.app_id = :app AND s.preferred = 1;
+INSERT OR IGNORE INTO item
+  SELECT d.prog, c.kind, c.n, c.pos, c.id, c.module, c.segment, c.seg_offset, c.address,
+         c.bit, c.size_bits, c.number
+  FROM cat.item c JOIN cat.program s ON s.prog = c.prog
+  JOIN main.program d ON d.full_id = s.full_id WHERE s.app_id = :app AND s.preferred = 1;
 ```
 
 There is no search text in a pack: search the catalogue on the server, a
 cache's few programs by inflating them.
+
+`pack` reads the index read-only. A read-only copy of the data directory needs
+the index's `-wal` and `-shm` files next to it, or an index without them.
 
 A pack contains manufacturer data from your product files. It is meant for
 your own devices; check the manufacturer's terms before passing it on.

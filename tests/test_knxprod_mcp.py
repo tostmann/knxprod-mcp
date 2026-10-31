@@ -44,6 +44,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import zlib
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -3137,14 +3138,17 @@ class TestPack(unittest.TestCase):
         cls.index = sqlite3.connect(os.path.join(cls.data, K.DB_NAME))
         cls.addClassCleanup(cls.index.close)
 
-    def pack(self, name, **kw):
+    def pack(self, name, data=None, **kw):
         out = os.path.join(self.tmp, name)
-        facts = K.write_pack(self.data, out, **kw)
+        facts = K.write_pack(data or self.data, out, **kw)
         db = sqlite3.connect(out)
         self.addCleanup(db.close)
         return out, facts, db
 
-    def test_every_object_comes_back_from_its_chunk(self):
+    def leftovers(self):
+        return [x for x in os.listdir(self.tmp) if ".tmp" in x]
+
+    def test_every_object_comes_back_from_its_chunk_with_its_item_row(self):
         out, facts, db = self.pack("all.sqlite", chunk=2)
         progs = self.index.execute("SELECT pk, full_id FROM programs").fetchall()
         self.assertEqual(facts["programs"], len(progs))
@@ -3153,62 +3157,88 @@ class TestPack(unittest.TestCase):
         prog_of = dict(db.execute("SELECT full_id, prog FROM program"))
         chunks = {(g, k, n): json.loads(zlib.decompress(b))
                   for g, k, n, b in db.execute("SELECT prog, kind, n, body FROM chunk")}
+        un = lambda b: json.loads(zlib.decompress(b))
+        mod = lambda o: (o.get("module") or {}).get("id")
         for pk, full_id in progs:
             prog = prog_of[full_id]
-            want = {"p": [json.loads(zlib.decompress(b)) for b, in self.index.execute(
-                        "SELECT b.body FROM params p JOIN param_bodies b ON b.id=p.id "
-                        "WHERE p.pk=? ORDER BY p.id", (pk,))],
-                    "c": [json.loads(zlib.decompress(b)) for b, in self.index.execute(
-                        "SELECT b.body FROM comobjects o JOIN comobject_bodies b ON b.id=o.id "
-                        "WHERE o.pk=? ORDER BY o.id", (pk,))],
-                    "t": [json.loads(zlib.decompress(b)) for b, in self.index.execute(
-                        "SELECT body FROM types WHERE pk=? ORDER BY id", (pk,))]}
-            for kind, bodies in want.items():
-                rows = db.execute("SELECT n, pos, id FROM item WHERE prog=? AND kind=? "
+            # what each item row must say, from the index's own columns and bodies
+            want = {"p": [(o["id"], mod(o), seg, off, addr, o.get("bit_offset"), bits, None, o)
+                          for seg, off, addr, bits, o in (
+                              (r[0], r[1], r[2], r[3], un(r[4])) for r in self.index.execute(
+                                  "SELECT p.segment, p.seg_offset, p.address, p.size_bits, "
+                                  "b.body FROM params p JOIN param_bodies b ON b.id=p.id "
+                                  "WHERE p.pk=? ORDER BY p.id", (pk,)))],
+                    "c": [(o["id"], mod(o), None, None, None, None, o.get("size_bits"), num, o)
+                          for num, o in ((r[0], un(r[1])) for r in self.index.execute(
+                              "SELECT o.number, b.body FROM comobjects o JOIN comobject_bodies b "
+                              "ON b.id=o.id WHERE o.pk=? ORDER BY o.id", (pk,)))],
+                    "t": [(tid, None, None, None, None, None, None, None, un(b))
+                          for tid, b in self.index.execute(
+                              "SELECT id, body FROM types WHERE pk=? ORDER BY id", (pk,))]}
+            for kind, objs in want.items():
+                rows = db.execute("SELECT n, pos, id, module, segment, seg_offset, address, bit, "
+                                  "size_bits, number FROM item WHERE prog=? AND kind=? "
                                   "ORDER BY n, pos", (prog, kind)).fetchall()
-                self.assertEqual(len(rows), len(bodies), (full_id, kind))
-                for (n, pos, _id), body in zip(rows, bodies):
-                    self.assertEqual(chunks[(prog, kind, n)][pos], body)
-        addr = self.index.execute("SELECT count(*) FROM params WHERE address IS NOT NULL")
-        self.assertEqual(db.execute("SELECT count(*) FROM item WHERE kind='p' AND address "
-                                    "IS NOT NULL").fetchone(), addr.fetchone())
+                self.assertEqual(len(rows), len(objs), (full_id, kind))
+                for row, w in zip(rows, objs):
+                    self.assertEqual(chunks[(prog, kind, row[0])][row[1]], w[-1])
+                    self.assertEqual(row[2:], w[:-1], (full_id, kind, w[0]))
+        # relative segments: located by segment and offset, no address
+        self.assertGreater(db.execute("SELECT count(*) FROM item WHERE kind='p' AND segment IS "
+                                      "NOT NULL AND address IS NULL").fetchone()[0], 0)
         self.assertGreater(db.execute("SELECT max(n) FROM chunk").fetchone()[0], 0)
         with open(out, "rb") as f:
             self.assertEqual(f.read(20)[18:20], b"\x01\x01")   # rollback journal, no WAL
-        self.assertEqual([x for x in os.listdir(self.tmp) if x.endswith(".tmp")], [])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_layout_preference_and_aliases(self):
+        _out, _f, db = self.pack("meta.sqlite")
+        index = {r[0]: r[1:] for r in self.index.execute(
+            "SELECT full_id, layout, max_nbytes FROM programs")}
+        for full_id, layout, nbytes in db.execute("SELECT full_id, layout, max_nbytes FROM program"):
+            self.assertEqual((layout, nbytes), index[full_id])
+        self.assertEqual(db.execute("SELECT count(*) FROM program WHERE preferred=1").fetchone(),
+                         db.execute("SELECT count(DISTINCT app_id || layout) FROM program").fetchone())
+        self.assertEqual(db.execute("SELECT a.alias, p.full_id FROM alias a JOIN program p "
+                                    "USING (prog)").fetchall(),
+                         self.index.execute("SELECT a.alias, p.full_id FROM aliases a JOIN "
+                                            "programs p USING (pk)").fetchall())
+        # an OEM alias selects its program, as the server resolves it
+        alias, full_id = self.index.execute("SELECT a.alias, p.full_id FROM aliases a JOIN "
+                                            "programs p USING (pk)").fetchone()
+        _out, facts, one = self.pack("alias.sqlite", apps=[alias.lower()])
+        self.assertEqual([r[0] for r in one.execute("SELECT full_id FROM program")], [full_id])
 
     def test_catalogue_has_no_lookup_indexes_and_copies_into_a_cache(self):
         _out, _f, full = self.pack("cache.sqlite")
         cat_path, _f, cat = self.pack("cat.sqlite", lookup_indexes=False)
         names = lambda db: {r[0] for r in db.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")}
-        self.assertIn("item_id", names(full))
-        self.assertNotIn("item_id", names(cat))
-        app = cat.execute("SELECT app_id FROM program LIMIT 1").fetchone()[0]
-        # a device's cache: the same schema, programs copied in with new numbers
+        self.assertTrue({"item_id", "item_address", "item_segment", "item_number"} <= names(full))
+        self.assertEqual(names(cat) & {"item_id", "item_address", "item_segment", "item_number"},
+                         set())
+        app = cat.execute("SELECT app_id FROM program WHERE prog=2").fetchone()[0]
+        # a device's cache: the same schema, programs copied in with new numbers,
+        # the statements of the README; copying twice changes nothing
         dev = sqlite3.connect(os.path.join(self.tmp, "device.sqlite"))
         self.addCleanup(dev.close)
         for stmt in K._PACK_SCHEMA + K.PACK_LOOKUP_INDEXES:
             dev.execute(stmt)
-        dev.execute("INSERT INTO program(full_id, app_id, header, entry) VALUES('X', 'X', x'', '{}')")
+        dev.execute("INSERT INTO program(full_id, app_id, layout, max_nbytes, preferred, header, "
+                    "entry) VALUES('X', 'X', '', 1, 1, x'', '{}')")
         dev.execute("ATTACH ? AS cat", (cat_path,))
-        dev.execute("INSERT INTO program(full_id, app_id, manufacturer, name, header, entry) "
-                    "SELECT full_id, app_id, manufacturer, name, header, entry FROM cat.program "
-                    "WHERE app_id=?", (app,))
-        for table, cols in (("chunk", "c.kind, c.n, c.body"),
-                            ("item", "c.kind, c.n, c.pos, c.id, c.module, c.address, c.bit, "
-                                     "c.size_bits, c.number")):
-            dev.execute("INSERT INTO %s SELECT d.prog, %s FROM cat.%s c JOIN cat.program s "
-                        "ON s.prog=c.prog JOIN main.program d ON d.full_id=s.full_id "
-                        "WHERE s.app_id=?" % (table, cols, table), (app,))
-        dev.commit()
-        n_cat = cat.execute("SELECT count(*) FROM item i JOIN program p USING (prog) "
-                            "WHERE p.app_id=?", (app,)).fetchone()[0]
-        n_dev = dev.execute("SELECT count(*) FROM item i JOIN program p USING (prog) "
-                            "WHERE p.app_id=?", (app,)).fetchone()[0]
-        self.assertEqual(n_dev, n_cat)
-        self.assertGreater(dev.execute("SELECT prog FROM program WHERE app_id=?",
-                                       (app,)).fetchone()[0], 1)
+        copy = README_COPY_SQL
+        for _ in range(2):
+            for stmt in copy:
+                dev.execute(stmt, {"app": app})
+            dev.commit()
+        count = ("SELECT (SELECT count(*) FROM {0}item i JOIN {0}program p USING (prog) WHERE "
+                 "p.app_id=:app), (SELECT count(*) FROM {0}chunk c JOIN {0}program p USING "
+                 "(prog) WHERE p.app_id=:app)")
+        self.assertEqual(dev.execute(count.format(""), {"app": app}).fetchone(),
+                         cat.execute(count.format(""), {"app": app}).fetchone())
+        self.assertEqual(dev.execute("SELECT prog FROM program WHERE app_id=?", (app,)).fetchone(),
+                         (2,))
 
     def test_selects_by_application_and_manufacturer(self):
         app, full_id = self.index.execute("SELECT app_id, full_id FROM programs "
@@ -3220,18 +3250,74 @@ class TestPack(unittest.TestCase):
         _out, facts, _db = self.pack("mfr.sqlite", manufacturers=["m-fff0"])
         self.assertEqual(facts["programs"], self.index.execute(
             "SELECT count(*) FROM programs").fetchone()[0])
-        _out, facts, _db = self.pack("none.sqlite", apps=["DEADBEEF00"])
-        self.assertEqual(facts["programs"], 0)
         self.assertTrue(full_id.upper().startswith("M-FFF0"))
+
+    def test_no_match_leaves_an_existing_pack_alone(self):
+        out, _f, _db = self.pack("keep.sqlite")
+        before = _read_bytes(out)
+        with self.assertRaises(K.ConfigError):
+            K.write_pack(self.data, out, apps=["DEADBEEF00"])
+        self.assertEqual(_read_bytes(out), before)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_failure_leaves_no_temporary_file(self):
+        out, _f, _db = self.pack("fail.sqlite")
+        before = _read_bytes(out)
+        with mock.patch.object(K, "_utc_now", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                K.write_pack(self.data, out)
+        self.assertEqual(_read_bytes(out), before)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_program_removed_meanwhile_is_left_out_whole(self):
+        data = os.path.join(self.tmp, "data-sync")
+        os.makedirs(data)
+        copy = sqlite3.connect(os.path.join(data, K.DB_NAME))
+        self.index.backup(copy)
+        copy.close()
+        progs = [r[0] for r in self.index.execute("SELECT full_id FROM programs ORDER BY full_id")]
+
+        def sync_meanwhile(_line):          # after the first program: a sync drops the last
+            con = sqlite3.connect(os.path.join(data, K.DB_NAME))
+            con.execute("DELETE FROM programs WHERE full_id=?", (progs[-1],))
+            con.commit()
+            con.close()
+
+        _out, facts, db = self.pack("sync.sqlite", data=data, log=sync_meanwhile)
+        self.assertEqual(facts["vanished"], [progs[-1]])
+        self.assertEqual([r[0] for r in db.execute("SELECT full_id FROM program ORDER BY prog")],
+                         progs[:-1])
 
     def test_cli(self):
         out = os.path.join(self.tmp, "cli.sqlite")
         with contextlib.redirect_stdout(io.StringIO()) as buf:
             self.assertEqual(K.main(["pack", out, "--data", self.data, "--catalogue"]), 0)
         self.assertIn("application programs", buf.getvalue())
-        self.assertTrue(os.path.exists(out))
-        with contextlib.redirect_stdout(io.StringIO()):
+        before = _read_bytes(out)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(K.main(["pack", out, "--data", self.data, "--app", "DEADBEEF00"]), 1)
+        self.assertIn("no application program matches", err.getvalue())
+        self.assertEqual(_read_bytes(out), before)
+
+
+
+def _read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _readme_copy_sql():
+    """The copy statements of the README's pack section, as a device runs them."""
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "README.md"),
+              encoding="utf-8") as f:
+        text = f.read()
+    block = text.split("## Product pack for a device", 1)[1].split("```sql", 1)[1].split("```", 1)[0]
+    block = "\n".join(line for line in block.splitlines() if not line.lstrip().startswith("--"))
+    stmts = [x.strip() for x in block.split(";") if x.strip()]
+    return [x for x in stmts if not x.upper().startswith("ATTACH")]
+
+
+README_COPY_SQL = _readme_copy_sql()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
