@@ -11,6 +11,14 @@ server indexes them. It is a single Python file that uses the standard library
 only and is meant to run as a container in a private network. It announces itself
 on the LAN via mDNS/DNS-SD, so clients can find it without a URL.
 
+It is one of two services that run next to **MCP4KNX**, the firmware that lets
+an AI agent commission KNX devices without ETS through a busware TUL stick: the
+stick finds this service on the LAN and forwards its tools to the agent. The
+other service, [knxproject-mcp](https://github.com/tostmann/knxproject-mcp),
+keeps the installation's record. Firmware and web flasher:
+[install.busware.de/TUL/mcp/](https://install.busware.de/TUL/mcp/);
+documentation: [BREMA for KNX](https://github.com/tostmann/BREMA/blob/main/docs/brema-for-knx.md).
+
 ## Quick start
 
 1. **Put your `.knxprod` files into a folder.** You can also use zip archives
