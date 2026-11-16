@@ -1800,6 +1800,27 @@ class TestNeverShown(unittest.TestCase):
         self.assertFalse(K._has_never([by_id(self.rec["comobjects"], "MD-4_M-6_MI-1_O-1")]))
 
 
+class TestWarmUp(unittest.TestCase):
+
+    def test_the_program_list_is_read_after_the_sync(self):
+        # the first search of a fresh start must not read it from disk
+        tmp = _tmpdir()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        products, data = os.path.join(tmp, "p"), os.path.join(tmp, "d")
+        write_file(os.path.join(products, "a.knxprod"), full_knxprod())
+        lines = []
+        svc = K.Service({"products": products, "data": data, "bind": "127.0.0.1", "port": 0,
+                         "scan_interval": 0}, log=lines.append)
+        self.addCleanup(svc.close)
+        self.assertEqual(svc.httpd.store._entries, (None, []))
+        svc.start_scanner(initial=True)
+        svc.scanner.join(60)
+        self.assertFalse(svc.scanner.is_alive())
+        self.assertIsNotNone(svc.httpd.store._entries[0])
+        self.assertEqual(len(svc.httpd.store._entries[1]), 2)
+        self.assertTrue(any("program list read in" in ln for ln in lines), lines)
+
+
 # ---------------------------------------------------------------------------
 # 4c. the index database: rows, full program ids, search
 # ---------------------------------------------------------------------------
@@ -2587,6 +2608,32 @@ class TestHttp(unittest.TestCase):
         self.assertIn("GET /healthz 200", new[0])
         self.assertIn("POST /mcp 200", new[1])
         self.assertIn("tools/list", new[1])
+
+    def test_h_a_late_body_is_noted(self):
+        # the logged time runs from the headers; a body that comes late says so
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
+        sock = socket.create_connection(("127.0.0.1", self.srv.port), timeout=30)
+        try:
+            sock.sendall(("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
+                          "Content-Type: application/json\r\nContent-Length: %d\r\n\r\n"
+                          % len(body)).encode())
+            time.sleep(0.7)
+            sock.sendall(body)
+            chunks = []
+            while True:
+                b = sock.recv(65536)
+                if not b:
+                    break
+                chunks.append(b)
+            reply = b"".join(chunks).decode("latin-1")
+        finally:
+            sock.close()
+        self.assertTrue(reply.startswith("HTTP/1.1 200"), reply)
+        self.assertTrue(wait_for(lambda: any(
+            "POST /mcp 200" in ln and "(body arrived after" in ln for ln in self.srv.lines)))
+        self.srv.mcp({"jsonrpc": "2.0", "id": 9, "method": "tools/list"})
+        time.sleep(0.05)
+        self.assertNotIn("(body arrived", [ln for ln in self.srv.lines if "POST /mcp" in ln][-1])
 
     @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
     def test_i_read_only_product_directory(self):

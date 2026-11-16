@@ -107,6 +107,7 @@ DEFAULT_PROTOCOL = "2025-06-18"
 RESPONSE_BUDGET = 12000
 
 MAX_MCP_BODY = 1 << 20
+SLOW_BODY_MS = 500                  # a request body that took longer is noted in the log
 MAX_UPLOAD = 512 << 20
 # Zip-bomb guards.  Only members the service reads count: a manufacturer
 # database also carries plugins and pictures nobody unpacks.  Real product
@@ -5282,6 +5283,9 @@ class Handler(BaseHTTPRequestHandler):
                                               self.path[:160], self._status, self._nbytes, dt)
         if self._notes:
             line += " " + " ".join(self._notes)[:200]
+        if self._body_ms is not None and self._body_ms >= SLOW_BODY_MS:
+            # the time includes waiting for the body: say how much of it that was
+            line += " (body arrived after %.0fms)" % self._body_ms
         self.server.log_line(line)
 
     def _read_body(self, cap):
@@ -5318,6 +5322,7 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method):
         self._t0 = time.monotonic()
         self._status, self._nbytes, self._notes = None, 0, []
+        self._body_ms = None
         self._cors = None          # the handler object lives on across keep-alive requests
         try:
             path = urlsplit(self.path).path
@@ -5374,7 +5379,9 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if origin is not None and not mcp_origin_allowed(origin, self.server.extra_hosts):
             raise _HttpError(403, "forbidden_origin")
+        t0 = time.monotonic()
         body = self._read_body(MAX_MCP_BODY)
+        self._body_ms = (time.monotonic() - t0) * 1000.0
         try:
             msg = json.loads(body)
         except (ValueError, UnicodeDecodeError):
@@ -5568,13 +5575,17 @@ def make_server(bind, port, data_dir, products_dir, allowed_hosts=(), upload_ori
 
 class ProductScanner(threading.Thread):
     """Syncs the product directory: with `initial` once at once (the start of
-    the server), then every `interval` seconds (0: never again)."""
+    the server), then every `interval` seconds (0: never again).  After each
+    sync `warm` reads what the first search needs: on a cold page cache the
+    program list of a full index (5 129 programs) took 1.1 s, warm 0.07 s."""
 
-    def __init__(self, products_dir, data_dir, interval, log, state=None, initial=False):
+    def __init__(self, products_dir, data_dir, interval, log, state=None, initial=False,
+                 warm=None):
         super().__init__(name="knxprod-scan", daemon=True)
         self.products_dir, self.data_dir = products_dir, data_dir
         self.interval, self.log = interval, log
         self.state, self.initial = state, initial
+        self.warm = warm
         self.stop_event = threading.Event()
 
     def run(self):
@@ -5598,6 +5609,16 @@ class ProductScanner(threading.Thread):
                         "is missing; the index stays as it is" if missing else "is back"))
             except Exception:                         # pragma: no cover - logged
                 self.log("%s scan failed: %s" % (_utc_now(), traceback.format_exc(limit=3)))
+            if self.warm is not None:
+                t0 = time.monotonic()
+                try:
+                    self.warm()
+                    if first:
+                        self.log("%s program list read in %.1f s"
+                                 % (_utc_now(), time.monotonic() - t0))
+                except Exception:                     # pragma: no cover - logged
+                    self.log("%s reading the program list failed: %s"
+                             % (_utc_now(), traceback.format_exc(limit=3)))
             first = False
 
 
@@ -5645,7 +5666,8 @@ class Service:
         interval = self.cfg.get("scan_interval", DEFAULT_SCAN_INTERVAL)
         if interval > 0 or initial:
             self.scanner = ProductScanner(self.products, self.data, interval, self.log,
-                                          self.sync_state, initial=initial)
+                                          self.sync_state, initial=initial,
+                                          warm=self.httpd.store.entries)
             self.scanner.start()
 
     def start_mdns(self):
