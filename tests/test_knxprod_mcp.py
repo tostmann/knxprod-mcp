@@ -3142,7 +3142,9 @@ class TestRealModules(unittest.TestCase):
             ids = [x["id"] for x in rec["parameters"] + rec["comobjects"]]
             self.assertEqual(len(ids), len(set(ids)), app)
             # per definition: an instance is the first one's layout, shifted by its
-            # base arguments -- at most one distinct shift per numeric argument
+            # base arguments -- at most one distinct shift per numeric argument.
+            # The repetitions of one <Module> lie apart; alternatives no
+            # configuration shows together (device variants) may share a place.
             numeric = {m["id"]: [a for a, v in m["arguments"].items() if v != "text"]
                        for m in rec["modules"]}
             per_def = collections.defaultdict(dict)
@@ -3152,17 +3154,23 @@ class TestRealModules(unittest.TestCase):
                     local = p["id"][len(iid) + 1:]
                     per_def[iid.split("_M-")[0]].setdefault(iid, {})[local] = p["offset"]
             for d, insts in per_def.items():
-                layouts = list(insts.values())
-                if len(layouts) < 2:
+                if len(insts) < 2:
                     continue
-                shifts = set()
-                for lay in layouts[1:]:
-                    common = set(layouts[0]) & set(lay)
+                first = next(iter(insts.values()))
+                shifts, placed = set(), {}
+                for iid, lay in insts.items():
+                    common = set(first) & set(lay)
                     self.assertTrue(common, (app, d))
-                    diff = {lay[k] - layouts[0][k] for k in common}
+                    diff = {lay[k] - first[k] for k in common}
                     self.assertLessEqual(len(diff), len(numeric[d]), (app, d, sorted(diff)[:5]))
-                    self.assertTrue(any(diff), (app, d))         # not all at the same place
                     shifts.add(tuple(sorted(diff)))
+                    place = iid.rsplit("_MI-", 1)[0]
+                    if place in placed:
+                        a = placed[place]
+                        self.assertTrue(any(lay[k] - a[k] for k in set(a) & set(lay)),
+                                        (app, iid))      # repetitions: not at the same place
+                    else:
+                        placed[place] = lay
                 rep.setdefault("instance_shifts", {})[d] = sorted(shifts)[:4]
             labels = {p["module"]["label"] for p in rec["parameters"] if p.get("module")}
             self.assertTrue(all(lbl and "{{" not in lbl for lbl in labels), app)
@@ -3219,8 +3227,9 @@ class TestRealModules(unittest.TestCase):
         for app in REAL_MODULE_APPS:
             rec = self.store.app(app)
             label = next(p["module"]["label"] for p in rec["parameters"] if p.get("module"))
+            co_label = next(c["module"]["label"] for c in rec["comobjects"] if c.get("module"))
             for name, args in (("prod-parameters", {"module": label}),
-                               ("prod-comobjects", {"module": label}),
+                               ("prod-comobjects", {"module": co_label}),
                                ("prod-application", {})):
                 o = self.tool(name, dict(args, app_id=app))
                 if name != "prod-application":
