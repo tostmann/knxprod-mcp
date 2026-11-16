@@ -174,6 +174,12 @@ Some things to keep in mind:
   which must hold as well. Places where it is hidden (`Access="None"`) do not
   count; an item ETS never shows gets `ui: false`. Conditions are complete,
   outermost first; `when_more` marks a chain longer than twelve.
+- `never_shown` marks a variant, com object or parameter that no configuration
+  of the program shows: a condition asks for a value the parameter cannot take
+  (a program shared by several products tests the device variants of all of
+  them, a default branch has no value left). It says which parameter and what
+  values it offers. Such entries stay listed, after those that apply at the
+  same object number or address, and a reply holding one says so in `note`.
 - A parameter's `default`, `access` and `text` are those of the refs ETS shows.
   When channel modes give it different defaults, `variants` lists each ref with
   its default and conditions, and the parameter has no single `default`.

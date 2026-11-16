@@ -36,8 +36,8 @@ every tool.
    segments, table locations, byte order, load procedure, modules.
 2. `prod-comobjects {"app_id": "FFF0123456", "numbers": [16]}`: take the
    numbers from the device's group-address and association tables (bus tool).
-3. `prod-parameters {"app_id": "FFF0123456", "query": "running time"}` or
-   `{"app_id": "FFF0123456", "address": "0x4A0A"}`: where a setting lives.
+3. `prod-parameters {"app_id": "FFF0123456", "query": "running time"}` (or
+   `"address": "0x4A0A"`): where a setting lives.
 4. Read those bytes on the device with a bus tool (e.g. `knx-mem-read`).
 5. `prod-decode {"app_id": "FFF0123456", "address": "0x4A0A", "data": "<hex>"}`:
    the values, with the text of enumerated values.
@@ -74,11 +74,10 @@ every tool.
   `skipped`, not left out.
 - Modules: many programs define a channel once (an ETS module) and instantiate
   it per channel. Every instance is listed on its own, with its own address or
-  object number and `module` = the instance, e.g. "Channel B"; its ids start
-  with the instance id (`MD-1_M-2_P-12`, repetitions add `_MI-3`). Filter
-  with `module` (label or id).
-  Alternative modules (switch / dimmer of a channel, variants of a device)
-  share memory and object numbers; `when` says which one applies.
+  object number and `module` = the instance, e.g. "Channel B"; ids start with
+  the instance id (`MD-1_M-2_MI-3_P-12`). Filter with `module` (label or id).
+  Alternative modules (channel modes, device variants) share memory and
+  object numbers; `when` says which one applies.
   `prod-application` lists the module definitions (`inside`: nested in
   another). `counts.module_unsupported` names what is not placed;
   `allocator_after_variable_repeat`: addresses after a repetition depend on
@@ -94,8 +93,10 @@ apply, outermost (usually the channel mode) first. `when_any` appears when ETS
 shows the item in several places: besides `when`, ONE of its condition sets
 must hold. Neither field: ETS shows it unconditionally. `when_more`: the chain
 was longer than listed. Only places ETS shows count; with `ui: false` ETS never
-shows the item, and a `when` says where it sits. Check conditions against
-values decoded from the device, not against defaults.
+shows the item, and a `when` says where it sits. `never_shown`: no
+configuration of this program shows it (it says why); it comes after the
+entries that apply. Check conditions against values decoded from the device,
+not against defaults.
 
 ## Byte order
 

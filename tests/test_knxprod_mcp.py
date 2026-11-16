@@ -1732,6 +1732,74 @@ class TestAllocatorBranches(unittest.TestCase):
         self.assertEqual(left, {"allocator_after_conditional_module": 1})
 
 
+class TestNeverShown(unittest.TestCase):
+    """What no configuration of the program shows (a condition asks for a
+    value the parameter cannot take) is marked with the reason and comes
+    after what a configuration shows at the same number or address: two
+    agents read the first of two objects 178 of an MDT Glass Touch, the one
+    for device variants the file does not offer, and went no further."""
+
+    WHY = ("Channel Left mode can only be 0 (inactive), 1 (switch), 2 (dimmer); "
+           "no such value meets these conditions")
+
+    @classmethod
+    def setUpClass(cls):
+        xml = _read(APP3_XML).decode("utf-8")
+        old = re.search(r'<Repeat Id="%sX-2".*?</Repeat>' % PRE3, xml, re.S).group(0)
+        dyn = ('<choose ParamRefId="{p}P-2_R-2"><when test="7">'
+               + TestAllocatorBranches.scenes(5, 1) + '</when><when test="2">'
+               + TestAllocatorBranches.scenes(6, 1) + '</when></choose>').replace("{p}", PRE3)
+        ref = '<ComObjectRef Id="{p}O-0_R-1" RefId="{p}O-0" Text="{{{{0}}}}" ' \
+              'TextParameterRefId="{p}P-4_R-4" />'.format(p=PRE3)
+        refref = '<ComObjectRefRef RefId="{p}O-0_R-1" />'.format(p=PRE3)
+        cls.rec = distill_xml(app3_with(
+            (old, dyn),
+            # a second variant of object 0, shown only for a mode the type lacks
+            (ref, ref + '<ComObjectRef Id="{p}O-0_R-2" RefId="{p}O-0" Text="Alarm" '
+                        'ObjectSize="1 Byte" />'.format(p=PRE3)),
+            (refref, refref + '<choose ParamRefId="{p}P-2_R-2"><when test="9">'
+                              '<ComObjectRefRef RefId="{p}O-0_R-2" /></when></choose>'
+                              .format(p=PRE3))))
+
+    def test_a_module_no_configuration_places(self):
+        scenes = [c for c in self.rec["comobjects"] if c["id"].startswith("MD-4_")]
+        self.assertEqual([(c["number"], c["module"]["id"]) for c in scenes],
+                         [(30, "MD-4_M-6_MI-1"), (30, "MD-4_M-5_MI-1")])
+        self.assertNotIn("never_shown", scenes[0])
+        self.assertEqual(scenes[1]["never_shown"], self.WHY)
+        self.assertEqual(scenes[1]["variants"][0]["never_shown"], self.WHY)
+        dead = [p for p in self.rec["parameters"] if p["id"].startswith("MD-4_M-5_")]
+        live = [p for p in self.rec["parameters"] if p["id"].startswith("MD-4_M-6_")]
+        self.assertTrue(dead and live)
+        self.assertTrue(all(p.get("never_shown") == self.WHY for p in dead))
+        self.assertFalse(any("never_shown" in p for p in live))
+        # the parameter that is shown comes first at the shared address
+        ids = [p["id"] for p in self.rec["parameters"]]
+        self.assertLess(ids.index(live[0]["id"]), ids.index(dead[0]["id"]))
+
+    def test_one_variant_no_configuration_shows(self):
+        o0 = by_id(self.rec["comobjects"], "O-0")
+        r1, r2 = o0["variants"]
+        self.assertNotIn("never_shown", o0)
+        self.assertNotIn("never_shown", r1)
+        self.assertEqual(r2["when"], ["Channel Left mode = 9"])
+        self.assertEqual(r2["never_shown"], self.WHY)
+
+    def test_replies_carry_it(self):
+        c = [c for c in self.rec["comobjects"] if c["id"].startswith("MD-4_M-5_")][0]
+        out = K._render_comobject(c, 1)
+        self.assertEqual(out["never_shown"], self.WHY)
+        self.assertNotIn("never_shown", out["variants"][0])     # said once, by the object
+        o0 = K._render_comobject(by_id(self.rec["comobjects"], "O-0"), 0)
+        self.assertNotIn("never_shown", o0)
+        self.assertEqual(o0["variants"][1]["never_shown"], self.WHY)
+        p = [p for p in self.rec["parameters"] if p["id"].startswith("MD-4_M-5_")][0]
+        for level in range(4):
+            self.assertEqual(K._render_param(p, {}, level)["never_shown"], self.WHY)
+        self.assertTrue(K._has_never([c]))
+        self.assertFalse(K._has_never([by_id(self.rec["comobjects"], "MD-4_M-6_MI-1_O-1")]))
+
+
 # ---------------------------------------------------------------------------
 # 4c. the index database: rows, full program ids, search
 # ---------------------------------------------------------------------------

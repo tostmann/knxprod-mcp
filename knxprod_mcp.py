@@ -86,7 +86,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
 VERSION = "0.8.0"
-SCHEMA_VERSION = 12                # index database format; another value rebuilds the index
+SCHEMA_VERSION = 13                # index database format; another value rebuilds the index
 DB_NAME = "index.sqlite"
 SERVER_NAME = "knxprod-mcp"
 
@@ -132,6 +132,8 @@ SLOT_NOTE = ("Names label slots of the application program, not what an "
 VARIANT_NOTE = ("Pick the variant whose size_bits matches the object size the "
                 "device reports; 'when' is the ETS condition for a variant, and with "
                 "'when_any' one of those must hold as well.")
+NEVER_NOTE = ("'never_shown': ETS shows this in no configuration of this program (a condition "
+              "asks for a value the parameter cannot take); it does not apply.")
 
 # The skill an agent reads first: skill/SKILL.md next to this file (in the
 # image /app/skill/SKILL.md), served as an MCP resource.
@@ -1380,6 +1382,9 @@ def build_record(raw, langs, master, hw, source, rows=None):
             o.update(_when_fields_de(o, alts, alts_de))
         if cut:
             o["when_more"] = True
+        never = never_shown(entry, inst)
+        if never:
+            o["never_shown"] = never
         if entry is None:
             o["ui"] = False
             return o
@@ -1462,7 +1467,14 @@ def build_record(raw, langs, master, hw, source, rows=None):
                     out.add(n)
         return frozenset(out)
 
+    cvals = {}
+
     def cond_values(cond):
+        if cond not in cvals:
+            cvals[cond] = _cond_values(cond)
+        return cvals[cond]
+
+    def _cond_values(cond):
         pref, test, others = cond
         dom = domain(pref)
         if dom is None:
@@ -1476,6 +1488,51 @@ def build_record(raw, langs, master, hw, source, rows=None):
                 return None
             taken |= s
         return dom - taken
+
+    # -- what no configuration shows: a condition asking for a value the
+    # parameter cannot take (MDT GTS-x4Tx: "Device selection in {0, 1}" in a
+    # file whose type offers 2 and 3).  Marked, not dropped: the reply says
+    # why, and an agent that reads the device's own values can check it.
+    def never_text(pref, names):
+        text, p = pref_text(pref, names)
+        dom = sorted(domain(pref))
+        vals = []
+        for v in dom[:6]:
+            vt = value_text(p, str(v))
+            vals.append("%d (%s)" % (v, vt) if vt else str(v))
+        if len(dom) > 6:
+            vals.append("... %d" % dom[-1])
+        return "%s can only be %s; no such value meets these conditions" % (
+            text, ", ".join(vals))
+
+    def dead_pref(conds):
+        """The ParameterRef no value of which meets all of `conds`, or None."""
+        acc = {}
+        for c in conds:
+            s = cond_values(c)
+            if s is None:
+                continue
+            if c[0] in acc:
+                s = acc[c[0]] & s
+            if not s:
+                return c[0]
+            acc[c[0]] = s
+        return None
+
+    def never_shown(entry, inst):
+        """Why no configuration shows a UI reference: its module instance is
+        never placed, or every place it is shown asks for an impossible value."""
+        if inst and inst.get("never"):
+            return inst["never"]
+        if not entry or not entry[1]:
+            return None
+        why = None
+        for conds in entry[1]:
+            pref = dead_pref(conds)
+            if pref is None:
+                return None
+            why = why or pref
+        return never_text(why, inst["names"] if inst else None)
 
     def constraint(conds, ctx, outer):
         """The values each condition placing a module allows ({(instance,
@@ -1545,6 +1602,10 @@ def build_record(raw, langs, master, hw, source, rows=None):
                     count = MAX_REPEAT
             cons = constraint(mod["conds"], parent["id"] if parent else None,
                               parent["cons"] if parent else None)
+            never = parent.get("never") if parent else None
+            if never is None:
+                pref = dead_pref(mod["conds"])
+                never = never_text(pref, pnames) if pref else None
             # every allocator starts where the modules a configuration can show
             # together with this one left it; modules in branches excluding
             # this one take nothing from it
@@ -1623,7 +1684,7 @@ def build_record(raw, langs, master, hw, source, rows=None):
                     md.attrs.get("Name") or short(md.full_id), i)
                 group.append({"id": iid, "md": md, "values": values, "names": names,
                               "outer": o_outer, "outer_de": o_outer_de, "label": label,
-                              "index": i, "cons": cons})
+                              "index": i, "cons": cons, "never": never})
             for lid, v in run.items():
                 counters[lid]["taken"].append((cons, v - first[lid], count_pref is not None))
             if rep is not None and len({g["label"] for g in group}) < len(group):
@@ -1888,6 +1949,10 @@ def build_record(raw, langs, master, hw, source, rows=None):
                 else:
                     o.pop("text_de", None)
         o["variants"] = variants
+        if inst and inst.get("never"):
+            o["never_shown"] = inst["never"]
+        elif variants and all(v.get("never_shown") for v in variants):
+            o["never_shown"] = variants[0]["never_shown"]
         counts["comobject_refs"] += len(variants)
         return o
 
@@ -2024,15 +2089,18 @@ def build_record(raw, langs, master, hw, source, rows=None):
 def _param_order(o, seq):
     """Index order of parameters: by address, then by segment and offset, then
     property and ETS-only parameters; `seq` keeps the program's own order."""
+    never = "never_shown" in o              # after what a configuration shows, same place
     if o.get("address") is not None:
-        return (0, "", o["address"], o.get("bit_offset") or 0, seq)
+        return (0, "", o["address"], o.get("bit_offset") or 0, never, seq)
     if o.get("storage") == "memory":
-        return (1, o.get("segment") or "", o.get("offset") or 0, o.get("bit_offset") or 0, seq)
-    return (2 if o.get("storage") else 3, "", 0, 0, seq)
+        return (1, o.get("segment") or "", o.get("offset") or 0, o.get("bit_offset") or 0,
+                never, seq)
+    return (2 if o.get("storage") else 3, "", 0, 0, never, seq)
 
 
 def _comobject_order(o, seq):
-    return (o["number"] if o["number"] is not None else 1 << 30, o["id"], seq)
+    return (o["number"] if o["number"] is not None else 1 << 30, "never_shown" in o, o["id"],
+            seq)
 
 
 def _pack(obj):
@@ -3707,6 +3775,13 @@ def _put_when(dst, src, level):
             dst["when_any_more"] = True
     if src.get("when_more"):
         dst["when_more"] = True
+    if src.get("never_shown"):
+        dst["never_shown"] = src["never_shown"]
+
+
+def _has_never(items):
+    return any(o.get("never_shown") or any(v.get("never_shown") for v in o.get("variants", ()))
+               for o in items)
 
 
 def _variant_groups(c):
@@ -3751,6 +3826,8 @@ def _render_co_variant(v, c, level):
     if v.get("priority") and v.get("priority") != c.get("priority"):
         w["priority"] = v["priority"]
     _put_when(w, v, 0)
+    if c.get("never_shown"):
+        w.pop("never_shown", None)          # said once, by the object
     if level == 0 and v.get("block"):
         w["block"] = v["block"]
     if level == 0 and v.get("seen"):
@@ -3762,6 +3839,8 @@ def _render_co_variant(v, c, level):
 
 def _render_comobject(c, level, variants=None):
     o = {"number": c["number"], "text": c["text"]}
+    if c.get("never_shown"):
+        o["never_shown"] = c["never_shown"]
     if c.get("module"):
         o["module"] = c["module"]["label"]
     if level == 0 and c.get("text_de"):
@@ -3888,6 +3967,8 @@ def tool_comobjects(store, args, budget):
             if missing:
                 header["missing_numbers"] = missing[:64]
         total, window = db.page("comobjects", where, a, offset, 1 if voff else limit)
+    if _has_never(window):
+        header["note"] += " " + NEVER_NOTE
     if voff == 0:
         try:
             return _page(window, total, offset, _render_comobject, header, "comobjects", budget,
@@ -3950,14 +4031,16 @@ _PARAM_NOTES = {1: "reduced: no text_de/name/block, enum values <= 24",
                 3: "reduced: no conditions, enum values <= 4"}
 
 
-def _render_param_variant(v, level):
+def _render_param_variant(v, level, p=None):
     """A ref that differs from the parameter, with the conditions that show
     it — kept at every level, it is the per-mode default or access."""
-    w = {k: v[k] for k in ("ref", "default", "access", "ui") if k in v}
+    w = {k: v[k] for k in ("ref", "default", "access", "ui", "never_shown") if k in v}
     if v.get("text") and level < 2:
         w["text"] = v["text"]
     if level < 3:
         _put_when(w, v, 0 if level < 2 else 1)
+    if p is not None and p.get("never_shown"):
+        w.pop("never_shown", None)          # said once, by the parameter
     return w
 
 
@@ -4007,14 +4090,17 @@ def _render_param(p, types, level, order="big"):
         o["union"] = p["union"]
     if level < 3:
         _put_when(o, p, 0 if level < 2 else 1)
-    elif p.get("when_more"):
-        o["when_more"] = True
+    else:
+        if p.get("when_more"):
+            o["when_more"] = True
+        if p.get("never_shown"):
+            o["never_shown"] = p["never_shown"]
     if level == 0 and p.get("block"):
         o["block"] = p["block"]
     if p.get("ui") is False:
         o["ui"] = False
     if p.get("variants"):
-        o["variants"] = [_render_param_variant(v, level) for v in p["variants"]]
+        o["variants"] = [_render_param_variant(v, level, p) for v in p["variants"]]
         if p.get("variants_total"):
             o["variants_total"] = p["variants_total"]
     return o
@@ -4069,6 +4155,8 @@ def tool_parameters(store, args, budget):
               "note": SLOT_NOTE + " bit_offset counts from the MSB; value = (integer of "
                       "extract.bytes bytes at address in byte_order >> shift) & mask. Union "
                       "members share memory: only the one matching the channel mode is valid."}
+    if _has_never(window):
+        header["note"] += " " + NEVER_NOTE
     if bo.get("warning"):
         header["byte_order_warning"] = bo["warning"]
     if segment is not None:
@@ -4192,6 +4280,8 @@ def tool_decode(store, args, budget):
                            "whose 'when' (and one of its 'when_any') matches the configured "
                            "channel mode is meaningful. "
                            + SLOT_NOTE})
+    if _has_never(values):
+        header["note"] += " " + NEVER_NOTE
     if bo.get("warning"):
         header["byte_order_warning"] = bo["warning"]
     if segment is None and not values and not partial and _relative_hint(rec):
