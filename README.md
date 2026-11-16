@@ -173,7 +173,10 @@ Some things to keep in mind:
   keeps what all of them share and `when_any` lists the alternatives, one of
   which must hold as well. Places where it is hidden (`Access="None"`) do not
   count; an item ETS never shows gets `ui: false`. Conditions are complete,
-  outermost first; `when_more` marks a chain longer than twelve.
+  outermost first; `when_more` marks a chain longer than twelve. What all
+  variants of a com object share (usually the channel's or module's
+  conditions) is said once, by the object's `when`; each variant keeps the
+  conditions that set it apart.
 - `never_shown` marks a variant, com object or parameter that no configuration
   of the program shows: a condition asks for a value the parameter cannot take
   (a program shared by several products tests the device variants of all of
@@ -213,7 +216,11 @@ Every `tools/call` response stays at or below 12 000 bytes, so small clients
 that forward replies can handle it. Long lists are paginated (`offset`/`limit`
 in, `total`/`next_offset` out). A reply that had to leave detail out says so in
 `detail`, and an object with more variants than one reply holds comes in parts
-(`variants_next_offset` out, `variant_offset` in).
+(`variants_next_offset` out, `variant_offset` in). A com-object listing
+(`module`, `query`, or none) that would show fewer than five objects in full
+comes as a summary instead: each object with its shared conditions, how many
+variants it has, their sizes and function texts. Asked by `numbers`, objects
+always come in full.
 
 ## Product pack for a device
 

@@ -1015,7 +1015,8 @@ class TestModules(unittest.TestCase):
                 self.assertLessEqual(K._esc_len(text), budget)
                 o = json.loads(text)
                 for i, x in enumerate(o[key]):
-                    nvar += len(x.get("variants", [])) if key == "comobjects" else 0
+                    if key == "comobjects":         # a summary counts them, a full reply lists them
+                        nvar += len(x["variants"]) if "variants" in x else x["variants_total"]
                     if i == 0 and voff:             # the rest of an object already counted
                         continue
                     seen.append(x["id"] if key == "parameters" else x["number"])
@@ -1359,6 +1360,99 @@ class TestReviewBudget(unittest.TestCase):
         p4 = o["parameters"][0]
         self.assertEqual(len(p4["when_any"]), 2)                        # conditions untouched
         self.assertNotIn("block", p4)
+
+
+class TestListings(unittest.TestCase):
+    """An object of many variants in a channel: every variant repeated the
+    channel's conditions, and a listing of a module held one object per reply
+    (MDT Glass Touch Smart, logic 3: 20 objects, 11 replies)."""
+
+    N = 12
+    MODE = "Channel 1 operating mode = 1 (Blind)"
+
+    @classmethod
+    def setUpClass(cls):
+        obj = ('<ComObject Id="{p}O-7" Name="Wert" Text="Value" Number="7" FunctionText="Channel 1" '
+               'ObjectSize="1 Bit" Priority="Low" CommunicationFlag="Enabled" ReadFlag="Disabled" '
+               'WriteFlag="Enabled" TransmitFlag="Enabled" UpdateFlag="Disabled" '
+               'ReadOnInitFlag="Disabled" />').format(p=PRE1)
+        sizes = ("1 Bit", "1 Byte", "2 Bytes")
+        corefs = "".join(
+            '<ComObjectRef Id="{p}O-7_R-{r}" RefId="{p}O-7" ObjectSize="{s}" '
+            'FunctionText="Type {i}" />'.format(p=PRE1, r=100 + i, i=i, s=sizes[i % 3])
+            for i in range(cls.N))
+        place = ('<choose ParamRefId="%sP-5_R-6">' % PRE1 + "".join(
+            '<when test="{i}"><ComObjectRefRef RefId="{p}O-7_R-{r}" /></when>'.format(
+                p=PRE1, i=i, r=100 + i) for i in range(cls.N)) + "</choose>")
+        cls.rec = distill_xml(app1_with(
+            '<ParameterRefRef RefId="%sUP-20_R-20" />' % PRE1, place, corefs=corefs,
+            replace=[("</ComObjectTable>", obj + "</ComObjectTable>")]))
+        cls.o7 = [c for c in cls.rec["comobjects"] if c["number"] == 7][0]
+
+    def test_what_all_variants_share_is_said_once(self):
+        out = K._render_comobject(self.o7, 0)
+        self.assertEqual(out["when"], [self.MODE])
+        self.assertEqual(len(out["variants"]), self.N)
+        for v, r in zip(out["variants"], self.o7["variants"]):
+            self.assertEqual(len(v["when"]), 1, v)              # what tells it apart
+            self.assertEqual(out["when"] + v["when"], r["when"])  # nothing lost
+        # an object of other refs shares nothing: its variants keep everything
+        o0 = K._render_comobject(by_id(self.rec["comobjects"], "O-0"), 0)
+        self.assertNotIn("when", o0)
+        self.assertEqual(o0["variants"][1]["when_any"], [[self.MODE],
+                                                         ["Channel 1 operating mode = 2 (Switch)"]])
+        # one variant: the object carries its conditions, the variant none
+        one = dict(self.o7, variants=self.o7["variants"][:1])
+        out = K._render_comobject(one, 0)
+        self.assertEqual(out["when"], self.o7["variants"][0]["when"])
+        self.assertNotIn("when", out["variants"][0])
+        self.assertEqual(K._shared_when([]), ([], None))
+
+    def test_parts_carry_what_all_share(self):
+        o = json.loads(K.tool_comobjects(OneApp(self.rec), {"app_id": self.rec["app_id"],
+                                                            "numbers": [7]}, 1500))
+        c = o["comobjects"][0]
+        self.assertIsNotNone(c["variants_next_offset"])
+        o = json.loads(K.tool_comobjects(OneApp(self.rec), {
+            "app_id": self.rec["app_id"], "numbers": [7],
+            "variant_offset": c["variants_next_offset"]}, 1500))
+        self.assertEqual(o["comobjects"][0]["when"], [self.MODE])   # from all, not the part
+
+    def test_a_listing_of_too_few_in_full_is_summarised(self):
+        args = {"app_id": self.rec["app_id"]}
+        full = K.tool_comobjects(OneApp(self.rec), args, K.RESPONSE_BUDGET)
+        o = json.loads(full)
+        self.assertEqual(o["returned"], 3)                       # all three fit in full
+        self.assertNotIn("detail", o)
+        o = json.loads(K.tool_comobjects(OneApp(self.rec), args, K._esc_len(full) - 1))
+        self.assertEqual(o["detail"], K.SUMMARY_DETAIL)
+        self.assertEqual([c["number"] for c in o["comobjects"]], [0, 1, 7])
+        self.assertIsNone(o["next_offset"])
+        s = o["comobjects"][2]
+        self.assertNotIn("variants", s)
+        self.assertEqual(s["when"], [self.MODE])
+        self.assertEqual(s["variants_total"], self.N)
+        self.assertEqual(s["variant_size_bits"], [1, 8, 16])
+        self.assertEqual(s["variant_function_texts"], ["Type %d" % i for i in range(6)])
+        self.assertEqual(s["variant_function_texts_total"], self.N)
+        # asked by number, an object comes in full, in parts if need be
+        o = json.loads(K.tool_comobjects(OneApp(self.rec), dict(args, numbers=[0, 1, 7]),
+                                         K._esc_len(full) - 1))
+        self.assertNotEqual(o.get("detail"), K.SUMMARY_DETAIL)
+        self.assertTrue(all("variants" in c for c in o["comobjects"]))
+        # a listing that fits few objects but shows them all stays in full
+        o = json.loads(K.tool_comobjects(OneApp(self.rec), dict(args, offset=2), 3000))
+        self.assertEqual(o["returned"], 1)
+        self.assertIn("variants", o["comobjects"][0])
+
+    def test_the_never_note_goes_with_the_entry_it_explains(self):
+        note = "x " + K.NEVER_NOTE
+        live = {"number": 1, "variants": [{"ref": "R-1"}]}
+        dead = {"number": 1, "variants": [{"ref": "R-2", "never_shown": "why"}]}
+        for items, kept in (([live], False), ([live, dead], True),
+                            ([{"number": 1, "variants_never_shown": 1}], True)):
+            o = json.loads(K._drop_unused_never_note(K._dumps({"note": note, "c": items}), "c"))
+            self.assertEqual(K.NEVER_NOTE in o["note"], kept, items)
 
 
 CATALOG = """<?xml version="1.0" encoding="utf-8"?>

@@ -131,8 +131,12 @@ _TEST_OPS = (("<=", lambda v, n: v <= n), (">=", lambda v, n: v >= n),
 SLOT_NOTE = ("Names label slots of the application program, not what an "
              "installation uses them for; the channel mode decides.")
 VARIANT_NOTE = ("Pick the variant whose size_bits matches the object size the "
-                "device reports; 'when' is the ETS condition for a variant, and with "
-                "'when_any' one of those must hold as well.")
+                "device reports; 'when' is the ETS condition for a variant (an object's "
+                "'when' holds for all its variants), and with 'when_any' one of those must "
+                "hold as well.")
+LIST_FULL_MIN = 5                   # a listing that shows fewer objects in full summarises them
+SUMMARY_DETAIL = ("summary: each object counts its variants instead of listing them; ask "
+                  "prod-comobjects with numbers for their sizes, flags and conditions")
 NEVER_NOTE = ("'never_shown': ETS shows this in no configuration of this program (a condition "
               "asks for a value the parameter cannot take); it does not apply.")
 
@@ -3781,8 +3785,8 @@ def _put_when(dst, src, level):
 
 
 def _has_never(items):
-    return any(o.get("never_shown") or any(v.get("never_shown") for v in o.get("variants", ()))
-               for o in items)
+    return any(o.get("never_shown") or o.get("variants_never_shown")
+               or any(v.get("never_shown") for v in o.get("variants", ())) for o in items)
 
 
 def _variant_groups(c):
@@ -3810,9 +3814,41 @@ def _variant_groups(c):
     return list(groups.values())
 
 
-def _render_co_variant(v, c, level):
-    """A variant always keeps its full conditions: they are what tells two
-    variants of the same size apart."""
+def _shared_when(vs):
+    """What every variant of an object has to meet: the leading conditions of
+    `when` they all share, and `when_any` if it is the same for all.  Said
+    once by the object: in a channel or module every variant repeated the
+    channel's conditions, and an object of fourteen variants took 6 KB, two
+    of them more than one reply holds."""
+    if not vs:
+        return [], None
+    ws = [v.get("when") or [] for v in vs]
+    n = 0
+    for i in range(min(len(w) for w in ws)):
+        if any(w[i] != ws[0][i] for w in ws):
+            break
+        n += 1
+    wa = vs[0].get("when_any")
+    if wa is None or any(v.get("when_any") != wa
+                         or v.get("when_any_more") != vs[0].get("when_any_more") for v in vs):
+        wa = None
+    return ws[0][:n], wa
+
+
+def _put_shared_when(o, vs):
+    when, when_any = _shared_when(vs)
+    if when:
+        o["when"] = when
+    if when_any:
+        o["when_any"] = when_any
+        if vs[0].get("when_any_more"):
+            o["when_any_more"] = True
+    return when, when_any
+
+
+def _render_co_variant(v, c, level, shared=([], None)):
+    """A variant keeps the conditions that tell it apart from the others; what
+    all of them share is said by the object (`shared`, from _shared_when)."""
     w = {"ref": v["ref"], "size_bits": v.get("size_bits"), "flags": v.get("flags")}
     if v.get("size") != c.get("size"):
         w["size"] = v.get("size")
@@ -3827,6 +3863,16 @@ def _render_co_variant(v, c, level):
     if v.get("priority") and v.get("priority") != c.get("priority"):
         w["priority"] = v["priority"]
     _put_when(w, v, 0)
+    when, when_any = shared
+    if when:
+        rest = w["when"][len(when):]
+        if rest:
+            w["when"] = rest
+        else:
+            del w["when"]
+    if when_any:
+        w.pop("when_any", None)
+        w.pop("when_any_more", None)
     if c.get("never_shown"):
         w.pop("never_shown", None)          # said once, by the object
     if level == 0 and v.get("block"):
@@ -3859,8 +3905,36 @@ def _render_comobject(c, level, variants=None):
         o["priority"] = c["priority"]
     if c.get("dpt"):
         o["dpt"] = c["dpt"]
-    o["variants"] = [_render_co_variant(v, c, level)
+    shared = _put_shared_when(o, c.get("variants", []))     # over all, also for a part
+    o["variants"] = [_render_co_variant(v, c, level, shared)
                      for v in (c.get("variants", []) if variants is None else variants)]
+    return o
+
+
+def _summarize_comobject(c, level=0):
+    """An object in a listing that would show too few in full: its shared
+    conditions and what its variants offer, not each variant.  Variants no
+    configuration shows count apart and offer nothing."""
+    vs = c.get("variants", [])
+    o = {"number": c["number"], "text": c["text"]}
+    if c.get("never_shown"):
+        o["never_shown"] = c["never_shown"]
+    if c.get("module"):
+        o["module"] = c["module"]["label"]
+    if c.get("function_text"):
+        o["function_text"] = c["function_text"]
+    _put_shared_when(o, vs)
+    o["variants_total"] = len(vs)
+    live = [v for v in vs if not v.get("never_shown")] or vs
+    if len(live) < len(vs):
+        o["variants_never_shown"] = len(vs) - len(live)
+    o["variant_size_bits"] = sorted({v["size_bits"] for v in live if v.get("size_bits")})
+    fts = _uniq(v["function_text"] for v in live
+                if v.get("function_text") and v["function_text"] != c.get("function_text"))
+    if fts:
+        o["variant_function_texts"] = fts[:6]
+        if len(fts) > 6:
+            o["variant_function_texts_total"] = len(fts)
     return o
 
 
@@ -3869,7 +3943,8 @@ _CO_NOTES = {1: "reduced: no text_de/name/block"}
 
 def _page_variants(c, total, offset, voff, header, budget):
     """One object whose variants do not fit into one reply, in parts: as many
-    variants as fit, each with its full conditions, and where to go on.  `c` is
+    variants as fit, each with its conditions (what all share with the object,
+    in every part), and where to go on.  `c` is
     the object at `offset`, None past the end.  The first part adds an overview
     by size/flags/text.  It replaced an emergency level that cut every
     variant's conditions to the innermost one, after which variants of the
@@ -3971,13 +4046,36 @@ def tool_comobjects(store, args, budget):
     if _has_never(window):
         header["note"] += " " + NEVER_NOTE
     if voff == 0:
+        full = None
         try:
-            return _page(window, total, offset, _render_comobject, header, "comobjects", budget,
+            full = _page(window, total, offset, _render_comobject, header, "comobjects", budget,
                          notes=_CO_NOTES, max_level=1)
         except ToolError as e:
             if e.payload.get("error") != "result_too_large":
                 raise
+        # A listing (module, query, everything) that would show fewer than
+        # LIST_FULL_MIN objects in full summarises them: weak models read one
+        # object per reply of a module of objects with many variants and did
+        # not page on.  Asked by number, an object always comes in full.
+        if (wanted is None and window and (full is None or json.loads(full)["returned"]
+                                           < min(len(window), LIST_FULL_MIN))):
+            full = _page(window, total, offset, _summarize_comobject,
+                         dict(header, detail=SUMMARY_DETAIL), "comobjects", budget, max_level=0)
+        if full is not None:
+            return _drop_unused_never_note(full, "comobjects")
     return _page_variants(window[0] if window else None, total, offset, voff, header, budget)
+
+
+def _drop_unused_never_note(text, key):
+    """The note on `never_shown` goes by the items read for a page, before the
+    budget cuts it: object 178 of a program carried it on page 1 while its
+    entry no configuration shows came on page 2.  Without it the reply only
+    gets shorter, so it still fits."""
+    o = json.loads(text)
+    if NEVER_NOTE in o.get("note", "") and not _has_never(o.get(key, [])):
+        o["note"] = o["note"].replace(" " + NEVER_NOTE, "")
+        return _dumps(o)
+    return text
 
 
 def _param_nbytes(p):
@@ -4168,8 +4266,9 @@ def tool_parameters(store, args, budget):
         header[key + "_hex"] = "0x%04X" % address
         if segment is None and not total and _relative_hint(rec):
             header["hint"] = _relative_hint(rec)
-    return _page(window, total, offset, lambda p, lv: _render_param(p, types, lv, order),
-                 header, "parameters", budget, notes=_PARAM_NOTES)
+    return _drop_unused_never_note(
+        _page(window, total, offset, lambda p, lv: _render_param(p, types, lv, order),
+              header, "parameters", budget, notes=_PARAM_NOTES), "parameters")
 
 
 def tool_decode(store, args, budget):
@@ -4352,8 +4451,8 @@ TOOLS = [
          "name labels the SLOT, not the function: in another mode the same number may do "
          "something else (a 'slat position' slot can switch a pump). Pick the variant "
          "whose size_bits matches the size the device reports. Filter: numbers, query, "
-         "module (instance of an ETS module). Paginated; very many variants come in "
-         "parts (variant_offset)."),
+         "module (ETS module instance). Paginated; a listing may be a summary (ask by "
+         "numbers); variant_offset pages through variants."),
      "inputSchema": {"type": "object", "properties": dict({
          "app_id": _APP_ID_PROP,
          "numbers": {"type": "array", "items": {"type": "integer", "minimum": 0,
