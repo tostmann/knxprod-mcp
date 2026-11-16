@@ -1642,6 +1642,96 @@ class TestNestedModules(unittest.TestCase):
                          before["counts"].get("module_unsupported", {}))
 
 
+class TestAllocatorBranches(unittest.TestCase):
+    """Modules on the same allocators in branches no configuration takes
+    together (device variants) each start where the allocator stood before
+    them: ETS 6.4 does so (export of an MDT Glass Touch Smart, the second
+    variant's first instance at the allocator's start)."""
+
+    @staticmethod
+    def scenes(n, count=2):
+        # a <Repeat> of MD-4 on the scene allocators (L-4 80..96 by 8, L-5 30..32 by 1)
+        return ('<Repeat Id="{p}X-{n}" Name="Scenes" Count="{c}"><Module Id="{p}MD-4_M-{n}" '
+                'RefId="{p}MD-4"><NumericArg RefId="{p}MD-4_A-1" AllocatorRefId="{p}L-4" />'
+                '<NumericArg RefId="{p}MD-4_A-2" AllocatorRefId="{p}L-5" /></Module></Repeat>'
+                ).format(p=PRE3, n=n, c=count)
+
+    @staticmethod
+    def distill(dynamic):
+        """APP3 with its scenes placed by `dynamic` instead: the scene objects
+        (number, instance, when) and what was not placed."""
+        xml = _read(APP3_XML).decode("utf-8")
+        old = re.search(r'<Repeat Id="%sX-2".*?</Repeat>' % PRE3, xml, re.S).group(0)
+        rec = distill_xml(app3_with((old, dynamic.replace("{p}", PRE3))))
+        got = sorted((c["number"], c["module"]["id"], c["variants"][0].get("when"))
+                     for c in rec["comobjects"] if c["id"].startswith("MD-4_"))
+        return got, rec["counts"].get("module_unsupported", {})
+
+    def test_exclusive_branches_start_alike(self):
+        # mode "<2" and mode "2" exclude each other: the dimmer's scenes do
+        # not come after the others, they take the same numbers
+        got, left = self.distill(
+            '<choose ParamRefId="{p}P-2_R-2"><when test="&lt;2">' + self.scenes(5) +
+            '</when><when test="2">' + self.scenes(6) + '</when></choose>')
+        low, dim = ["Channel Left mode <2"], ["Channel Left mode = 2 (dimmer)"]
+        self.assertEqual(got, [(30, "MD-4_M-5_MI-1", low), (30, "MD-4_M-6_MI-1", dim),
+                               (31, "MD-4_M-5_MI-2", low), (31, "MD-4_M-6_MI-2", dim)])
+        self.assertEqual(left, {})
+
+    def test_branches_of_one_choose_may_overlap(self):
+        # ETS shows every <when> whose test holds: "<3" and "2" both hold
+        # for a dimmer, so the second scenes come after the first
+        got, left = self.distill(
+            '<choose ParamRefId="{p}P-2_R-2"><when test="&lt;3">' + self.scenes(5, 1) +
+            '</when><when test="2">' + self.scenes(6, 1) + '</when></choose>')
+        self.assertEqual([g[:2] for g in got], [(30, "MD-4_M-5_MI-1"), (31, "MD-4_M-6_MI-1")])
+        self.assertEqual(left, {})
+
+    def test_default_branch_and_other_parameters(self):
+        # the default branch allows what the others do not; a condition on
+        # another parameter excludes nothing
+        got, left = self.distill(
+            '<choose ParamRefId="{p}P-2_R-2"><when test="1">' + self.scenes(5, 1) +
+            '</when><when default="true">' + self.scenes(6, 1) + '</when></choose>'
+            '<choose ParamRefId="{p}P-3_R-3"><when test="1">'
+            '<choose ParamRefId="{p}P-2_R-2"><when test="1">' + self.scenes(7, 1) +
+            '</when></choose></when></choose>')
+        self.assertEqual([g[:2] for g in got], [(30, "MD-4_M-5_MI-1"), (30, "MD-4_M-6_MI-1"),
+                                                (31, "MD-4_M-7_MI-1")])
+        self.assertEqual(left, {})
+
+    def test_after_a_module_some_configurations_show(self):
+        # shown with mode 1 only, then a module shown always: where the second
+        # lies depends on the mode -- laid out after the first, and flagged
+        got, left = self.distill(
+            '<choose ParamRefId="{p}P-2_R-2"><when test="1">' + self.scenes(5, 1) +
+            '</when></choose>' + self.scenes(6, 1))
+        self.assertEqual([g[:2] for g in got], [(30, "MD-4_M-5_MI-1"), (31, "MD-4_M-6_MI-1")])
+        self.assertEqual(left, {"allocator_after_conditional_module": 1})
+        # wherever the second is shown the first is as well: nothing to flag
+        got, left = self.distill(
+            '<choose ParamRefId="{p}P-2_R-2"><when test="1 2">' + self.scenes(5, 1) +
+            '</when><when test="1">' + self.scenes(6, 1) + '</when></choose>')
+        self.assertEqual([g[:2] for g in got], [(30, "MD-4_M-5_MI-1"), (31, "MD-4_M-6_MI-1")])
+        self.assertEqual(left, {})
+
+    def test_a_value_the_type_lacks_matches_nothing(self):
+        # A program shared by several products tests values its type does not
+        # have (MDT: "Device selection" 0/1 in a file whose type knows 2 and 3
+        # only).  No configuration shows those scenes: they take nothing.  A
+        # test not understood ("x7") excludes nothing, as before.
+        got, left = self.distill(
+            '<choose ParamRefId="{p}P-2_R-2"><when test="7">' + self.scenes(5, 1) +
+            '</when><when test="2">' + self.scenes(6, 1) + '</when></choose>')
+        self.assertEqual([g[:2] for g in got], [(30, "MD-4_M-5_MI-1"), (30, "MD-4_M-6_MI-1")])
+        self.assertEqual(left, {})
+        got, left = self.distill(
+            '<choose ParamRefId="{p}P-2_R-2"><when test="x7">' + self.scenes(5, 1) +
+            '</when><when test="2">' + self.scenes(6, 1) + '</when></choose>')
+        self.assertEqual([g[:2] for g in got], [(30, "MD-4_M-5_MI-1"), (31, "MD-4_M-6_MI-1")])
+        self.assertEqual(left, {"allocator_after_conditional_module": 1})
+
+
 # ---------------------------------------------------------------------------
 # 4c. the index database: rows, full program ids, search
 # ---------------------------------------------------------------------------

@@ -189,11 +189,16 @@ Some things to keep in mind:
   addresses, its com objects their own numbers, and `module` names the instance
   (for example `Channel B`). Repetitions (`Repeat`, allocators) are expanded the
   same way, and so are modules placed inside module definitions (scene groups
-  inside a channel, for example). What cannot be resolved is counted in
+  inside a channel, for example). Modules that no configuration shows
+  together (the variants of a device, the modes of a channel) take nothing
+  from each other's allocators: each starts where the allocator stood before
+  them, as ETS does. What cannot be resolved is counted in
   `counts.module_unsupported`; `allocator_after_variable_repeat` means that
   where an instance lies depends on a repetition count set in ETS, which the
   device usually does not keep: such instances are laid out with every count
-  at its maximum.
+  at its maximum. `allocator_after_conditional_module`: an earlier module on
+  the same allocator is shown in some configurations that show this one, not
+  in all; the instance is laid out as if it were shown.
 - Programs that keep their parameters in a relative segment have offsets but no
   absolute addresses. Pass `segment` to `prod-parameters` and `prod-decode` and
   give the offset within that segment as `address`.

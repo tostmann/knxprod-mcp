@@ -86,7 +86,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
 VERSION = "0.7.0"
-SCHEMA_VERSION = 11                # index database format; another value rebuilds the index
+SCHEMA_VERSION = 12                # index database format; another value rebuilds the index
 DB_NAME = "index.sqlite"
 SERVER_NAME = "knxprod-mcp"
 
@@ -121,6 +121,11 @@ MAX_ALTS = 8                       # distinct condition sets (UI places) kept pe
 BYTE_ORDER_MIN_EVIDENCE = 3        # template defaults needed before a byte-order warning
 MAX_REPEAT = 256                   # module instances expanded per <Repeat>
 MAX_MODULE_DEPTH = 4               # modules placed inside module definitions, levels
+MAX_DOMAIN = 1024                  # number parameters with more values: conditions on them not evaluated
+# the comparisons an ETS condition test may start with (longest first)
+_TEST_OPS = (("<=", lambda v, n: v <= n), (">=", lambda v, n: v >= n),
+             ("!=", lambda v, n: v != n), ("<", lambda v, n: v < n),
+             (">", lambda v, n: v > n), ("=", lambda v, n: v == n))
 
 SLOT_NOTE = ("Names label slots of the application program, not what an "
              "installation uses them for; the channel mode decides.")
@@ -1413,10 +1418,100 @@ def build_record(raw, langs, master, hw, source, rows=None):
     for md in defs.values():
         allocators.update(md.allocators)
 
+    # -- the configurations that place a module.  ETS takes from an allocator
+    # only for modules it shows: a module in a branch the configuration does
+    # not take leaves the allocator to the alternatives (checked against ETS
+    # 6.4: MDT GTS-x4Tx, two device variants on the same allocators, the
+    # second variant's first instance at the allocator's start).  A condition
+    # becomes the set of values it allows, where the parameter's type lists
+    # them; one it cannot evaluate excludes nothing (the layout before).
+    domains = {}
+
+    def domain(pref_id):
+        if pref_id not in domains:
+            r = pref_by_id.get(pref_id)
+            p = params_by_id.get(r["ref"]) if r else None
+            ty = raw.types.get(p["type"]) if p and p.get("type") else None
+            d = None
+            if ty and ty.get("kind") == "enum":
+                vals = [_intval(v["value"]) for v in ty.get("values", [])]
+                if vals and None not in vals:
+                    d = frozenset(vals)
+            elif ty and ty.get("kind") == "number":
+                lo, hi = ty.get("min"), ty.get("max")
+                if isinstance(lo, int) and isinstance(hi, int) and 0 <= hi - lo < MAX_DOMAIN:
+                    d = frozenset(range(lo, hi + 1))
+            domains[pref_id] = d
+        return domains[pref_id]
+
+    def test_values(dom, test):
+        out = set()
+        for tok in test.split():
+            for op, f in _TEST_OPS:
+                if tok.startswith(op):
+                    n = _intval(tok[len(op):])
+                    if n is None:
+                        return None
+                    out.update(v for v in dom if f(v, n))
+                    break
+            else:
+                n = _intval(tok)
+                if n is None:
+                    return None
+                if n in dom:                        # a value the type lacks matches nothing
+                    out.add(n)
+        return frozenset(out)
+
+    def cond_values(cond):
+        pref, test, others = cond
+        dom = domain(pref)
+        if dom is None:
+            return None
+        if test is not None:
+            return test_values(dom, test)
+        taken = set()                               # default branch: none of the others
+        for t in others:
+            s = test_values(dom, t)
+            if s is None:
+                return None
+            taken |= s
+        return dom - taken
+
+    def constraint(conds, ctx, outer):
+        """The values each condition placing a module allows ({(instance,
+        ParameterRef): values}, the enclosing instance's included) and the
+        conditions that were not understood."""
+        vals = dict(outer["vals"]) if outer else {}
+        opaque = set(outer["opaque"]) if outer else set()
+        for c in conds:
+            s = cond_values(c)
+            if s is None:
+                opaque.add((ctx, c))
+            else:
+                k = (ctx, c[0])
+                vals[k] = vals[k] & s if k in vals else s
+        return {"vals": vals, "opaque": frozenset(opaque)}
+
+    def compatible(a, b):
+        """Can a configuration place both?"""
+        if not all(a["vals"].values()) or not all(b["vals"].values()):
+            return False
+        return all(s & b["vals"][k] for k, s in a["vals"].items() if k in b["vals"])
+
+    def implies(a, b):
+        """Does every configuration that places a place b as well?"""
+        if not b["opaque"] <= a["opaque"]:
+            return False
+        for k, t in b["vals"].items():
+            s = a["vals"].get(k)
+            if not (s if s is not None else domain(k[1])) <= t:
+                return False
+        return True
+
     def counters_for(decls):
-        # one counter per allocator: [next value, a repeat counted by a
-        # parameter took from it -- later values depend on the configuration]
-        return {lid: [al.get("start"), False] for lid, al in decls.items()}
+        # per allocator: its start and what the modules placed so far took
+        # from it -- [(their constraint, amount, counted by a parameter)]
+        return {lid: {"start": al.get("start"), "taken": []} for lid, al in decls.items()}
 
     def expand(placements, parent, counters, depth):
         """Instances of the modules `placements` puts (the program's, or those
@@ -1448,8 +1543,28 @@ def build_record(raw, langs, master, hw, source, rows=None):
                 if count > MAX_REPEAT:
                     unsupported["repeat_instances_capped"] += count - MAX_REPEAT
                     count = MAX_REPEAT
-            used = [g["allocator"] for g in mod["args"].values() if g.get("allocator")]
-            shifted = any(counters.get(lid, [None, False])[1] for lid in used)
+            cons = constraint(mod["conds"], parent["id"] if parent else None,
+                              parent["cons"] if parent else None)
+            # every allocator starts where the modules a configuration can show
+            # together with this one left it; modules in branches excluding
+            # this one take nothing from it
+            run, shifted, depends = {}, False, False
+            for g in mod["args"].values():
+                lid = g.get("allocator")
+                cell = counters.get(lid) if lid else None
+                if cell is None or cell["start"] is None or lid in run:
+                    continue
+                v = cell["start"]
+                for c, n, counted in cell["taken"]:
+                    if not compatible(c, cons):
+                        continue
+                    v += n
+                    if counted:
+                        shifted = True
+                    elif not implies(cons, c):
+                        depends = True
+                run[lid] = v
+            first = dict(run)
             group = []
             for i in range(1, count + 1):
                 values, names, ok = {}, {}, True
@@ -1465,13 +1580,13 @@ def build_record(raw, langs, master, hw, source, rows=None):
                             continue
                     if given.get("allocator"):
                         lid = given["allocator"]
-                        al, cell = allocators.get(lid), counters.get(lid)
+                        al = allocators.get(lid)
                         step = decl.get("allocates")
-                        if al is None or cell is None or cell[0] is None or not step:
+                        if al is None or lid not in run or not step:
                             unsupported["allocator_unresolved"] += 1
                             continue
-                        v = cell[0]
-                        cell[0] = v + step
+                        v = run[lid]
+                        run[lid] = v + step
                         if al.get("max") is not None and v + step > al["max"]:
                             ok = False
                         values[arg_id] = v + base
@@ -1493,6 +1608,10 @@ def build_record(raw, langs, master, hw, source, rows=None):
                     # an earlier repeat counted by a parameter took from the same
                     # allocator: where this instance lies depends on that count
                     unsupported["allocator_after_variable_repeat"] += 1
+                elif depends:
+                    # an earlier module on the same allocator is shown in some
+                    # configurations that show this one, not in all
+                    unsupported["allocator_after_conditional_module"] += 1
                 iid = ((parent["id"] + "_" + local_id(mod["id"], parent["md"])) if parent
                        else short(mod["id"])) + ("_MI-%d" % i if rep is not None else "")
                 o_outer, o_outer_de = list(outer), list(outer_de)
@@ -1504,11 +1623,9 @@ def build_record(raw, langs, master, hw, source, rows=None):
                     md.attrs.get("Name") or short(md.full_id), i)
                 group.append({"id": iid, "md": md, "values": values, "names": names,
                               "outer": o_outer, "outer_de": o_outer_de, "label": label,
-                              "index": i})
-            if count_pref:
-                for lid in used:
-                    if lid in counters:
-                        counters[lid][1] = True
+                              "index": i, "cons": cons})
+            for lid, v in run.items():
+                counters[lid]["taken"].append((cons, v - first[lid], count_pref is not None))
             if rep is not None and len({g["label"] for g in group}) < len(group):
                 for g in group:
                     g["label"] = "%s #%d" % (g["label"], g["index"])

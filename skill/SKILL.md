@@ -77,13 +77,15 @@ every tool.
   object number and `module` = the instance, e.g. "Channel B"; its ids start
   with the instance id (`MD-1_M-2_P-12`, repetitions add `_MI-3`). Filter
   with `module` (label or id).
-  Alternative modules for one channel (switch / dimmer) share memory and
-  object numbers; `when` says which one the channel mode selects.
+  Alternative modules (switch / dimmer of a channel, variants of a device)
+  share memory and object numbers; `when` says which one applies.
   `prod-application` lists the module definitions (`inside`: nested in
   another). `counts.module_unsupported` names what is not placed;
   `allocator_after_variable_repeat`: addresses after a repetition depend on
   a count set in ETS (usually not kept on the device); they are laid out
   with every count at its maximum: do not trust them without the ETS project.
+  `allocator_after_conditional_module`: they depend on whether an earlier
+  module is shown.
 
 ## Conditions: `when` and `when_any`
 
